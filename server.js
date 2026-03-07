@@ -661,6 +661,7 @@ function createRoomState() {
     units: new Map(),
     buildings: new Map(),
     activeSlbms: new Map(),
+    activeAirstrikes: new Map(),
     nextSlbmId: 1,
     map: null,
     landCellsSnapshot: null,
@@ -687,9 +688,21 @@ function roomEmit(event, data) {
   }
 }
 
-function roomHasConnectedClients(roomId) {
-  const sockets = io.sockets.adapter.rooms.get(roomId);
-  return !!(sockets && sockets.size > 0);
+function getRoomHumanCount(roomId) {
+  const room = gameRooms.get(roomId);
+  if (!room) return 0;
+
+  let humanCount = 0;
+  room.players.forEach(player => {
+    if (player && !player.isAI && player.online !== false) {
+      humanCount++;
+    }
+  });
+  return humanCount;
+}
+
+function roomHasHumanPlayers(roomId) {
+  return getRoomHumanCount(roomId) > 0;
 }
 
 // Switch context to a specific room
@@ -734,6 +747,14 @@ function removePlayerFromCurrentRoom(userId, options = {}) {
 function syncSlbmId() {
   if (gameState) {
     gameState.nextSlbmId = nextSlbmId;
+  }
+}
+
+function clearCurrentRoomTransientState() {
+  if (!gameState) return;
+  gameState.activeSlbms.clear();
+  if (gameState.activeAirstrikes) {
+    gameState.activeAirstrikes.clear();
   }
 }
 
@@ -1994,6 +2015,8 @@ io.use((socket, next) => {
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
+  const wasRoomIdle = !roomHasHumanPlayers(socket.roomId);
+
   // Join the selected room
   socket.join(socket.roomId);
   switchRoom(socket.roomId);
@@ -2026,6 +2049,13 @@ io.on('connection', (socket) => {
       spawnAdminBase(socket.userId);
     } else {
       spawnPlayerBase(socket.userId);
+    }
+
+    if (wasRoomIdle) {
+      gameState.lastUpdate = Date.now();
+      const spawnedAiCount = initializeAIPlayers();
+      syncSlbmId();
+      console.log(`Room ${socket.roomId} activated by ${socket.username}; spawned ${spawnedAiCount} AI player(s)`);
     }
     
     console.log(`Player ${socket.username} spawned fresh`);
@@ -2524,6 +2554,13 @@ io.on('connection', (socket) => {
     console.log(`Player disconnected: ${socket.username}`);
     try {
       removePlayerFromCurrentRoom(socket.userId, { emitPlayerLeft: true });
+      if (!roomHasHumanPlayers(socket.roomId)) {
+        const removedAiCount = removeAllAiFactionsFromCurrentRoom();
+        clearCurrentRoomTransientState();
+        gameState.lastUpdate = Date.now();
+        syncSlbmId();
+        console.log(`Room ${socket.roomId} is now idle; stopped simulation and removed ${removedAiCount} AI player(s)`);
+      }
     } catch (error) {
       console.error('Error during disconnect:', error);
     }
@@ -2887,6 +2924,10 @@ function buildBuilding(userId, type, x, y) {
 setInterval(() => {
   const now = Date.now();
   gameRooms.forEach((room, roomId) => {
+    if (!roomHasHumanPlayers(roomId)) {
+      room.lastUpdate = now;
+      return;
+    }
     switchRoom(roomId);
     const deltaTime = (now - gameState.lastUpdate) / 1000;
     gameState.lastUpdate = now;
@@ -2898,6 +2939,7 @@ setInterval(() => {
 // Separate fog of war update (less frequent) - all rooms
 setInterval(() => {
   gameRooms.forEach((room, roomId) => {
+    if (!roomHasHumanPlayers(roomId)) return;
     switchRoom(roomId);
     updateFogOfWar();
   });
@@ -2908,7 +2950,7 @@ let updateCounter = 0;
 setInterval(() => {
   updateCounter++;
   gameRooms.forEach((room, roomId) => {
-    if (!roomHasConnectedClients(roomId)) return;
+    if (!roomHasHumanPlayers(roomId)) return;
 
     switchRoom(roomId);
     const entityCount = gameState.units.size + gameState.buildings.size;
@@ -4427,9 +4469,12 @@ function scheduleAIRespawn(aiUserId) {
   const timer = setTimeout(() => {
     const targetRoom = gameRooms.get(roomId);
     if (!targetRoom) return;
+    targetRoom.aiRespawnTimers.delete(aiUserId);
+    if (!roomHasHumanPlayers(roomId)) {
+      return;
+    }
 
     switchRoom(roomId);
-    targetRoom.aiRespawnTimers.delete(aiUserId);
 
     const aiPlayer = spawnAIPlayer(aiIndex);
     syncSlbmId();
@@ -4482,6 +4527,30 @@ function clearActiveWeaponsForUser(userId) {
   });
 }
 
+function removeAllAiFactionsFromCurrentRoom(options = {}) {
+  if (!gameState || AI_CONFIG.count <= 0) {
+    return 0;
+  }
+
+  const { emitPlayerLeft = false } = options;
+  let removedCount = 0;
+
+  for (let aiIndex = 0; aiIndex < AI_CONFIG.count; aiIndex++) {
+    const aiUserId = getAIUserId(aiIndex);
+    clearAIRespawnTimer(aiUserId);
+    clearActiveWeaponsForUser(aiUserId);
+
+    if (gameState.players.has(aiUserId)) {
+      removePlayerFromCurrentRoom(aiUserId, { emitPlayerLeft });
+      removedCount++;
+    } else {
+      gameState.fogOfWar.delete(aiUserId);
+    }
+  }
+
+  return removedCount;
+}
+
 function resetAllAiFactionsInCurrentRoom() {
   if (!gameState || !currentRoomId || AI_CONFIG.count <= 0) {
     return 0;
@@ -4489,17 +4558,7 @@ function resetAllAiFactionsInCurrentRoom() {
 
   const roomId = currentRoomId;
   roomEmit('systemKillLog', { message: '(시스템에 의해 신속하게 처리되었습니다)' });
-
-  for (let aiIndex = 0; aiIndex < AI_CONFIG.count; aiIndex++) {
-    const aiUserId = getAIUserId(aiIndex);
-    clearAIRespawnTimer(aiUserId);
-    clearActiveWeaponsForUser(aiUserId);
-    if (gameState.players.has(aiUserId)) {
-      removePlayerFromCurrentRoom(aiUserId, { emitPlayerLeft: true });
-    } else {
-      gameState.fogOfWar.delete(aiUserId);
-    }
-  }
+  removeAllAiFactionsFromCurrentRoom({ emitPlayerLeft: true });
 
   let respawnedCount = 0;
   for (let aiIndex = 0; aiIndex < AI_CONFIG.count; aiIndex++) {
@@ -4516,11 +4575,17 @@ function resetAllAiFactionsInCurrentRoom() {
 
 // Initialize AI players
 function initializeAIPlayers() {
-  console.log(`Initializing ${AI_CONFIG.count} AI players...`);
-  
+  let spawnedCount = 0;
   for (let i = 0; i < AI_CONFIG.count; i++) {
-    spawnAIPlayer(i);
+    if (gameState.players.has(getAIUserId(i))) {
+      continue;
+    }
+    const aiPlayer = spawnAIPlayer(i);
+    if (aiPlayer) {
+      spawnedCount++;
+    }
   }
+  return spawnedCount;
 }
 
 // AI decision making
@@ -5453,16 +5518,10 @@ function buildUnitForAI(userId, buildingId, unitType) {
   return false;
 }
 
-// Initialize AI for all rooms when server starts
-gameRooms.forEach((room, roomId) => {
-  switchRoom(roomId);
-  initializeAIPlayers();
-  syncSlbmId();
-});
-
-// Run AI update loop - all rooms
+// Run AI update loop - only for rooms with connected humans
 setInterval(() => {
   gameRooms.forEach((room, roomId) => {
+    if (!roomHasHumanPlayers(roomId)) return;
     switchRoom(roomId);
     updateAI();
     syncSlbmId();
