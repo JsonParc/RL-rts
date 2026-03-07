@@ -4,8 +4,8 @@
   "description": "MW Craft multiplayer RTS game",
   "main": "server.js",
   "engines": {
-    "node": ">=16.0.0",
-    "npm": ">=8.0.0"
+    "node": "20.x",
+    "npm": "10.x"
   },
   "scripts": {
     "start": "node server.js",
