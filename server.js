@@ -124,6 +124,11 @@ function targetIntersectsDamageCircle(centerX, centerY, damageRadius, targetX, t
   const totalRadius = damageRadius + targetRadius;
   return (dx * dx) + (dy * dy) <= totalRadius * totalRadius;
 }
+
+function hasValidSlbmPosition(slbm) {
+  return !!(slbm && Number.isFinite(slbm.currentX) && Number.isFinite(slbm.currentY));
+}
+
 const UNIT_DEFINITIONS = {
   worker: {
     cost: 50,
@@ -3013,7 +3018,7 @@ function updateFogOfWar() {
     
     // Reveal fog around active SLBMs for ALL players
     gameState.activeSlbms.forEach(slbm => {
-      if (!slbm.currentX || !slbm.currentY) return;
+      if (!hasValidSlbmPosition(slbm)) return;
       const slbmVisionRadius = 2000;
       const cellSize = gameState.map.cellSize || 50;
       const gridX = Math.floor(slbm.currentX / cellSize);
@@ -3449,34 +3454,7 @@ function updateGame(deltaTime) {
     // Update current position
     slbm.currentX = slbm.fromX + (slbm.targetX - slbm.fromX) * progress;
     slbm.currentY = slbm.fromY + (slbm.targetY - slbm.fromY) * progress;
-    
-    // Check if arrived at target
-    if (progress >= 1) {
-      applySlbmDamage(slbm);
-      roomEmit('slbmImpact', { id: slbmId, x: slbm.targetX, y: slbm.targetY });
-      
-      // Reveal impact area fog for ALL players temporarily
-      const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
-      const impactVisionRadius = 2000;
-      const gridX = Math.floor(slbm.targetX / cellSize);
-      const gridY = Math.floor(slbm.targetY / cellSize);
-      const gridRadius = Math.ceil(impactVisionRadius / cellSize);
-      gameState.players.forEach((player, playerId) => {
-        const playerFog = gameState.fogOfWar.get(playerId);
-        if (playerFog) {
-          for (let dx = -gridRadius; dx <= gridRadius; dx++) {
-            for (let dy = -gridRadius; dy <= gridRadius; dy++) {
-              if (dx * dx + dy * dy <= gridRadius * gridRadius) {
-                const key = `${gridX + dx}_${gridY + dy}`;
-                playerFog.set(key, { lastSeen: now, explored: true });
-              }
-            }
-          }
-        }
-      });
-      
-      gameState.activeSlbms.delete(slbmId);
-    }
+    slbm.hasReachedTarget = progress >= 1;
   });
 
   // Mine detonation processing
@@ -3889,7 +3867,7 @@ function updateGame(deltaTime) {
     // Defense tower SLBM interception
     gameState.activeSlbms.forEach(slbm => {
       if (slbm.userId === building.userId) return;
-      if (!slbm.currentX || !slbm.currentY) return;
+      if (!hasValidSlbmPosition(slbm)) return;
       const dx = slbm.currentX - building.x;
       const dy = slbm.currentY - building.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
@@ -4137,20 +4115,24 @@ function updateGame(deltaTime) {
       
       // Check enemy SLBMs - only aegis-mode cruisers can target SLBMs
       if (unit.type === 'cruiser' && unit.aegisMode) {
+        let nearestSlbm = null;
+        let nearestSlbmDistSq = baseCombatRange * baseCombatRange;
         gameState.activeSlbms.forEach(slbm => {
           if (slbm.userId === unit.userId) return;
-          if (!slbm.currentX || !slbm.currentY) return;
+          if (!hasValidSlbmPosition(slbm)) return;
           const dx = slbm.currentX - unit.x;
           const dy = slbm.currentY - unit.y;
           const distSq = dx * dx + dy * dy;
-          // Aegis SLBM interception uses full base range (not reduced)
-          const aegisSlbmRange = baseCombatRange;
-          if (distSq < aegisSlbmRange * aegisSlbmRange && distSq < nearestDistSq) {
-            nearestDistSq = distSq;
-            target = slbm;
-            unit.attackTargetType = 'slbm';
+          if (distSq < nearestSlbmDistSq) {
+            nearestSlbmDistSq = distSq;
+            nearestSlbm = slbm;
           }
         });
+        if (nearestSlbm) {
+          nearestDistSq = nearestSlbmDistSq;
+          target = nearestSlbm;
+          unit.attackTargetType = 'slbm';
+        }
       }
     }
     
@@ -4533,6 +4515,39 @@ function clearActiveWeaponsForUser(userId) {
   strikeIdsToDelete.forEach(strikeId => {
     gameState.activeAirstrikes.delete(strikeId);
     roomEmit('airstrikeCancelled', { id: strikeId });
+  });
+
+  // Resolve SLBM destruction/impact after all interceptors acted this tick.
+  gameState.activeSlbms.forEach((slbm, slbmId) => {
+    if (slbm.hp <= 0) {
+      roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
+      gameState.activeSlbms.delete(slbmId);
+      return;
+    }
+    if (!slbm.hasReachedTarget) return;
+
+    applySlbmDamage(slbm);
+    roomEmit('slbmImpact', { id: slbmId, x: slbm.targetX, y: slbm.targetY });
+
+    const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
+    const impactVisionRadius = 2000;
+    const gridX = Math.floor(slbm.targetX / cellSize);
+    const gridY = Math.floor(slbm.targetY / cellSize);
+    const gridRadius = Math.ceil(impactVisionRadius / cellSize);
+    gameState.players.forEach((player, playerId) => {
+      const playerFog = gameState.fogOfWar.get(playerId);
+      if (!playerFog) return;
+      for (let dx = -gridRadius; dx <= gridRadius; dx++) {
+        for (let dy = -gridRadius; dy <= gridRadius; dy++) {
+          if (dx * dx + dy * dy <= gridRadius * gridRadius) {
+            const key = `${gridX + dx}_${gridY + dy}`;
+            playerFog.set(key, { lastSeen: now, explored: true });
+          }
+        }
+      }
+    });
+
+    gameState.activeSlbms.delete(slbmId);
   });
 }
 
