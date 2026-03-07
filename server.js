@@ -9,7 +9,9 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server);
+const io = socketIo(server, {
+  transports: ['websocket']
+});
 
 const APP_NAME = 'MW Craft';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
@@ -520,6 +522,43 @@ function buildClientUnitsPayload() {
   return units;
 }
 
+function buildClientUnitSyncPayload() {
+  const units = [];
+  gameState.units.forEach(unit => {
+    units.push({
+      id: unit.id,
+      x: unit.x,
+      y: unit.y,
+      hp: unit.hp,
+      targetX: unit.targetX ?? null,
+      targetY: unit.targetY ?? null,
+      gatheringResourceId: unit.gatheringResourceId ?? null,
+      buildingType: unit.buildingType ?? null,
+      buildTargetX: unit.buildTargetX ?? null,
+      buildTargetY: unit.buildTargetY ?? null,
+      sourceDestroyerId: unit.sourceDestroyerId ?? null,
+      isDetected: !!unit.isDetected,
+      kills: unit.kills ?? 0,
+      aimedShot: !!unit.aimedShot,
+      aimedShotCooldownUntil: unit.aimedShotCooldownUntil ?? null,
+      aegisMode: !!unit.aegisMode,
+      isIsolated: !!unit.isIsolated,
+      aircraft: unit.aircraft ?? null,
+      aircraftDeployed: unit.aircraftDeployed ?? null,
+      aircraftQueue: unit.aircraftQueue ?? [],
+      producingAircraft: unit.producingAircraft ?? null,
+      attackMove: !!unit.attackMove,
+      attackTargetId: unit.attackTargetId ?? null,
+      attackTargetType: unit.attackTargetType ?? null,
+      holdPosition: !!unit.holdPosition,
+      searchCooldownUntil: unit.searchCooldownUntil ?? null,
+      airstrikeReady: !!unit.airstrikeReady,
+      airstrikeCooldownUntil: unit.airstrikeCooldownUntil ?? null
+    });
+  });
+  return units;
+}
+
 function buildClientBuildingsPayload() {
   const buildings = [];
   gameState.buildings.forEach(building => {
@@ -531,6 +570,28 @@ function buildClientBuildingsPayload() {
       y: building.y,
       hp: building.hp,
       maxHp: building.maxHp,
+      buildProgress: building.buildProgress,
+      slbmCount: building.slbmCount ?? 0,
+      producing: building.producing ?? null,
+      missileProducing: building.missileProducing ?? null,
+      missileQueue: building.missileQueue ?? [],
+      attackTargetId: building.attackTargetId ?? null,
+      attackTargetType: building.attackTargetType ?? null,
+      turretAngle: building.turretAngle ?? null,
+      turretTargetX: building.turretTargetX ?? null,
+      turretTargetY: building.turretTargetY ?? null,
+      lastTurretTargetTime: building.lastTurretTargetTime ?? null
+    });
+  });
+  return buildings;
+}
+
+function buildClientBuildingSyncPayload() {
+  const buildings = [];
+  gameState.buildings.forEach(building => {
+    buildings.push({
+      id: building.id,
+      hp: building.hp,
       buildProgress: building.buildProgress,
       slbmCount: building.slbmCount ?? 0,
       producing: building.producing ?? null,
@@ -683,6 +744,11 @@ function roomEmit(event, data) {
   } else {
     io.emit(event, data);
   }
+}
+
+function roomHasConnectedClients(roomId) {
+  const sockets = io.sockets.adapter.rooms.get(roomId);
+  return !!(sockets && sockets.size > 0);
 }
 
 // Switch context to a specific room
@@ -2901,6 +2967,8 @@ let updateCounter = 0;
 setInterval(() => {
   updateCounter++;
   gameRooms.forEach((room, roomId) => {
+    if (!roomHasConnectedClients(roomId)) return;
+
     switchRoom(roomId);
     const entityCount = gameState.units.size + gameState.buildings.size;
     let stride = 1;
@@ -2911,8 +2979,8 @@ setInterval(() => {
 
     io.to(roomId).volatile.emit('gameUpdate', {
       players: buildClientPlayersPayload(),
-      units: buildClientUnitsPayload(),
-      buildings: buildClientBuildingsPayload()
+      units: buildClientUnitSyncPayload(),
+      buildings: buildClientBuildingSyncPayload()
     });
   });
 }, NETWORK_UPDATE_BASE_MS);

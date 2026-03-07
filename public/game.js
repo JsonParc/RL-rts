@@ -621,15 +621,51 @@ function normalizeBuildingPayload(building) {
     return building;
 }
 
+function mergeUnitState(existingUnit, nextUnit, nowMs) {
+    if (!existingUnit) {
+        return {
+            ...nextUnit,
+            interpDisplayX: nextUnit.x,
+            interpDisplayY: nextUnit.y
+        };
+    }
+
+    const merged = {
+        ...existingUnit,
+        ...nextUnit
+    };
+
+    merged.interpPrevX = existingUnit.interpDisplayX !== undefined ? existingUnit.interpDisplayX : existingUnit.x;
+    merged.interpPrevY = existingUnit.interpDisplayY !== undefined ? existingUnit.interpDisplayY : existingUnit.y;
+    merged.interpTargetX = merged.x;
+    merged.interpTargetY = merged.y;
+    merged.interpDisplayX = merged.interpPrevX;
+    merged.interpDisplayY = merged.interpPrevY;
+    merged.interpStartTime = nowMs;
+
+    const incomingTargetTime = Number.isFinite(nextUnit.lastTurretTargetTime) ? nextUnit.lastTurretTargetTime : -Infinity;
+    const existingTargetTime = Number.isFinite(existingUnit.lastTurretTargetTime) ? existingUnit.lastTurretTargetTime : -Infinity;
+    if (existingTargetTime > incomingTargetTime) {
+        merged.lastTurretTargetX = existingUnit.lastTurretTargetX;
+        merged.lastTurretTargetY = existingUnit.lastTurretTargetY;
+        merged.lastTurretTargetTime = existingUnit.lastTurretTargetTime;
+    }
+
+    return merged;
+}
+
 function mergeBuildingVisualState(existingBuilding, nextBuilding) {
-    const merged = normalizeBuildingPayload(nextBuilding);
+    const normalizedBuilding = normalizeBuildingPayload(nextBuilding);
+    const merged = existingBuilding
+        ? { ...existingBuilding, ...normalizedBuilding }
+        : normalizedBuilding;
     if (!existingBuilding) return merged;
 
     if (!Number.isFinite(merged.turretAngle) && Number.isFinite(existingBuilding.turretAngle)) {
         merged.turretAngle = existingBuilding.turretAngle;
     }
 
-    const incomingTargetTime = Number.isFinite(merged.lastTurretTargetTime) ? merged.lastTurretTargetTime : -Infinity;
+    const incomingTargetTime = Number.isFinite(normalizedBuilding.lastTurretTargetTime) ? normalizedBuilding.lastTurretTargetTime : -Infinity;
     const existingTargetTime = Number.isFinite(existingBuilding.lastTurretTargetTime) ? existingBuilding.lastTurretTargetTime : -Infinity;
     if (existingTargetTime > incomingTargetTime) {
         merged.turretTargetX = existingBuilding.turretTargetX;
@@ -4379,6 +4415,7 @@ function connectToGame() {
             token: gameState.token,
             roomId: gameState.selectedRoom || localStorage.getItem('selectedRoom') || 'server1'
         },
+        transports: ['websocket'],
         reconnection: false // 자동 재연결 비활성화
     });
     
@@ -4526,29 +4563,8 @@ function connectToGame() {
         // Update units with interpolation support
         data.units.forEach(u => {
             const existingUnit = gameState.units.get(u.id);
-            if (existingUnit) {
-                // Store previous display position for interpolation
-                u.interpPrevX = existingUnit.interpDisplayX !== undefined ? existingUnit.interpDisplayX : existingUnit.x;
-                u.interpPrevY = existingUnit.interpDisplayY !== undefined ? existingUnit.interpDisplayY : existingUnit.y;
-                u.interpTargetX = u.x;
-                u.interpTargetY = u.y;
-                u.interpDisplayX = u.interpPrevX;
-                u.interpDisplayY = u.interpPrevY;
-                u.interpStartTime = nowMs;
-                // Preserve client-side visual properties not tracked by server
-                if (existingUnit.commandAngle !== undefined) u.commandAngle = existingUnit.commandAngle;
-                if (existingUnit.turretAngles) u.turretAngles = existingUnit.turretAngles;
-                if (existingUnit.lastTurretTargetTime !== undefined) {
-                    u.lastTurretTargetX = existingUnit.lastTurretTargetX;
-                    u.lastTurretTargetY = existingUnit.lastTurretTargetY;
-                    u.lastTurretTargetTime = existingUnit.lastTurretTargetTime;
-                }
-            } else {
-                // New unit - no interpolation needed
-                u.interpDisplayX = u.x;
-                u.interpDisplayY = u.y;
-            }
-            gameState.units.set(u.id, u);
+            const mergedUnit = mergeUnitState(existingUnit, u, nowMs);
+            gameState.units.set(mergedUnit.id, mergedUnit);
         });
         
         // Track which buildings exist
@@ -4579,14 +4595,16 @@ function connectToGame() {
     });
     
     socket.on('unitCreated', (unit) => {
-        gameState.units.set(unit.id, unit);
+        const mergedUnit = mergeUnitState(gameState.units.get(unit.id), unit, Date.now());
+        gameState.units.set(mergedUnit.id, mergedUnit);
         fogDirty = true;
         minimapDirty = true;
     });
     
     socket.on('buildingCreated', (building) => {
-        const normalizedBuilding = normalizeBuildingPayload(building);
-        gameState.buildings.set(normalizedBuilding.id, normalizedBuilding);
+        const existingBuilding = gameState.buildings.get(building.id);
+        const mergedBuilding = mergeBuildingVisualState(existingBuilding, building);
+        gameState.buildings.set(mergedBuilding.id, mergedBuilding);
         fogDirty = true;
         minimapDirty = true;
     });
