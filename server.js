@@ -701,6 +701,16 @@ function syncSlbmId() {
   }
 }
 
+function calculatePlayerScore(player) {
+  if (!player) return 0;
+
+  const resources = Number.isFinite(player.resources) ? player.resources : 0;
+  const population = Number.isFinite(player.population) ? player.population : 0;
+  const combatPower = Number.isFinite(player.combatPower) ? player.combatPower : 0;
+
+  return Math.floor(resources + population * 100 + combatPower * 50);
+}
+
 // Initialize map
 function initializeMap() {
   const MAP_SIZE = mapConfig.mapSize;
@@ -3290,7 +3300,7 @@ function updateGame(deltaTime) {
   
   gameState.players.forEach(player => {
     // Update score
-    player.score = Math.floor(player.resources + player.population * 100 + player.combatPower * 50);
+    player.score = calculatePlayerScore(player);
   });
   
   // Process building production queues
@@ -4257,41 +4267,32 @@ function updateGame(deltaTime) {
 
 // Ranking endpoint
 app.get('/api/rankings', (req, res) => {
-  // Rankings should reflect only currently active players in live rooms.
-  // This prevents stale DB entries from appearing for disconnected or never-joined players.
+  // Rankings panel is room-local. Never merge same-named AI players across rooms.
   const requestedRoomId = typeof req.query.roomId === 'string' ? req.query.roomId : null;
-  const roomsToInspect = requestedRoomId && gameRooms.has(requestedRoomId)
-    ? [gameRooms.get(requestedRoomId)]
-    : [...gameRooms.values()];
-  const liveRankings = new Map();
+  const room =
+    (requestedRoomId && gameRooms.get(requestedRoomId)) ||
+    gameRooms.get('server1') ||
+    [...gameRooms.values()][0];
 
-  roomsToInspect.forEach((room) => {
-    room.players.forEach((player) => {
-      if (!player) return;
-      if (!player.isAI && !player.online) return;
+  if (!room) {
+    res.json([]);
+    return;
+  }
 
-      const rankingKey = player.isAI ? `ai:${player.username}` : `human:${player.userId}`;
-      const rankingEntry = {
-        username: player.username,
-        resources: Math.floor(player.resources || 0),
-        population: player.population || 0,
-        combat_power: player.combatPower || 0,
-        score: Math.floor(player.score || 0)
-      };
-
-      const existing = liveRankings.get(rankingKey);
-      if (!existing || rankingEntry.score > existing.score) {
-        liveRankings.set(rankingKey, rankingEntry);
-      }
-    });
-  });
-
-  const filteredRankings = [...liveRankings.values()]
+  const rankings = [...room.players.values()]
+    .filter(player => player && (player.isAI || player.online))
+    .map((player) => ({
+      username: player.username,
+      resources: Math.floor(player.resources || 0),
+      population: player.population || 0,
+      combat_power: player.combatPower || 0,
+      score: calculatePlayerScore(player)
+    }))
     .filter(player => player.score > 0)
     .sort((a, b) => (b.score || 0) - (a.score || 0))
     .slice(0, 10);
 
-  res.json(filteredRankings);
+  res.json(rankings);
 });
 
 // Auto-save disabled (no persistence)
