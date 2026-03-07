@@ -655,32 +655,53 @@ let gameState = {
 };
 
 // ==================== SOUND EFFECTS SYSTEM (MP3 Files) ====================
-const soundLaunch = new Audio('launchsound.mp3');
-const soundBomb = new Audio('bombsound.mp3');
-const soundCannon = new Audio('cannonsound.mp3');
-soundLaunch.volume = 0.5;
-soundBomb.volume = 0.6;
-soundCannon.volume = 0.4;
+function createSound(src, options = {}) {
+    const audio = new Audio(src);
+    audio.preload = 'auto';
+    audio.volume = options.volume ?? 1;
+    audio.loop = !!options.loop;
+    audio.addEventListener('error', () => {
+        console.warn(`Failed to load sound: ${src}`);
+    });
+    return audio;
+}
 
-function playSoundLaunch() {
+const soundLaunch = createSound('/launchsound.mp3', { volume: 0.5, loop: true });
+const soundBomb = createSound('/bombsound.mp3', { volume: 0.6 });
+const soundCannon = createSound('/cannonsound.mp3', { volume: 0.4 });
+
+function playOneShot(soundTemplate) {
     try {
+        const sound = soundTemplate.cloneNode();
+        sound.volume = soundTemplate.volume;
+        sound.play().catch(() => {});
+    } catch(e) {}
+}
+
+function startSlbmFlightSound() {
+    try {
+        const hasActiveSlbm = slbmMissiles.some(missile => !missile.impacted);
+        if (!hasActiveSlbm || !soundLaunch.paused) return;
         soundLaunch.currentTime = 0;
         soundLaunch.play().catch(() => {});
     } catch(e) {}
 }
 
-function playSoundBomb() {
+function stopSlbmFlightSound(force = false) {
     try {
-        soundBomb.currentTime = 0;
-        soundBomb.play().catch(() => {});
+        const hasActiveSlbm = slbmMissiles.some(missile => !missile.impacted);
+        if (!force && hasActiveSlbm) return;
+        soundLaunch.pause();
+        soundLaunch.currentTime = 0;
     } catch(e) {}
 }
 
+function playSoundBomb() {
+    playOneShot(soundBomb);
+}
+
 function playSoundCannon() {
-    try {
-        soundCannon.currentTime = 0;
-        soundCannon.play().catch(() => {});
-    } catch(e) {}
+    playOneShot(soundCannon);
 }
 // ==================== END SOUND EFFECTS ====================
 
@@ -4166,6 +4187,7 @@ function logout() {
     console.log('Logging out...');
     isLoggingIn = false;
     slbmMissiles = [];
+    stopSlbmFlightSound(true);
     attackProjectiles = [];
     localStorage.removeItem('token');
     stopUpdate();
@@ -4272,6 +4294,7 @@ function connectToGame() {
     
     socket.on('disconnect', (reason) => {
         console.log('Disconnected:', reason);
+        stopSlbmFlightSound(true);
         if (reason === 'io server disconnect' || reason === 'io client disconnect') {
             // Don't auto-reconnect
         }
@@ -4313,6 +4336,7 @@ function connectToGame() {
             // Clear fog of war for fresh start
             gameState.fogOfWar.clear();
             slbmMissiles = [];
+            stopSlbmFlightSound(true);
             attackProjectiles = [];
             fogDirty = true;
             minimapDirty = true;
@@ -4508,8 +4532,8 @@ function connectToGame() {
         });
         minimapDirty = true;
         
-        // Play launch sound (SLBM always audible as it reveals fog)
-        playSoundLaunch();
+        // Keep SLBM flight sound on only while one or more missiles are still flying.
+        startSlbmFlightSound();
         
         // Decrease missile count if it's our missile
         if (data.userId === gameState.userId) {
@@ -4704,8 +4728,7 @@ function connectToGame() {
         });
         
         // Play bomb sound (SLBM impact always audible)
-        soundLaunch.pause();
-        soundLaunch.currentTime = 0;
+        stopSlbmFlightSound();
         playSoundBomb();
         
         // Clean up old missiles after 30 seconds
@@ -4721,6 +4744,7 @@ function connectToGame() {
     socket.on('slbmDestroyed', (data) => {
         // SLBM was intercepted - remove it from visualization
         slbmMissiles = slbmMissiles.filter(missile => missile.id !== data.id);
+        stopSlbmFlightSound();
         minimapDirty = true;
         console.log('SLBM intercepted at', data.x, data.y);
     });
