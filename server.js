@@ -11,7 +11,8 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
-const JWT_SECRET = 'your-secret-key-change-this-in-production';
+const APP_NAME = 'MW Craft';
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
 const GAME_TICK_RATE = 30; // 30 ticks per second
 const db = new Database('game.db');
 const COMBAT_SPATIAL_CELL_SIZE = 700;
@@ -5301,8 +5302,12 @@ setInterval(() => {
 
 // ==================== END AI PLAYER SYSTEM ====================
 
+if (!process.env.JWT_SECRET) {
+  console.warn('JWT_SECRET is not set. Using insecure fallback secret.');
+}
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Naval Warfare RTS server running on port ${PORT}`);
+  console.log(`${APP_NAME} server running on port ${PORT}`);
 });
 

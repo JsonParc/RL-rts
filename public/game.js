@@ -32,6 +32,7 @@ let lastMinimapInvalidateTime = 0;
 let isPointerInCanvas = false;
 let attackTarget = null; // { id, type, name, x, y } - currently designated attack target for HUD display
 let commandGroup = new Set(); // Units that have been given commands and should NOT be deselected by panel clicks
+const APP_NAME = 'MW Craft';
 const CAMERA_EDGE_PAN_SPEED = 3800;
 const FOG_UPDATE_INTERVAL = 650;
 const MINIMAP_UPDATE_INTERVAL = 500;
@@ -4844,7 +4845,16 @@ function updateFogOfWar(force = false) {
     minimapDirty = true;
 }
 
+function applyBranding() {
+    document.title = APP_NAME;
+    const loginTitle = document.querySelector('#loginScreen h1');
+    if (loginTitle) {
+        loginTitle.textContent = APP_NAME;
+    }
+}
+
 // Initialize - show login screen by default
+applyBranding();
 document.getElementById('loginScreen').classList.add('active');
 document.getElementById('gameScreen').classList.remove('active');
 

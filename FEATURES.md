@@ -1,4 +1,4 @@
-# Naval Warfare RTS - 새로운 기능 안내
+# MW Craft - 새로운 기능 안내
 
 ## 🎮 주요 업데이트
 

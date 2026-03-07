@@ -1,7 +1,7 @@
 {
-  "name": "naval-warfare-rts",
+  "name": "mw-craft",
   "version": "1.0.0",
-  "description": "Large-scale multiplayer naval warfare RTS game",
+  "description": "MW Craft multiplayer RTS game",
   "main": "server.js",
   "engines": {
     "node": ">=16.0.0",
