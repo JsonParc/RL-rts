@@ -510,6 +510,7 @@ function buildClientUnitsPayload() {
       attackMove: !!unit.attackMove,
       attackTargetId: unit.attackTargetId ?? null,
       attackTargetType: unit.attackTargetType ?? null,
+      holdPosition: !!unit.holdPosition,
       searchCooldownUntil: unit.searchCooldownUntil ?? null,
       airstrikeReady: !!unit.airstrikeReady,
       airstrikeCooldownUntil: unit.airstrikeCooldownUntil ?? null,
@@ -2044,6 +2045,7 @@ io.on('connection', (socket) => {
       const unit = gameState.units.get(unitId);
       if (unit && unit.userId === socket.userId) {
         if (assignMoveTarget(unit, targetX, targetY)) {
+          unit.holdPosition = false;
           unit.attackMove = false;
           unit.attackTargetId = null;
           unit.attackTargetType = null;
@@ -2058,6 +2060,8 @@ io.on('connection', (socket) => {
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (unit && unit.userId === socket.userId) {
+        unit.holdPosition = false;
+        unit.attackMove = false;
         unit.attackTargetId = targetId;
         unit.attackTargetType = targetType;
       }
@@ -2083,6 +2087,7 @@ io.on('connection', (socket) => {
     const resource = gameState.map.resources.find(r => r.id === resourceId);
     
     if (unit && unit.userId === socket.userId && unit.type === 'worker' && resource) {
+      unit.holdPosition = false;
       unit.gatheringResourceId = resourceId;
       unit.targetX = resource.x;
       unit.targetY = resource.y;
@@ -2101,6 +2106,7 @@ io.on('connection', (socket) => {
     workerIds.forEach(workerId => {
       const unit = gameState.units.get(workerId);
       if (unit && unit.userId === socket.userId && unit.type === 'worker') {
+        unit.holdPosition = false;
         unit.buildingType = buildingType;
         unit.buildTargetX = x;
         unit.buildTargetY = y;
@@ -2270,9 +2276,31 @@ io.on('connection', (socket) => {
       const unit = gameState.units.get(unitId);
       if (unit && unit.userId === socket.userId) {
         if (assignMoveTarget(unit, targetX, targetY)) {
+          unit.holdPosition = false;
           unit.attackMove = true; // Flag for attack-move behavior
         }
       }
+    });
+  });
+
+  socket.on('holdPosition', (data) => {
+    switchRoom(socket.roomId);
+    const { unitIds } = data;
+    if (!Array.isArray(unitIds)) return;
+    unitIds.forEach(unitId => {
+      const unit = gameState.units.get(unitId);
+      if (!unit || unit.userId !== socket.userId) return;
+      unit.holdPosition = true;
+      unit.attackMove = false;
+      unit.attackTargetId = null;
+      unit.attackTargetType = null;
+      unit.targetX = null;
+      unit.targetY = null;
+      unit.pathWaypoints = null;
+      unit.gatheringResourceId = null;
+      unit.buildingType = null;
+      unit.buildTargetX = null;
+      unit.buildTargetY = null;
     });
   });
 
@@ -4014,7 +4042,7 @@ function updateGame(deltaTime) {
     
     // 2) If no specific target, auto-detect nearest enemy within range
     //    Submarines do NOT auto-attack unless on attack-move ('A' key)
-    if (!target && (unit.type !== 'submarine' || unit.attackMove)) {
+    if (!target && (unit.type !== 'submarine' || unit.attackMove || unit.holdPosition)) {
       let nearestDistSq = combatRange * combatRange;
 
       // Check enemy units (spatial query)
@@ -4213,7 +4241,7 @@ function updateGame(deltaTime) {
             unit.attackTargetType = null;
           }
         }
-      } else if (unit.attackTargetId || unit.attackMove) {
+      } else if ((unit.attackTargetId || unit.attackMove) && !unit.holdPosition) {
         // Out of range but has explicit attack command - move towards target
         const moveToX = (unit.attackTargetType === 'slbm') ? target.currentX : target.x;
         const moveToY = (unit.attackTargetType === 'slbm') ? target.currentY : target.y;
@@ -4231,9 +4259,13 @@ function updateGame(deltaTime) {
 app.get('/api/rankings', (req, res) => {
   // Rankings should reflect only currently active players in live rooms.
   // This prevents stale DB entries from appearing for disconnected or never-joined players.
+  const requestedRoomId = typeof req.query.roomId === 'string' ? req.query.roomId : null;
+  const roomsToInspect = requestedRoomId && gameRooms.has(requestedRoomId)
+    ? [gameRooms.get(requestedRoomId)]
+    : [...gameRooms.values()];
   const liveRankings = new Map();
 
-  gameRooms.forEach((room) => {
+  roomsToInspect.forEach((room) => {
     room.players.forEach((player) => {
       if (!player) return;
       if (!player.isAI && !player.online) return;
