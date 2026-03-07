@@ -1,0 +1,59 @@
+{
+  "mapSize": 40000,
+  "gridSize": 800,
+  "islands": {
+    "count": 25,
+    "minRadius": 8,
+    "maxRadius": 25
+  },
+  "resources": {
+    "perIsland": {
+      "min": 2,
+      "max": 3
+    },
+    "radius": 40,
+    "amount": {
+      "min": 8000,
+      "max": 15000
+    }
+  },
+  "spawnZones": {
+    "minDistanceFromEdge": 2000,
+    "minDistanceFromOtherBases": 5000
+  },
+  "vision": {
+    "workerVisionRadius": 1000,
+    "unitVisionRadius": 1500,
+    "buildingVisionRadius": 2000,
+    "fogFadeTime": 30000
+  },
+  "images": {
+    "map": "assets/maps/world-map.png",
+    "units": {
+      "worker": "assets/units/worker.png",
+      "destroyer": "assets/units/destroyer.png",
+      "cruiser": "assets/units/cruiser.png",
+      "battleship": "assets/units/battleship.png",
+      "carrier": "assets/units/carrier.png",
+      "submarine": "assets/units/submarine.png"
+    },
+    "buildings": {
+      "headquarters": "assets/images/buildings/hq.png",
+      "shipyard": "assets/buildings/shipyard.png",
+      "resource_dock": "assets/buildings/resource_dock.png",
+      "defense_tower": "assets/buildings/defense_tower.png",
+      "naval_academy": "assets/buildings/naval_academy.png",
+      "research_lab": "assets/buildings/research_lab.png",
+      "missile_silo": "assets/buildings/missile_silo.png"
+    },
+    "resources": {
+      "metal": "assets/resources/metal.png",
+      "oil": "assets/resources/oil.png"
+    },
+    "particles": {
+      "explosion": "assets/particles/explosion.png",
+      "torpedo": "assets/particles/torpedo.png",
+      "slbm": "assets/particles/slbm.png"
+    }
+  }
+}

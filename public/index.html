@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Naval Warfare RTS</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="loginScreen" class="screen active">
+        <div class="login-container">
+            <h1>⚓ Naval Warfare RTS</h1>
+            <div class="login-form">
+                <input type="text" id="username" placeholder="이름 입력" autocomplete="username">
+                <div style="margin: 8px 0;">
+                    <label style="color: #aaa; font-size: 13px; display: block; margin-bottom: 4px;">서버 선택</label>
+                    <select id="serverSelect" style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #8f99a3; background: #20252b; color: #fff; font-size: 14px; cursor: pointer;">
+                        <option value="server1">서버 1</option>
+                        <option value="server2">서버 2</option>
+                    </select>
+                    <div id="serverInfo" style="color: #888; font-size: 11px; margin-top: 4px;"></div>
+                </div>
+                <button id="loginBtn">접속</button>
+                <div id="authError" class="error"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Game Screen -->
+    <div id="gameScreen" class="screen">
+        <!-- Top HUD -->
+        <div id="topHud">
+            <div class="hud-section">
+                <span class="hud-label">에너지:</span>
+                <span id="resources">0</span>
+            </div>
+            <div class="hud-section">
+                <span class="hud-label">미사일:</span>
+                <span id="missileCount">0</span>
+            </div>
+            <div class="hud-section">
+                <span class="hud-label">인구:</span>
+                <span id="population">0</span> / <span id="maxPopulation">0</span>
+            </div>
+            <div class="hud-section">
+                <span class="hud-label">전투력:</span>
+                <span id="combatPower">0</span>
+            </div>
+            <div class="hud-section">
+                <span class="hud-label">점수:</span>
+                <span id="score">0</span>
+            </div>
+            <button id="resetBtn" class="reset-btn" title="내 기지와 모든 데이터 초기화">내 기지 초기화</button>
+            <button id="logoutBtn" class="logout-btn">로그아웃</button>
+            <span id="modeIndicator" style="display:none;color:#ff4444;font-weight:bold;margin-left:15px;font-size:14px;">⚔️ 공격 모드 (클릭으로 대상 지정)</span>
+        </div>
+
+        <!-- Rankings Panel -->
+        <div id="rankingsPanel">
+            <h3>🏆 상위 10위 랭킹</h3>
+            <div id="rankingsList"></div>
+        </div>
+
+        <!-- Unit Action Panel (for submarines and other units) -->
+        <div id="unitActionPanel" style="display:none;"></div>
+
+        <!-- Kill Log Container (displays elimination messages) -->
+        <div id="killLogContainer"></div>
+
+        <!-- Main Game Canvas -->
+        <canvas id="gameCanvas"></canvas>
+
+        <!-- Minimap -->
+        <div id="minimapContainer">
+            <canvas id="minimap"></canvas>
+        </div>
+
+        <!-- Bottom Unit Info Panel -->
+        <div id="bottomPanel">
+            <!-- Portrait area (left) -->
+            <div id="unitPortrait">
+                <div id="portraitPlaceholder"></div>
+            </div>
+            <!-- Stats area (center-left) -->
+            <div id="unitStats">
+                <div id="unitStatsContent">
+                    <div class="stat-row"><span class="stat-label">⚔ 공격력</span><span id="statDamage" class="stat-value">-</span></div>
+                    <div class="stat-row"><span class="stat-label">🎯 사거리</span><span id="statRange" class="stat-value">-</span></div>
+                    <div class="stat-row"><span class="stat-label">❤ 체력</span><span id="statHp" class="stat-value">-</span></div>
+                    <div class="stat-row"><span class="stat-label">💀 킬 수</span><span id="statKills" class="stat-value">-</span></div>
+                </div>
+                <div id="targetInfo">
+                    <span id="targetLabel">타겟 없음</span>
+                </div>
+            </div>
+            <!-- Skills / Production area (right) -->
+            <div id="unitSkills">
+                <div id="productionQueueDisplay" style="display:none;">
+                    <div id="productionQueueIcons" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;"></div>
+                    <div id="productionProgressInline" style="display:none;">
+                        <div id="productionLabelInline" style="color:#ffcc00;font-size:11px;margin-bottom:2px;"></div>
+                        <div style="background:rgba(255,255,255,0.1);border-radius:3px;height:10px;overflow:hidden;">
+                            <div id="productionFillInline" style="background:linear-gradient(90deg,#7e8892,#c8d0d6);height:100%;width:0%;transition:width 0.3s;border-radius:3px;"></div>
+                        </div>
+                    </div>
+                    <div id="productionButtons" style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px;"></div>
+                </div>
+                <div class="skill-slot" id="skillSlot1" style="display:none;">
+                    <button class="skill-btn" id="skillBtn1">🚀 SLBM</button>
+                    <div class="skill-desc" id="skillDesc1">핵미사일 발사 - 반경 800 범위 피해</div>
+                </div>
+                <div class="skill-slot" id="skillSlot2" style="display:none;">
+                    <button class="skill-btn" id="skillBtn2">🔧 미사일 제작</button>
+                    <div class="skill-desc" id="skillDesc2">에너지 500으로 미사일 1기 제작</div>
+                </div>
+                <div id="slbmProgressBar" style="display:none;margin-top:4px;">
+                    <div id="slbmProgressLabel" style="color:#ce93d8;font-size:10px;margin-bottom:2px;"></div>
+                    <div style="background:rgba(255,255,255,0.1);border-radius:3px;height:8px;overflow:hidden;">
+                        <div id="slbmProgressFill" style="background:linear-gradient(90deg,#9c27b0,#ce93d8);height:100%;width:0%;transition:width 0.3s;border-radius:3px;"></div>
+                    </div>
+                </div>
+                <div class="skill-slot" id="skillSlot3" style="display:none;">
+                    <button class="skill-btn" id="skillBtn3">✈️ 함재기 제작</button>
+                    <div class="skill-desc" id="skillDesc3">에너지 100으로 함재기 제작</div>
+                </div>
+                <div class="skill-slot" id="skillSlot4" style="display:none;">
+                    <button class="skill-btn" id="skillBtn4">✈️ 공중강습</button>
+                    <div class="skill-desc" id="skillDesc4">함재기 10기 소모하여 범위 폭격 (3회)</div>
+                </div>
+                <div class="skill-slot" id="skillSlot5" style="display:none;">
+                    <button class="skill-btn" id="skillBtn5">🎯 조준 사격</button>
+                    <div class="skill-desc" id="skillDesc5">다음 공격의 사거리와 시야 2배</div>
+                </div>
+                <div class="skill-slot" id="skillSlot6" style="display:none;">
+                    <button class="skill-btn" id="skillBtn6">🛡️ 이지스 모드</button>
+                    <div class="skill-desc" id="skillDesc6">SLBM 요격 가능 / 공격력↓ 방어력↑ 사거리↓</div>
+                </div>
+                <div class="skill-slot" id="skillSlot7" style="display:none;">
+                    <button class="skill-btn" id="skillBtn7">🔍 탐색</button>
+                    <div class="skill-desc" id="skillDesc7">시야 내 잠수함/기뢰 발견 (쿨 16초)</div>
+                </div>
+                <div class="skill-slot" id="skillSlot8" style="display:none;">
+                    <button class="skill-btn" id="skillBtn8">💣 기뢰매설</button>
+                    <div class="skill-desc" id="skillDesc8">클릭한 위치에 기뢰를 설치합니다</div>
+                </div>
+                <div id="aircraftProgressBar" style="display:none;margin-top:4px;">
+                    <div id="aircraftProgressLabel" style="color:#c8d0d6;font-size:10px;margin-bottom:2px;"></div>
+                    <div style="background:rgba(255,255,255,0.1);border-radius:3px;height:8px;overflow:hidden;">
+                        <div id="aircraftProgressFill" style="background:linear-gradient(90deg,#7e8892,#c8d0d6);height:100%;width:0%;transition:width 0.3s;border-radius:3px;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Selection Info (shown above bottom panel for multi-select) -->
+        <div id="selectionInfo"></div>
+
+        <!-- Worker Build Menu (now rendered dynamically in skill panel) -->
+        <div id="workerBuildMenu" style="display:none;"></div>
+
+        <!-- SLBM Instructions -->
+        <div id="slbmInstructions" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(255,0,0,0.9); padding: 20px; border-radius: 10px; color: white; display: none; font-size: 18px; text-align: center;">
+            <strong>SLBM 목표 지정</strong><br>
+            클릭하여 미사일 발사<br>
+            <small>ESC로 취소</small>
+        </div>
+        <div id="airstrikeInstructions" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(255,120,0,0.9); padding: 20px; border-radius: 10px; color: white; display: none; font-size: 18px; text-align: center;">
+            <strong>공중강습 목표 지정</strong><br>
+            클릭하여 폭격 지점 설정<br>
+            <small>ESC로 취소</small>
+        </div>
+        <div id="mineInstructions" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(50,50,50,0.9); padding: 20px; border-radius: 10px; color: white; display: none; font-size: 18px; text-align: center;">
+            <strong>기뢰매설 위치 지정</strong><br>
+            클릭하여 기뢰 설치<br>
+            <small>ESC로 취소</small>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.3.2/dist/pixi.min.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="game.js"></script>
+</body>
+</html>

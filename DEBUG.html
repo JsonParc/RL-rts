@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔍 디버깅 모드 - Naval Warfare RTS</title>
+    <style>
+        body {
+            font-family: 'Consolas', 'Monaco', monospace;
+            max-width: 900px;
+            margin: 30px auto;
+            padding: 30px;
+            background: #1a1a1a;
+            color: #00ff00;
+        }
+        h1 {
+            color: #00ff00;
+            text-align: center;
+            font-size: 36px;
+            text-shadow: 0 0 10px #00ff00;
+        }
+        .box {
+            background: #0a0a0a;
+            padding: 20px;
+            margin: 20px 0;
+            border: 2px solid #00ff00;
+            border-radius: 8px;
+        }
+        .box h2 {
+            color: #00ff00;
+            margin-top: 0;
+            border-bottom: 1px solid #00ff00;
+            padding-bottom: 10px;
+        }
+        code {
+            background: #000;
+            padding: 2px 6px;
+            border: 1px solid #00ff00;
+            color: #0ff;
+        }
+        .step {
+            margin: 15px 0;
+            padding: 10px;
+            background: rgba(0, 255, 0, 0.05);
+            border-left: 3px solid #00ff00;
+        }
+        .button {
+            display: inline-block;
+            padding: 15px 30px;
+            background: #00ff00;
+            color: #000;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            margin: 10px 5px;
+            text-align: center;
+        }
+        .button:hover {
+            background: #00cc00;
+        }
+        .center {
+            text-align: center;
+            margin: 30px 0;
+        }
+        .warning {
+            background: rgba(255, 0, 0, 0.1);
+            border-color: #ff0000;
+            color: #ff6666;
+        }
+        .success {
+            background: rgba(0, 255, 0, 0.1);
+        }
+        ol, ul {
+            line-height: 1.8;
+        }
+        .highlight {
+            color: #ffff00;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 디버깅 모드 활성화</h1>
+
+    <div class="box success">
+        <h2>✅ 디버깅 로그 추가됨!</h2>
+        <p>이제 정확한 문제를 찾을 수 있습니다. 서버와 클라이언트 모두 상세한 로그가 출력됩니다.</p>
+    </div>
+
+    <div class="box">
+        <h2>📋 단계별 테스트 방법</h2>
+        
+        <div class="step">
+            <h3>1단계: 브라우저 준비</h3>
+            <ol>
+                <li><code>Ctrl + Shift + R</code> 로 완전 새로고침</li>
+                <li><code>F12</code> 눌러서 개발자 도구 열기</li>
+                <li><code>Console</code> 탭 선택</li>
+                <li>콘솔 내용 비우기 (우클릭 → Clear console)</li>
+            </ol>
+        </div>
+        
+        <div class="step">
+            <h3>2단계: 새 계정 만들기</h3>
+            <ol>
+                <li>사용자명: <code>test</code></li>
+                <li>비밀번호: <code>1234</code></li>
+                <li>"회원가입" 클릭</li>
+                <li>성공 메시지 확인</li>
+            </ol>
+        </div>
+        
+        <div class="step">
+            <h3>3단계: 로그인하면서 로그 확인</h3>
+            <ol>
+                <li>같은 정보로 로그인</li>
+                <li><span class="highlight">콘솔에 출력되는 메시지 주목!</span></li>
+                <li>VSCode 터미널도 함께 확인</li>
+            </ol>
+        </div>
+    </div>
+
+    <div class="box">
+        <h2>🔍 확인해야 할 로그</h2>
+        
+        <h3>브라우저 콘솔에서 보여야 할 것:</h3>
+        <ul>
+            <li><code>"Connected to server"</code> ✅</li>
+            <li><code>"Received init data: {…}"</code> ✅</li>
+            <li><code>"Map loaded: yes"</code> ✅</li>
+            <li><code>"Players loaded: 1"</code> ✅</li>
+            <li><code>"Buildings loaded: 1"</code> ✅</li>
+            <li><code>"Camera centered at: …"</code> ✅</li>
+            <li><code>"Game initialized successfully!"</code> ✅</li>
+        </ul>
+        
+        <h3>VSCode 터미널에서 보여야 할 것:</h3>
+        <ul>
+            <li><code>"Player connected: test (1)"</code> ✅</li>
+            <li><code>"Loading data for user 1: found"</code> ✅</li>
+            <li><code>"Loaded 0 units for user 1"</code> ✅</li>
+            <li><code>"Loaded 1 buildings for user 1"</code> ✅</li>
+            <li><code>"Data loaded for user 1"</code> ✅</li>
+            <li><code>"Sending init data: 1 players, 0 units, 1 buildings"</code> ✅</li>
+        </ul>
+    </div>
+
+    <div class="box warning">
+        <h2>❌ 에러가 보인다면?</h2>
+        <p><span class="highlight">콘솔이나 터미널의 에러 메시지를 정확히 복사해서 알려주세요!</span></p>
+        <p>예시:</p>
+        <ul>
+            <li><code>TypeError: Cannot read property 'x' of undefined</code></li>
+            <li><code>Uncaught ReferenceError: ...</code></li>
+            <li><code>Error in init handler: ...</code></li>
+        </ul>
+    </div>
+
+    <div class="center">
+        <h2 style="color: #00ff00;">디버깅 준비 완료! 🚀</h2>
+        <p>이제 문제를 정확히 찾을 수 있습니다</p>
+        <a href="http://localhost:3000" class="button" target="_blank">🎮 게임 시작 (F12 먼저!)</a>
+    </div>
+
+    <div class="box">
+        <h2>💡 추가 팁</h2>
+        <ul>
+            <li><code>Network</code> 탭에서 Socket.io 연결 상태 확인</li>
+            <li>콘솔에서 <code>gameState</code> 입력하면 현재 게임 상태 확인 가능</li>
+            <li>연결 끊김이 계속되면 <span class="highlight">정확한 에러 메시지</span>를 알려주세요</li>
+        </ul>
+    </div>
+
+    <div class="box success">
+        <h2>📊 현재 상태</h2>
+        <ul>
+            <li>✅ 서버 재시작 완료</li>
+            <li>✅ 데이터베이스 초기화 완료</li>
+            <li>✅ 상세 로그 활성화</li>
+            <li>✅ 에러 핸들링 추가</li>
+        </ul>
+    </div>
+</body>
+</html>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚓ Naval Warfare RTS - 배포 가이드</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #0a1428;
+            color: #fff;
+        }
+        h1 { color: #4fc3f7; border-bottom: 3px solid #4fc3f7; padding-bottom: 10px; }
+        h2 { color: #29b6f6; margin-top: 30px; }
+        h3 { color: #4fc3f7; }
+        code {
+            background: rgba(79, 195, 247, 0.1);
+            padding: 2px 6px;
+            border-radius: 3px;
+            color: #4fc3f7;
+        }
+        pre {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            border-left: 3px solid #4fc3f7;
+        }
+        .method {
+            background: rgba(79, 195, 247, 0.05);
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            border: 1px solid #4fc3f7;
+        }
+        .warning {
+            background: rgba(255, 82, 82, 0.1);
+            padding: 15px;
+            border-left: 4px solid #ff5252;
+            margin: 20px 0;
+        }
+        .info {
+            background: rgba(79, 195, 247, 0.1);
+            padding: 15px;
+            border-left: 4px solid #4fc3f7;
+            margin: 20px 0;
+        }
+        ul { padding-left: 20px; }
+        li { margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>⚓ Naval Warfare RTS - 배포 가이드</h1>
+
+    <div class="info">
+        <strong>📌 게임 크기 비율 (mapandunit.png 기준)</strong><br>
+        - 건물 (본부, 조선소 등): <code>100 x 100</code> (기준 크기)<br>
+        - 자원 구역: <code>반지름 60</code> (건물의 60%)<br>
+        - 유닛 (군함): <code>30 x 30</code> (건물의 30%)<br>
+        <br>
+        이 비율은 mapandunit.png의 초록색 사각형(건물), 빨간색 선(자원), 파란색 선(유닛)의 비율을 반영합니다.
+    </div>
+
+    <h2>🌐 배포 방법</h2>
+
+    <div class="method">
+        <h3>1. Render.com (추천 - 무료, 쉬움)</h3>
+        <p><strong>장점:</strong> 무료, 데이터베이스 지속, Socket.io 완벽 지원</p>
+        
+        <ol>
+            <li><a href="https://render.com" target="_blank">Render.com</a> 가입</li>
+            <li><strong>New +</strong> → <strong>Web Service</strong> 선택</li>
+            <li>GitHub 저장소 연결 또는 수동 배포</li>
+            <li>설정:
+                <pre>Name: naval-warfare-rts
+Environment: Node
+Build Command: npm install
+Start Command: npm start
+Instance Type: Free</pre>
+            </li>
+            <li><strong>Environment Variables</strong> 설정:
+                <pre>JWT_SECRET=your-random-secret-key-here-change-this</pre>
+            </li>
+            <li><strong>Create Web Service</strong> 클릭</li>
+        </ol>
+        <p>배포 완료 후 제공되는 URL로 접속하세요!</p>
+    </div>
+
+    <div class="method">
+        <h3>2. Railway.app (무료, 빠름)</h3>
+        <p><strong>장점:</strong> 배포가 매우 빠름, GitHub 연동 자동</p>
+        
+        <ol>
+            <li><a href="https://railway.app" target="_blank">Railway.app</a> 가입</li>
+            <li><strong>New Project</strong> → <strong>Deploy from GitHub repo</strong></li>
+            <li>저장소 선택 또는 업로드</li>
+            <li>자동으로 감지되어 배포됨</li>
+            <li><strong>Variables</strong>에서 환경 변수 설정:
+                <pre>JWT_SECRET=your-random-secret-key</pre>
+            </li>
+            <li><strong>Settings</strong> → <strong>Generate Domain</strong>으로 URL 생성</li>
+        </ol>
+    </div>
+
+    <div class="method">
+        <h3>3. Heroku (유명함)</h3>
+        <p><strong>장점:</strong> 안정적, 많은 사용자</p>
+        
+        <ol>
+            <li><a href="https://www.heroku.com" target="_blank">Heroku</a> 가입 (신용카드 필요)</li>
+            <li>Heroku CLI 설치:
+                <pre>npm install -g heroku</pre>
+            </li>
+            <li>명령어 실행:
+                <pre>heroku login
+heroku create naval-warfare-rts
+git init
+git add .
+git commit -m "Initial commit"
+git push heroku main</pre>
+            </li>
+            <li>환경 변수 설정:
+                <pre>heroku config:set JWT_SECRET=your-secret-key</pre>
+            </li>
+        </ol>
+    </div>
+
+    <div class="method">
+        <h3>4. Glitch.com (가장 쉬움)</h3>
+        <p><strong>장점:</strong> 웹에서 바로 편집, GitHub 없이 배포</p>
+        
+        <ol>
+            <li><a href="https://glitch.com" target="_blank">Glitch.com</a> 가입</li>
+            <li><strong>New Project</strong> → <strong>Import from GitHub</strong> 또는 파일 업로드</li>
+            <li><code>.env</code> 파일 생성:
+                <pre>JWT_SECRET=your-secret-key
+PORT=3000</pre>
+            </li>
+            <li>자동으로 배포됨</li>
+            <li><strong>Share</strong> 버튼으로 URL 확인</li>
+        </ol>
+    </div>
+
+    <div class="warning">
+        <strong>⚠️ 배포 전 체크리스트</strong>
+        <ul>
+            <li>✅ <code>JWT_SECRET</code>을 강력한 랜덤 문자열로 변경</li>
+            <li>✅ <code>game.db</code>는 git에 올리지 말 것 (.gitignore 확인)</li>
+            <li>✅ 서버 로그에서 개인정보 제거</li>
+            <li>✅ 포트는 <code>process.env.PORT</code>로 자동 설정됨</li>
+        </ul>
+    </div>
+
+    <h2>🔧 GitHub 저장소 생성 및 연동</h2>
+    
+    <pre>cd c:\Users\박지민\Downloads\mwcraft
+git init
+git add .
+git commit -m "Initial commit: Naval Warfare RTS"
+git branch -M main
+git remote add origin https://github.com/your-username/naval-warfare-rts.git
+git push -u origin main</pre>
+
+    <h2>🎮 로컬 테스트</h2>
+    <pre>npm start</pre>
+    <p>브라우저에서 <code>http://localhost:3000</code> 접속</p>
+
+    <h2>📊 게임 비율 정보</h2>
+    <table style="width:100%; border-collapse: collapse; margin: 20px 0;">
+        <tr style="background: rgba(79, 195, 247, 0.1);">
+            <th style="padding: 10px; border: 1px solid #4fc3f7;">요소</th>
+            <th style="padding: 10px; border: 1px solid #4fc3f7;">크기</th>
+            <th style="padding: 10px; border: 1px solid #4fc3f7;">비율</th>
+            <th style="padding: 10px; border: 1px solid #4fc3f7;">설명</th>
+        </tr>
+        <tr>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">건물</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">100 x 100</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">100%</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">본부, 조선소, 방어타워 등</td>
+        </tr>
+        <tr style="background: rgba(255, 255, 255, 0.02);">
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">자원 구역</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">반지름 60</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">60%</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">금, 자원 채취 지점</td>
+        </tr>
+        <tr>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">유닛 (군함)</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">30 x 30</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">30%</td>
+            <td style="padding: 10px; border: 1px solid #4fc3f7;">구축함, 전함, 항모 등</td>
+        </tr>
+    </table>
+
+    <div class="info">
+        <strong>💡 팁:</strong> 게임이 성공적으로 배포되면, 친구들에게 URL을 공유하여 함께 플레이할 수 있습니다!
+    </div>
+
+    <h2>🆘 문제 해결</h2>
+    <ul>
+        <li><strong>게임창이 안 뜸:</strong> 브라우저 콘솔(F12)에서 에러 확인</li>
+        <li><strong>연결 안 됨:</strong> 서버가 실행 중인지, 포트가 열려있는지 확인</li>
+        <li><strong>데이터 날아감:</strong> SQLite 데이터베이스(<code>game.db</code>) 백업 필요</li>
+        <li><strong>속도 느림:</strong> 무료 플랜은 제한이 있음, 업그레이드 고려</li>
+    </ul>
+</body>
+</html>

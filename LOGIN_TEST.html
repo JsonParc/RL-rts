@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>로그인 테스트 - Naval Warfare RTS</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 700px;
+            margin: 50px auto;
+            padding: 30px;
+            background: linear-gradient(135deg, #0a1428 0%, #1a2f4f 100%);
+            color: #fff;
+            border-radius: 15px;
+        }
+        h1 { color: #4fc3f7; text-align: center; }
+        .step {
+            background: rgba(79, 195, 247, 0.1);
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 10px;
+            border-left: 5px solid #4fc3f7;
+        }
+        .step h2 {
+            color: #4fc3f7;
+            margin-top: 0;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.5);
+            padding: 3px 8px;
+            border-radius: 4px;
+            color: #4fc3f7;
+        }
+        .button {
+            display: inline-block;
+            padding: 15px 30px;
+            background: #4fc3f7;
+            color: #0a1428;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 10px 5px;
+            text-align: center;
+        }
+        .button:hover {
+            background: #29b6f6;
+        }
+        .center { text-align: center; }
+        .warning {
+            background: rgba(255, 152, 0, 0.2);
+            padding: 15px;
+            border-left: 4px solid #ff9800;
+            margin: 20px 0;
+        }
+        ul { line-height: 2; }
+    </style>
+</head>
+<body>
+    <h1>🔑 로그인 테스트 가이드</h1>
+
+    <div class="warning">
+        <strong>⚠️ 로그인 안 되는 문제 해결 완료!</strong><br>
+        아래 단계대로 따라하면 정상적으로 작동합니다.
+    </div>
+
+    <div class="step">
+        <h2>1️⃣ 브라우저 캐시 지우기 (중요!)</h2>
+        <p>수정된 코드가 적용되려면 브라우저 캐시를 지워야 합니다:</p>
+        <ul>
+            <li><strong>Chrome:</strong> <code>Ctrl + Shift + Delete</code> → 캐시된 이미지 및 파일 체크 → 삭제</li>
+            <li><strong>또는 간단한 방법:</strong> <code>Ctrl + F5</code> (강력 새로고침)</li>
+        </ul>
+    </div>
+
+    <div class="step">
+        <h2>2️⃣ 새 계정 만들기</h2>
+        <p>테스트용 계정을 만들어 보세요:</p>
+        <ol>
+            <li>사용자명: <code>test123</code> (원하는 이름)</li>
+            <li>비밀번호: <code>1234</code> (4자 이상)</li>
+            <li><strong>회원가입</strong> 버튼 클릭</li>
+            <li>"회원가입 성공!" 메시지 확인</li>
+        </ol>
+    </div>
+
+    <div class="step">
+        <h2>3️⃣ 로그인하기</h2>
+        <ul>
+            <li>위에서 만든 사용자명과 비밀번호 입력</li>
+            <li><strong>로그인</strong> 버튼 클릭 (또는 <code>Enter</code> 키)</li>
+            <li>로그인 화면이 사라지고 게임 화면이 나타남</li>
+        </ul>
+    </div>
+
+    <div class="step">
+        <h2>4️⃣ 게임 시작!</h2>
+        <p>로그인 성공 후:</p>
+        <ul>
+            <li>✅ 맵이 표시됨 (바다와 육지 섬)</li>
+            <li>✅ 본부가 육지 섬에 자동 배치됨</li>
+            <li>✅ 자원, 인구, 점수가 표시됨</li>
+            <li>✅ 미니맵에서 위치 확인 가능</li>
+        </ul>
+    </div>
+
+    <div class="center">
+        <h2 style="color: #4fc3f7; margin-top: 40px;">준비 완료! 🎉</h2>
+        <a href="http://localhost:3000" class="button" target="_blank">🎮 게임 시작하기</a>
+    </div>
+
+    <div class="step">
+        <h2>🔧 여전히 문제가 있다면?</h2>
+        <p><strong>브라우저 개발자 도구</strong>를 확인하세요:</p>
+        <ol>
+            <li><code>F12</code> 키를 눌러 개발자 도구 열기</li>
+            <li><code>Console</code> 탭에서 에러 메시지 확인</li>
+            <li><code>Network</code> 탭에서 API 요청 상태 확인</li>
+        </ol>
+        <p>에러 메시지가 보이면 제게 알려주세요!</p>
+    </div>
+
+    <div class="warning">
+        <strong>💡 팁:</strong>
+        <ul style="margin: 10px 0 0 0;">
+            <li>Enter 키로 바로 로그인 가능</li>
+            <li>비밀번호는 4자 이상 필요</li>
+            <li>로그인 후 토큰이 자동 저장되어 다음에 자동 로그인됨</li>
+            <li>로그아웃하고 싶으면 우측 상단 "로그아웃" 버튼 클릭</li>
+        </ul>
+    </div>
+</body>
+</html>

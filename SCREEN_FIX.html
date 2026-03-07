@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>✅ 화면 전환 문제 해결!</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 30px;
+            background: linear-gradient(135deg, #0a1428 0%, #1a2f4f 100%);
+            color: #fff;
+            border-radius: 15px;
+        }
+        h1 {
+            color: #4fc3f7;
+            text-align: center;
+            font-size: 42px;
+        }
+        .box {
+            background: rgba(79, 195, 247, 0.1);
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 10px;
+            border-left: 5px solid #4fc3f7;
+        }
+        .box h2 {
+            color: #4fc3f7;
+            margin-top: 0;
+        }
+        .success {
+            background: rgba(76, 175, 80, 0.2);
+            border-left-color: #4caf50;
+        }
+        .success h2 {
+            color: #4caf50;
+        }
+        .warning {
+            background: rgba(255, 152, 0, 0.2);
+            border-left-color: #ff9800;
+        }
+        .warning h2 {
+            color: #ff9800;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.5);
+            padding: 3px 8px;
+            border-radius: 4px;
+            color: #4fc3f7;
+            font-weight: bold;
+        }
+        .button {
+            display: inline-block;
+            padding: 15px 30px;
+            background: #4fc3f7;
+            color: #0a1428;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 10px 5px;
+            text-align: center;
+            font-size: 18px;
+        }
+        .button:hover {
+            background: #29b6f6;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
+            transition: all 0.3s;
+        }
+        .center {
+            text-align: center;
+            margin: 30px 0;
+        }
+        ol, ul {
+            line-height: 2;
+        }
+        .highlight {
+            color: #ffff00;
+            font-weight: bold;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <h1>✅ 화면 전환 문제 해결!</h1>
+
+    <div class="box success">
+        <h2>🎉 수정 완료!</h2>
+        <ul>
+            <li>✅ 로그인 중복 실행 방지</li>
+            <li>✅ 자동 재연결 완전 비활성화</li>
+            <li>✅ 화면 전환 타이밍 수정 (init 이벤트 후)</li>
+            <li>✅ 에러 상태 플래그 추가</li>
+        </ul>
+    </div>
+
+    <div class="box warning">
+        <h2>⚠️ 중요: 먼저 해야 할 일!</h2>
+        <p class="highlight">브라우저를 완전히 새로고침하세요:</p>
+        <p style="text-align: center; font-size: 32px; margin: 20px 0;">
+            <code style="font-size: 32px;">Ctrl + Shift + R</code>
+        </p>
+        <p style="text-align: center;">또는 브라우저 캐시를 지우세요</p>
+    </div>
+
+    <div class="box">
+        <h2>🎮 다시 테스트하기</h2>
+        <ol>
+            <li><strong>브라우저 새로고침</strong>: <code>Ctrl + Shift + R</code></li>
+            <li><strong>개발자 도구 열기</strong>: <code>F12</code> → Console 탭</li>
+            <li><strong>로그인</strong>:
+                <ul>
+                    <li>사용자명: <code>test</code></li>
+                    <li>비밀번호: <code>1234</code></li>
+                    <li>"로그인" 버튼 클릭 <span class="highlight">(한 번만!)</span></li>
+                </ul>
+            </li>
+            <li><strong>확인 사항</strong>:
+                <ul>
+                    <li>콘솔에서 <code>"Switching to game screen..."</code> 확인</li>
+                    <li>로그인 화면이 사라지고 게임 화면이 나타나야 함</li>
+                </ul>
+            </li>
+        </ol>
+    </div>
+
+    <div class="box">
+        <h2>📊 콘솔 로그 순서</h2>
+        <p>정상적인 경우 다음 순서로 나타납니다:</p>
+        <ol>
+            <li><code>Starting login...</code></li>
+            <li><code>Login successful, connecting to game...</code></li>
+            <li><code>connectToGame called</code></li>
+            <li><code>Connected to server</code></li>
+            <li><code>Received init data: {...}</code></li>
+            <li><code>Map loaded: yes</code></li>
+            <li><code>Players loaded: 1</code></li>
+            <li><code>Buildings loaded: 1</code></li>
+            <li><code>Camera centered at: ...</code></li>
+            <li><code>Starting game update loop...</code></li>
+            <li><code>Switching to game screen...</code> ⭐</li>
+            <li><code>Game initialized successfully!</code></li>
+        </ol>
+        <p><span class="highlight">"Switching to game screen..."</span> 메시지가 보이면 화면이 전환됩니다!</p>
+    </div>
+
+    <div class="center">
+        <h2 style="color: #4fc3f7;">준비 완료! 🚀</h2>
+        <p style="font-size: 18px;">Ctrl + Shift + R 후 다시 로그인하세요!</p>
+        <a href="http://localhost:3000" class="button" target="_blank">🎮 게임 시작하기</a>
+    </div>
+
+    <div class="box success">
+        <h2>💡 변경 사항</h2>
+        <ul>
+            <li><strong>로그인 중복 방지</strong>: 로그인 버튼을 여러 번 눌러도 한 번만 실행</li>
+            <li><strong>재연결 비활성화</strong>: 자동 재연결로 인한 무한 루프 방지</li>
+            <li><strong>화면 전환 타이밍</strong>: 모든 데이터를 받은 후에만 화면 전환</li>
+            <li><strong>에러 시 복구</strong>: 에러 발생 시 자동으로 로그인 가능 상태로 복구</li>
+        </ul>
+    </div>
+
+    <div class="box warning">
+        <h2>🔍 여전히 안 되나요?</h2>
+        <p>콘솔에 다음 메시지가 있는지 확인하세요:</p>
+        <ul>
+            <li><code>"Switching to game screen..."</code> - 이 메시지가 안 보이면 알려주세요</li>
+            <li><code>"Connection error"</code> - 연결 에러가 있으면 메시지 복사해주세요</li>
+            <li><code>"Error in init handler"</code> - 에러 내용 복사해주세요</li>
+        </ul>
+    </div>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎯 CSS 문제 해결!</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 30px;
+            background: linear-gradient(135deg, #0a1428 0%, #1a2f4f 100%);
+            color: #fff;
+            border-radius: 15px;
+        }
+        h1 {
+            color: #4caf50;
+            text-align: center;
+            font-size: 48px;
+            text-shadow: 0 0 20px #4caf50;
+        }
+        .box {
+            background: rgba(76, 175, 80, 0.2);
+            padding: 25px;
+            margin: 25px 0;
+            border-radius: 12px;
+            border-left: 5px solid #4caf50;
+        }
+        .box h2 {
+            color: #4caf50;
+            margin-top: 0;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.5);
+            padding: 4px 10px;
+            border-radius: 4px;
+            color: #4fc3f7;
+            font-weight: bold;
+        }
+        .button {
+            display: inline-block;
+            padding: 20px 40px;
+            background: #4caf50;
+            color: #000;
+            text-decoration: none;
+            border-radius: 10px;
+            font-weight: bold;
+            margin: 15px 5px;
+            text-align: center;
+            font-size: 20px;
+        }
+        .button:hover {
+            background: #45a049;
+            transform: scale(1.05);
+            box-shadow: 0 5px 20px rgba(76, 175, 80, 0.6);
+            transition: all 0.3s;
+        }
+        .center {
+            text-align: center;
+            margin: 40px 0;
+        }
+        ul {
+            line-height: 2;
+            font-size: 18px;
+        }
+        .highlight {
+            color: #ffff00;
+            font-weight: bold;
+            font-size: 20px;
+        }
+        .steps {
+            background: rgba(79, 195, 247, 0.1);
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 5px solid #4fc3f7;
+            margin: 20px 0;
+        }
+        .checkmark {
+            color: #4caf50;
+            font-size: 24px;
+        }
+    </style>
+</head>
+<body>
+    <h1>✅ CSS 문제 해결!</h1>
+
+    <div class="box">
+        <h2>🎉 원인을 찾았습니다!</h2>
+        <p><strong>문제:</strong> CSS 우선순위 충돌</p>
+        <ul>
+            <li><code>#loginScreen</code>에 <code>display: flex</code>가 설정됨</li>
+            <li><code>.screen.active</code>의 <code>display: block</code>이 덮어씌워짐</li>
+            <li>결과: 클래스는 변경되지만 화면은 그대로</li>
+        </ul>
+        <p><strong>해결:</strong></p>
+        <ul>
+            <li><span class="checkmark">✓</span> <code>!important</code> 추가로 강제 적용</li>
+            <li><span class="checkmark">✓</span> 모든 screen에 통일된 display 로직</li>
+            <li><span class="checkmark">✓</span> 센터링을 <code>.screen.active</code>에서 처리</li>
+        </ul>
+    </div>
+
+    <div class="steps">
+        <h2>🚀 이제 마지막 단계!</h2>
+        <p class="highlight" style="text-align: center; font-size: 32px; margin: 20px 0;">
+            Ctrl + Shift + R
+        </p>
+        <p style="text-align: center; font-size: 18px;">
+            브라우저를 <strong>완전히 새로고침</strong>하세요!<br>
+            (캐시된 CSS 파일 때문에 안 보일 수 있습니다)
+        </p>
+    </div>
+
+    <div class="box">
+        <h2>📋 테스트 순서</h2>
+        <ol style="font-size: 18px; line-height: 2;">
+            <li><code>Ctrl + Shift + R</code> <span class="highlight">(필수!)</span></li>
+            <li>사용자명: <code>test</code></li>
+            <li>비밀번호: <code>1234</code></li>
+            <li>로그인 클릭</li>
+            <li><span class="highlight">화면이 게임으로 전환됩니다!</span></li>
+        </ol>
+    </div>
+
+    <div class="center">
+        <h2 style="color: #4caf50; font-size: 36px;">이제 작동합니다! 🎮</h2>
+        <a href="http://localhost:3000" class="button" target="_blank">🚀 게임 시작하기</a>
+    </div>
+
+    <div class="box">
+        <h2>✅ 예상 결과</h2>
+        <ul>
+            <li><span class="checkmark">✓</span> 로그인 버튼 클릭</li>
+            <li><span class="checkmark">✓</span> "로그인 중..." 메시지</li>
+            <li><span class="checkmark">✓</span> 콘솔: "Switching to game screen..."</li>
+            <li><span class="checkmark">✓</span> <strong>로그인 화면 사라짐</strong></li>
+            <li><span class="checkmark">✓</span> <strong>게임 화면 나타남 (맵, HUD, 미니맵)</strong></li>
+        </ul>
+    </div>
+
+    <div class="box">
+        <h2>🎯 확인 사항</h2>
+        <p>게임 화면에서 보여야 할 것:</p>
+        <ul>
+            <li><span class="checkmark">✓</span> 상단 HUD (자원, 인구, 점수)</li>
+            <li><span class="checkmark">✓</span> 바다와 육지 섬이 있는 맵</li>
+            <li><span class="checkmark">✓</span> 좌측 하단 미니맵</li>
+            <li><span class="checkmark">✓</span> 우측 상단 랭킹 패널</li>
+            <li><span class="checkmark">✓</span> 우측 하단 건물 건설 메뉴</li>
+        </ul>
+    </div>
+
+    <div class="steps">
+        <h2>💡 참고</h2>
+        <p><strong>왜 Ctrl + Shift + R이 필요한가요?</strong></p>
+        <p>브라우저가 이전 CSS 파일을 캐시에 저장했기 때문입니다. <code>Ctrl + Shift + R</code>은 캐시를 무시하고 서버에서 새 파일을 받아옵니다.</p>
+    </div>
+</body>
+</html>
