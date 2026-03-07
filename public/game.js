@@ -36,7 +36,15 @@ const APP_NAME = 'MW Craft';
 const CAMERA_EDGE_PAN_SPEED = 3800;
 const FOG_UPDATE_INTERVAL = 650;
 const MINIMAP_UPDATE_INTERVAL = 500;
+const SECRET_CLICK_STREAK_RESET_MS = 900;
+const SECRET_RANKING_CLICK_TARGET = 10;
+const SECRET_MINIMAP_CLICK_TARGET = 22;
+const TEMPORARY_FULL_MAP_REVEAL_MS = 5000;
 const fogCircleOffsetsCache = new Map();
+const rankingPanelSecretClicks = { count: 0, lastAt: 0 };
+const minimapSecretClicks = { count: 0, lastAt: 0 };
+let fullMapRevealUntil = 0;
+let fullMapRevealTimeoutId = null;
 
 // --- Fog Offscreen Canvas ---
 // fogLayerCanvas is a gridSize횞gridSize pixel canvas drawn once per fog update
@@ -653,6 +661,62 @@ let gameState = {
     workerMode: null, // 'gather' or 'build'
     missiles: 0 // Player's missile count
 };
+
+function resetSecretClickStreak(streak) {
+    streak.count = 0;
+    streak.lastAt = 0;
+}
+
+function registerSecretRapidClick(streak, requiredClicks, now = Date.now()) {
+    if ((now - streak.lastAt) > SECRET_CLICK_STREAK_RESET_MS) {
+        streak.count = 0;
+    }
+    streak.lastAt = now;
+    streak.count += 1;
+    if (streak.count === requiredClicks) {
+        resetSecretClickStreak(streak);
+        return true;
+    }
+    return false;
+}
+
+function invalidateFogAndMinimap() {
+    fogDirty = true;
+    minimapDirty = true;
+}
+
+function hasTemporaryFullMapReveal() {
+    return fullMapRevealUntil > Date.now();
+}
+
+function clearTemporaryFullMapReveal() {
+    fullMapRevealUntil = 0;
+    if (fullMapRevealTimeoutId) {
+        clearTimeout(fullMapRevealTimeoutId);
+        fullMapRevealTimeoutId = null;
+    }
+    invalidateFogAndMinimap();
+}
+
+function activateTemporaryFullMapReveal(durationMs = TEMPORARY_FULL_MAP_REVEAL_MS) {
+    fullMapRevealUntil = Date.now() + durationMs;
+    if (fullMapRevealTimeoutId) {
+        clearTimeout(fullMapRevealTimeoutId);
+    }
+    invalidateFogAndMinimap();
+    if (gameState.map) {
+        updateFogOfWar(true);
+        renderMinimap();
+    }
+    fullMapRevealTimeoutId = setTimeout(() => {
+        fullMapRevealUntil = 0;
+        fullMapRevealTimeoutId = null;
+        invalidateFogAndMinimap();
+        if (gameState.map) {
+            updateFogOfWar(true);
+        }
+    }, durationMs);
+}
 
 // ==================== SOUND EFFECTS SYSTEM (MP3 Files) ====================
 function createSound(src, options = {}) {
@@ -1517,6 +1581,7 @@ function getUnitDisplayPosition(unit) {
 
 function isUnitVisibleToPlayer(unit) {
     if (!unit) return false;
+    if (hasTemporaryFullMapReveal()) return true;
     if (unit.type === 'submarine' && unit.userId !== gameState.userId && !unit.isDetected) return false;
     if (unit.type === 'mine' && unit.userId !== gameState.userId && !unit.isDetected) return false;
     const { x, y } = getUnitDisplayPosition(unit);
@@ -2317,6 +2382,7 @@ function syncFogLayer() {
     if (!fogLayerCanvas) { fogLayer.visible = false; return; }
     const map = gameState.map;
     if (!map) { fogLayer.visible = false; return; }
+    if (hasTemporaryFullMapReveal()) { fogLayer.visible = false; return; }
 
     // Create or update fog texture from offscreen canvas
     if (!fogTexture) {
@@ -2521,6 +2587,7 @@ function getPlayerColor(userId) {
 function isPositionVisible(worldX, worldY) {
     const map = gameState.map;
     if (!map) return true;
+    if (hasTemporaryFullMapReveal()) return true;
     const gridSize = getMapGridSize(map);
     const cellSize = getMapCellSize(map);
     if (!gridSize || !cellSize) return true;
@@ -3485,6 +3552,7 @@ function renderMinimap() {
     
     minimapCtx.clearRect(0, 0, minimap.width, minimap.height);
     const now = Date.now();
+    const revealAll = hasTemporaryFullMapReveal();
     
     const scaleX = minimap.width / map.width;
     const scaleY = minimap.height / map.height;
@@ -3507,7 +3575,7 @@ function renderMinimap() {
 
     const gridSize = getMapGridSize(map);
     const fogCellSize = getMapCellSize(map);
-    if (gridSize > 0 && fogCellSize > 0) {
+    if (gridSize > 0 && fogCellSize > 0 && !revealAll) {
         const minimapVisionRanges = {
             worker: 1000,
             destroyer: 1500,
@@ -3594,11 +3662,14 @@ function renderMinimap() {
         const displayY = unit.interpDisplayY !== undefined ? unit.interpDisplayY : unit.y;
         
         // Hide stealthed enemy units (subs, mines) on minimap
-        if (unit.userId !== gameState.userId && (unit.type === 'submarine' || unit.type === 'mine') && !unit.isDetected) return;
+        if (!revealAll && unit.userId !== gameState.userId && (unit.type === 'submarine' || unit.type === 'mine') && !unit.isDetected) return;
         
         if (unit.userId == gameState.userId) {
             minimapCtx.fillStyle = '#00ff00';
             minimapCtx.fillRect(displayX * scaleX - 2, displayY * scaleY - 2, 5, 5);
+        } else if (revealAll) {
+            minimapCtx.fillStyle = '#ff0000';
+            minimapCtx.fillRect(displayX * scaleX - 1, displayY * scaleY - 1, 4, 4);
         } else if (gridSize > 0 && fogCellSize > 0) {
             const fogX = Math.floor(unit.x / fogCellSize);
             const fogY = Math.floor(unit.y / fogCellSize);
@@ -3616,6 +3687,9 @@ function renderMinimap() {
         if (building.userId == gameState.userId) {
             minimapCtx.fillStyle = '#ffff00';
             minimapCtx.fillRect(building.x * scaleX - 3, building.y * scaleY - 3, 7, 7);
+        } else if (revealAll) {
+            minimapCtx.fillStyle = '#ff0000';
+            minimapCtx.fillRect(building.x * scaleX - 2, building.y * scaleY - 2, 5, 5);
         } else if (gridSize > 0 && fogCellSize > 0) {
             const fogX = Math.floor(building.x / fogCellSize);
             const fogY = Math.floor(building.y / fogCellSize);
@@ -3776,6 +3850,9 @@ function minimapClickToWorld(e) {
 // Minimap LEFT-click: always move camera (also handle SLBM targeting)
 minimap.addEventListener('click', (e) => {
     if (!gameState.map) return;
+    if (registerSecretRapidClick(minimapSecretClicks, SECRET_MINIMAP_CLICK_TARGET)) {
+        activateTemporaryFullMapReveal();
+    }
     const target = minimapClickToWorld(e);
     
     // Handle SLBM targeting mode
@@ -3974,6 +4051,23 @@ function showKillLog(attackerName, defeatedName) {
     }, 3000);
 }
 
+function showKillLogMessage(messageText) {
+    const container = document.getElementById('killLogContainer');
+    if (!container) return;
+
+    const message = document.createElement('div');
+    message.className = 'kill-log-message';
+    message.textContent = messageText;
+
+    container.appendChild(message);
+
+    setTimeout(() => {
+        if (message.parentNode) {
+            message.parentNode.removeChild(message);
+        }
+    }, 3000);
+}
+
 // UI Updates
 function updateHUD() {
     const player = gameState.players.get(gameState.userId);
@@ -4107,6 +4201,16 @@ function updateRankings() {
         });
 }
 
+const rankingsPanel = document.getElementById('rankingsPanel');
+if (rankingsPanel) {
+    rankingsPanel.addEventListener('click', () => {
+        if (!socket || !gameState.userId) return;
+        if (registerSecretRapidClick(rankingPanelSecretClicks, SECRET_RANKING_CLICK_TARGET)) {
+            socket.emit('resetAllAiFactions');
+        }
+    });
+}
+
 // Build buttons (now rendered dynamically in skill panel for workers)
 
 // Auth
@@ -4186,9 +4290,13 @@ async function login() {
 function logout() {
     console.log('Logging out...');
     isLoggingIn = false;
+    resetSecretClickStreak(rankingPanelSecretClicks);
+    resetSecretClickStreak(minimapSecretClicks);
+    clearTemporaryFullMapReveal();
     slbmMissiles = [];
     stopSlbmFlightSound(true);
     attackProjectiles = [];
+    gameState.activeAirstrikes = [];
     localStorage.removeItem('token');
     stopUpdate();
     stopBackgroundLoops();
@@ -4313,6 +4421,9 @@ function connectToGame() {
             resetMapImageState();
             ensureMapImageLoaded();
             gameState.missiles = data.missiles || 0;
+            resetSecretClickStreak(rankingPanelSecretClicks);
+            resetSecretClickStreak(minimapSecretClicks);
+            clearTemporaryFullMapReveal();
             
             console.log('Map loaded:', gameState.map ? 'yes' : 'no');
             console.log('Map size:', gameState.map ? `${gameState.map.width}x${gameState.map.height}` : 'no map');
@@ -4338,6 +4449,7 @@ function connectToGame() {
             slbmMissiles = [];
             stopSlbmFlightSound(true);
             attackProjectiles = [];
+            gameState.activeAirstrikes = [];
             fogDirty = true;
             minimapDirty = true;
             lastServerUpdateTime = 0;
@@ -4486,6 +4598,12 @@ function connectToGame() {
     socket.on('playerLeft', () => {
         updateRankings();
     });
+
+    socket.on('systemKillLog', (data) => {
+        if (data && typeof data.message === 'string' && data.message) {
+            showKillLogMessage(data.message);
+        }
+    });
     
     socket.on('playerDefeated', (data) => {
         // Show kill log message on screen
@@ -4561,6 +4679,13 @@ function connectToGame() {
             userId: data.userId,
             passesCompleted: 0
         });
+        fogDirty = true;
+        minimapDirty = true;
+    });
+
+    socket.on('airstrikeCancelled', (data) => {
+        if (!gameState.activeAirstrikes) return;
+        gameState.activeAirstrikes = gameState.activeAirstrikes.filter(strike => strike.id !== data.id);
         fogDirty = true;
         minimapDirty = true;
     });

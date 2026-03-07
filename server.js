@@ -2507,6 +2507,11 @@ io.on('connection', (socket) => {
     }
   });
   
+  socket.on('resetAllAiFactions', () => {
+    switchRoom(socket.roomId);
+    resetAllAiFactionsInCurrentRoom();
+  });
+
   socket.on('disconnect', () => {
     switchRoom(socket.roomId);
     console.log(`Player disconnected: ${socket.username}`);
@@ -4406,6 +4411,80 @@ function scheduleAIRespawn(aiUserId) {
   }, AI_CONFIG.respawnDelayMs);
 
   room.aiRespawnTimers.set(aiUserId, timer);
+}
+
+function clearAIRespawnTimer(aiUserId) {
+  const existingTimer = gameState.aiRespawnTimers.get(aiUserId);
+  if (!existingTimer) {
+    return;
+  }
+  clearTimeout(existingTimer);
+  gameState.aiRespawnTimers.delete(aiUserId);
+}
+
+function clearActiveWeaponsForUser(userId) {
+  const slbmIdsToDelete = [];
+  gameState.activeSlbms.forEach((slbm, slbmId) => {
+    if (slbm.userId === userId) {
+      slbmIdsToDelete.push(slbmId);
+    }
+  });
+  slbmIdsToDelete.forEach(slbmId => {
+    const slbm = gameState.activeSlbms.get(slbmId);
+    gameState.activeSlbms.delete(slbmId);
+    roomEmit('slbmDestroyed', {
+      id: slbmId,
+      x: slbm ? slbm.currentX : null,
+      y: slbm ? slbm.currentY : null
+    });
+  });
+
+  if (!gameState.activeAirstrikes) {
+    return;
+  }
+
+  const strikeIdsToDelete = [];
+  gameState.activeAirstrikes.forEach((strike, strikeId) => {
+    if (strike.userId === userId) {
+      strikeIdsToDelete.push(strikeId);
+    }
+  });
+  strikeIdsToDelete.forEach(strikeId => {
+    gameState.activeAirstrikes.delete(strikeId);
+    roomEmit('airstrikeCancelled', { id: strikeId });
+  });
+}
+
+function resetAllAiFactionsInCurrentRoom() {
+  if (!gameState || !currentRoomId || AI_CONFIG.count <= 0) {
+    return 0;
+  }
+
+  const roomId = currentRoomId;
+  roomEmit('systemKillLog', { message: '(시스템에 의해 신속하게 처리되었습니다)' });
+
+  for (let aiIndex = 0; aiIndex < AI_CONFIG.count; aiIndex++) {
+    const aiUserId = getAIUserId(aiIndex);
+    clearAIRespawnTimer(aiUserId);
+    clearActiveWeaponsForUser(aiUserId);
+    if (gameState.players.has(aiUserId)) {
+      removePlayerFromCurrentRoom(aiUserId, { emitPlayerLeft: true });
+    } else {
+      gameState.fogOfWar.delete(aiUserId);
+    }
+  }
+
+  let respawnedCount = 0;
+  for (let aiIndex = 0; aiIndex < AI_CONFIG.count; aiIndex++) {
+    const aiPlayer = spawnAIPlayer(aiIndex);
+    if (!aiPlayer) continue;
+    respawnedCount++;
+    io.to(roomId).emit('playerJoined', aiPlayer);
+  }
+
+  syncSlbmId();
+  console.log(`Reset ${respawnedCount} AI faction(s) in room ${roomId}`);
+  return respawnedCount;
 }
 
 // Initialize AI players
