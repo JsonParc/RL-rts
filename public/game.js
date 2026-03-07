@@ -4355,12 +4355,22 @@ function connectToGame() {
         fogDirty = true;
         minimapDirty = true;
     });
+
+    socket.on('playerJoined', () => {
+        updateRankings();
+    });
+
+    socket.on('playerLeft', () => {
+        updateRankings();
+    });
     
     socket.on('playerDefeated', (data) => {
         // Show kill log message on screen
         if (data.defeatedName && data.attackerName) {
             showKillLog(data.attackerName, data.defeatedName);
         }
+
+        updateRankings();
         
         if (data.userId === gameState.userId && data.respawned) {
             // Reset local player data

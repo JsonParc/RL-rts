@@ -4229,41 +4229,37 @@ function updateGame(deltaTime) {
 
 // Ranking endpoint
 app.get('/api/rankings', (req, res) => {
-  // Get human player rankings from DB
-  const dbRankings = db.prepare(`
-    SELECT u.username, p.resources, p.population, p.combat_power, p.score
-    FROM player_data p
-    JOIN users u ON p.user_id = u.id
-    ORDER BY p.score DESC
-    LIMIT 10
-  `).all();
-  
-  // Add AI players from all rooms (deduplicated by name, pick highest score)
-  const aiMap = new Map();
+  // Rankings should reflect only currently active players in live rooms.
+  // This prevents stale DB entries from appearing for disconnected or never-joined players.
+  const liveRankings = new Map();
+
   gameRooms.forEach((room) => {
     room.players.forEach((player) => {
-      if (player.isAI) {
-        const existing = aiMap.get(player.username);
-        if (!existing || player.score > existing.score) {
-          aiMap.set(player.username, {
-            username: player.username,
-            resources: Math.floor(player.resources || 0),
-            population: player.population || 0,
-            combat_power: player.combatPower || 0,
-            score: Math.floor(player.score || 0)
-          });
-        }
+      if (!player) return;
+      if (!player.isAI && !player.online) return;
+
+      const rankingKey = player.isAI ? `ai:${player.username}` : `human:${player.userId}`;
+      const rankingEntry = {
+        username: player.username,
+        resources: Math.floor(player.resources || 0),
+        population: player.population || 0,
+        combat_power: player.combatPower || 0,
+        score: Math.floor(player.score || 0)
+      };
+
+      const existing = liveRankings.get(rankingKey);
+      if (!existing || rankingEntry.score > existing.score) {
+        liveRankings.set(rankingKey, rankingEntry);
       }
     });
   });
-  
-  const allRankings = [...dbRankings, ...aiMap.values()];
-  allRankings.sort((a, b) => (b.score || 0) - (a.score || 0));
-  
-  // Remove players with score 0 (defeated/reset)
-  const filteredRankings = allRankings.filter(p => p.score > 0);
-  
-  res.json(filteredRankings.slice(0, 10));
+
+  const filteredRankings = [...liveRankings.values()]
+    .filter(player => player.score > 0)
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, 10);
+
+  res.json(filteredRankings);
 });
 
 // Auto-save disabled (no persistence)
