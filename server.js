@@ -35,9 +35,10 @@ const FIXED_BUILDING_IMAGE_MAX_DIMENSION = 200;
 const MISSILE_SILO_COST = 1600;
 const BUILDING_PLACEMENT_BUFFER = 50;
 const BUILDING_PLACEMENT_SEARCH_RADIUS = 4000;
+const SLBM_MAX_HP = 500;
 const DEFENSE_TOWER_CANNON_START = Object.freeze({ x: 5, y: 8 });
 const DEFENSE_TOWER_CANNON_MUZZLE = Object.freeze({ x: 21, y: 12 });
-const DESTROYER_SEARCH_RADIUS = 2200;
+const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
 const SEARCH_REVEAL_DURATION_MS = 10000;
 const SHIP_HEIGHT_MULT = 6.6;
@@ -145,7 +146,7 @@ const UNIT_DEFINITIONS = {
     size: 60,
     attackRange: 1250,
     attackCooldownMs: 1000,
-    visionRadius: 1500,
+    visionRadius: 1000,
     buildTime: 8000
   },
   cruiser: {
@@ -514,6 +515,7 @@ function buildClientUnitsPayload() {
       attackTargetType: unit.attackTargetType ?? null,
       holdPosition: !!unit.holdPosition,
       searchCooldownUntil: unit.searchCooldownUntil ?? null,
+      searchActiveUntil: unit.searchActiveUntil ?? null,
       airstrikeReady: !!unit.airstrikeReady,
       airstrikeCooldownUntil: unit.airstrikeCooldownUntil ?? null,
       isMine: unit.type === 'mine'
@@ -2184,7 +2186,7 @@ io.on('connection', (socket) => {
         currentX: unit.x, currentY: unit.y,
         startTime: Date.now(),
         flightTime: 5000,
-        hp: 250, maxHp: 250,
+        hp: SLBM_MAX_HP, maxHp: SLBM_MAX_HP,
         userId: socket.userId,
         firingSubId: submarineId,
         damageAccumulator: 0,
@@ -2366,7 +2368,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Destroyer: activate search (reveals subs + mines in vision range, 16s cooldown)
+  // Destroyer: activate search (extends vision to a wide pulse for a short duration, 16s cooldown)
   socket.on('activateSearch', (data) => {
     switchRoom(socket.roomId);
     const { unitIds } = data;
@@ -2377,33 +2379,12 @@ io.on('connection', (socket) => {
       if (unit && unit.userId === socket.userId && unit.type === 'destroyer') {
         if (unit.searchCooldownUntil && now < unit.searchCooldownUntil) return;
         unit.searchCooldownUntil = now + 16000;
-        const vr = Math.max(DESTROYER_SEARCH_RADIUS, unit.visionRadius || UNIT_DEFINITIONS.destroyer.visionRadius);
-        const vrSq = vr * vr;
+        unit.searchActiveUntil = now + SEARCH_REVEAL_DURATION_MS;
+        const vr = DESTROYER_SEARCH_VISION_RADIUS;
         if (!gameState.fogOfWar.has(unit.userId)) {
           gameState.fogOfWar.set(unit.userId, new Map());
         }
         revealFogCircleForPlayer(gameState.fogOfWar.get(unit.userId), unit.x, unit.y, vr, now);
-        // Reveal submarines
-        gameState.units.forEach(other => {
-          if (other.userId === unit.userId) return;
-          if (other.type === 'submarine') {
-            const dx = other.x - unit.x;
-            const dy = other.y - unit.y;
-            if (dx * dx + dy * dy <= vrSq) {
-              other.isDetected = true;
-              other.searchRevealedUntil = now + SEARCH_REVEAL_DURATION_MS;
-            }
-          }
-          // Reveal mines
-          if (other.type === 'mine') {
-            const dx = other.x - unit.x;
-            const dy = other.y - unit.y;
-            if (dx * dx + dy * dy <= vrSq) {
-              other.isDetected = true;
-              other.searchRevealedUntil = now + SEARCH_REVEAL_DURATION_MS;
-            }
-          }
-        });
         roomEmit('searchActivated', { unitId: unit.id, x: unit.x, y: unit.y, radius: vr });
       }
     });
@@ -2979,18 +2960,21 @@ function updateFogOfWar() {
     const playerFog = gameState.fogOfWar.get(playerId);
     
     // Reveal fog based on unit positions
-    gameState.units.forEach(unit => {
-      if (unit.userId === playerId) {
-        const unitDef = getUnitDefinition(unit.type);
-        let visionRadius = unitDef.visionRadius || mapConfig.vision.unitVisionRadius;
-        // Battleship aimed shot doubles vision
-        if (unit.type === 'battleship' && unit.aimedShot) {
-          visionRadius *= 2;
-        }
-        const cellSize = gameState.map.cellSize || 50;
-        const gridX = Math.floor(unit.x / cellSize);
-        const gridY = Math.floor(unit.y / cellSize);
-        const gridRadius = Math.ceil(visionRadius / cellSize);
+      gameState.units.forEach(unit => {
+        if (unit.userId === playerId) {
+          const unitDef = getUnitDefinition(unit.type);
+          let visionRadius = unitDef.visionRadius || mapConfig.vision.unitVisionRadius;
+          // Battleship aimed shot doubles vision
+          if (unit.type === 'battleship' && unit.aimedShot) {
+            visionRadius *= 2;
+          }
+          if (unit.type === 'destroyer' && unit.searchActiveUntil && now < unit.searchActiveUntil) {
+            visionRadius = Math.max(visionRadius, DESTROYER_SEARCH_VISION_RADIUS);
+          }
+          const cellSize = gameState.map.cellSize || 50;
+          const gridX = Math.floor(unit.x / cellSize);
+          const gridY = Math.floor(unit.y / cellSize);
+          const gridRadius = Math.ceil(visionRadius / cellSize);
         
         for (let dx = -gridRadius; dx <= gridRadius; dx++) {
           for (let dy = -gridRadius; dy <= gridRadius; dy++) {
@@ -3283,13 +3267,6 @@ function updateGame(deltaTime) {
       }
     }
     
-    // Submarine stealth detection (simplified)
-    if (unit.type === 'submarine') {
-      // Reset detection if not attacking
-      if (!unit.lastAttackTime || now - unit.lastAttackTime > 10000) {
-        unit.isDetected = false;
-      }
-    }
   });
   
   // Update buildings construction
@@ -3629,13 +3606,51 @@ function updateGame(deltaTime) {
     }
   });
 
-  // Re-stealth submarines and mines after search reveal expires
+  // Destroyers always reveal submarines and mines inside current vision.
+  const destroyerSensors = [];
   gameState.units.forEach(unit => {
-    if ((unit.type === 'submarine' || unit.type === 'mine') && unit.isDetected && unit.searchRevealedUntil) {
-      if (now >= unit.searchRevealedUntil) {
-        unit.isDetected = false;
-        unit.searchRevealedUntil = null;
+    if (unit.type !== 'destroyer' || unit.hp <= 0) return;
+    const baseVision = unit.visionRadius || UNIT_DEFINITIONS.destroyer.visionRadius;
+    const detectionRadius = (unit.searchActiveUntil && now < unit.searchActiveUntil)
+      ? DESTROYER_SEARCH_VISION_RADIUS
+      : baseVision;
+    destroyerSensors.push({
+      userId: unit.userId,
+      x: unit.x,
+      y: unit.y,
+      radiusSq: detectionRadius * detectionRadius
+    });
+    if (unit.searchActiveUntil && now >= unit.searchActiveUntil) {
+      unit.searchActiveUntil = null;
+    }
+  });
+
+  gameState.units.forEach(unit => {
+    if (unit.type !== 'submarine' && unit.type !== 'mine') return;
+
+    let detected = false;
+    if (unit.type === 'submarine' && unit.lastAttackTime && now - unit.lastAttackTime <= 10000) {
+      detected = true;
+    }
+    if (!detected && unit.searchRevealedUntil && now < unit.searchRevealedUntil) {
+      detected = true;
+    }
+    if (!detected) {
+      for (let i = 0; i < destroyerSensors.length; i++) {
+        const sensor = destroyerSensors[i];
+        if (sensor.userId === unit.userId) continue;
+        const dx = unit.x - sensor.x;
+        const dy = unit.y - sensor.y;
+        if ((dx * dx) + (dy * dy) <= sensor.radiusSq) {
+          detected = true;
+          break;
+        }
       }
+    }
+
+    unit.isDetected = detected;
+    if (unit.searchRevealedUntil && now >= unit.searchRevealedUntil) {
+      unit.searchRevealedUntil = null;
     }
   });
 
@@ -4177,9 +4192,9 @@ function updateGame(deltaTime) {
           // Calculate damage with modifiers
           let dmg = unit.damage;
           
-          // Aegis mode: fixed damage (10% of SLBM HP = 25)
+          // Aegis mode: fixed damage, with bonus interception damage versus SLBMs.
           if (unit.type === 'cruiser' && unit.aegisMode) {
-            dmg = 25;
+            dmg = unit.attackTargetType === 'slbm' ? 50 : 25;
           }
           
           // Aimed shot: 2x damage
@@ -4819,7 +4834,7 @@ function updateAI() {
           currentX: sub.x, currentY: sub.y,
           startTime: now,
           flightTime: 5000,
-          hp: 250, maxHp: 250,
+          hp: SLBM_MAX_HP, maxHp: SLBM_MAX_HP,
           userId: playerId,
           firingSubId: sub.id,
           damageAccumulator: 0,

@@ -146,7 +146,8 @@ const FIXED_BUILDING_IMAGE_MAX_DIMENSION = 200;
 const DEFENSE_TOWER_CANNON_START = Object.freeze({ x: 5, y: 8 });
 const DEFENSE_TOWER_CANNON_MUZZLE = Object.freeze({ x: 21, y: 12 });
 const AIRSTRIKE_TARGET_RADIUS = 400;
-const DESTROYER_VISION_RADIUS = 1500;
+const DESTROYER_VISION_RADIUS = 1000;
+const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
 const WORKER_FILL_COLOR = 0x8f99a3;
 const WORKER_OUTLINE_COLOR = 0xe4e8eb;
@@ -1852,11 +1853,11 @@ function renderSingleUnitPanel(unit, options = {}) {
         if (isAegis) {
             document.getElementById('skillBtn6').textContent = '🛡️ 이지스 모드 (활성)';
             document.getElementById('skillBtn6').className = 'skill-btn skill-active';
-            document.getElementById('skillDesc6').textContent = 'SLBM 요격 가능 / 데미지 25 / 피해감소 30% / 사거리 60% 감소';
+            document.getElementById('skillDesc6').textContent = 'SLBM 요격 가능 / 함선 25, SLBM 50 / 피해감소 30% / 사거리 60% 감소';
         } else {
             document.getElementById('skillBtn6').textContent = '🛡️ 이지스 모드';
             document.getElementById('skillBtn6').className = 'skill-btn';
-            document.getElementById('skillDesc6').textContent = 'SLBM 요격 모드 전환 (데미지 25, 피해감소 30%, 사거리 60%↓)';
+            document.getElementById('skillDesc6').textContent = 'SLBM 요격 모드 전환 (함선 25, SLBM 50, 피해감소 30%, 사거리 60%↓)';
         }
         if (unit.isIsolated) {
             document.getElementById('skillDesc6').textContent += ' | 🐺 외로운 늑대: 데미지 +100%, 피해감소 50%';
@@ -1867,16 +1868,22 @@ function renderSingleUnitPanel(unit, options = {}) {
         const now7 = Date.now();
         const slot7 = document.getElementById('skillSlot7');
         slot7.style.display = 'flex';
+        const searchActive = unit.searchActiveUntil && now7 < unit.searchActiveUntil;
+        const searchActiveRemain = searchActive ? Math.ceil((unit.searchActiveUntil - now7) / 1000) : 0;
         const searchCd = unit.searchCooldownUntil && now7 < unit.searchCooldownUntil;
         const searchRemain = searchCd ? Math.ceil((unit.searchCooldownUntil - now7) / 1000) : 0;
-        if (searchCd) {
+        if (searchActive) {
+            document.getElementById('skillBtn7').textContent = `🔍 탐색 활성 (${searchActiveRemain}초)`;
+            document.getElementById('skillBtn7').className = 'skill-btn skill-active';
+            document.getElementById('skillDesc7').textContent = `시야 4800 유지 중 | 쿨타임 ${searchRemain}초`;
+        } else if (searchCd) {
             document.getElementById('skillBtn7').textContent = `🔍 탐색 (${searchRemain}초)`;
             document.getElementById('skillBtn7').className = 'skill-btn skill-cooldown';
             document.getElementById('skillDesc7').textContent = `쿨타임 ${searchRemain}초 남음`;
         } else {
             document.getElementById('skillBtn7').textContent = '🔍 탐색';
             document.getElementById('skillBtn7').className = 'skill-btn';
-            document.getElementById('skillDesc7').textContent = '시야 내 잠수함/기뢰 발견 (쿨타임 16초)';
+            document.getElementById('skillDesc7').textContent = '기본: 시야 내 잠수함/기뢰 자동 탐지 | 사용: 10초간 시야 4800';
         }
         const slot8 = document.getElementById('skillSlot8');
         slot8.style.display = 'flex';
@@ -2306,7 +2313,7 @@ function updateSelectionInfo() {
             slot7.style.display = 'flex';
             document.getElementById('skillBtn7').textContent = '🔍 탐색';
             document.getElementById('skillBtn7').className = 'skill-btn';
-            document.getElementById('skillDesc7').textContent = '시야 내 잠수함/기뢰 발견 (쿨타임 16초)';
+            document.getElementById('skillDesc7').textContent = '기본: 시야 내 잠수함/기뢰 자동 탐지 | 사용: 10초간 시야 4800';
             
             const slot8 = document.getElementById('skillSlot8');
             slot8.style.display = 'flex';
@@ -2327,7 +2334,7 @@ function updateSelectionInfo() {
                 document.getElementById('skillBtn6').textContent = '🛡️ 이지스 모드';
                 document.getElementById('skillBtn6').className = 'skill-btn';
             }
-            document.getElementById('skillDesc6').textContent = 'SLBM 요격 모드 전환 (데미지 25, 피해감소 30%, 사거리 60%↓)';
+            document.getElementById('skillDesc6').textContent = 'SLBM 요격 모드 전환 (함선 25, SLBM 50, 피해감소 30%, 사거리 60%↓)';
         }
         
 // Multi-unit type summary (sorted by priority)
@@ -3614,7 +3621,7 @@ function renderMinimap() {
     if (gridSize > 0 && fogCellSize > 0 && !revealAll) {
         const minimapVisionRanges = {
             worker: 1000,
-            destroyer: 1500,
+            destroyer: 1000,
             cruiser: 1200,
             battleship: 3200,
             carrier: 2000,
@@ -3628,7 +3635,10 @@ function renderMinimap() {
             if (unit.userId != gameState.userId) return;
             const displayX = unit.interpDisplayX !== undefined ? unit.interpDisplayX : unit.x;
             const displayY = unit.interpDisplayY !== undefined ? unit.interpDisplayY : unit.y;
-            const worldRadius = minimapVisionRanges[unit.type] || 1000;
+            let worldRadius = minimapVisionRanges[unit.type] || 1000;
+            if (unit.type === 'destroyer' && unit.searchActiveUntil && now < unit.searchActiveUntil) {
+                worldRadius = DESTROYER_SEARCH_VISION_RADIUS;
+            }
             visibleCircles.push({
                 x: displayX * scaleX,
                 y: displayY * scaleY,
@@ -5044,7 +5054,7 @@ function updateFogOfWar(force = false) {
     // Vision ranges (in world units) - increased for better visibility
     const visionRanges = {
         'worker': 1000,
-        'destroyer': 1500,
+        'destroyer': 1000,
         'cruiser': 1200,
         'battleship': 3200,
         'carrier': 2000,
@@ -5067,7 +5077,10 @@ function updateFogOfWar(force = false) {
 
     for (let i = 0; i < _ownUnitsTemp.length; i += unitSampleStep) {
         const unit = _ownUnitsTemp[i];
-        const radius = visionRanges[unit.type] || 1000;
+        let radius = visionRanges[unit.type] || 1000;
+        if (unit.type === 'destroyer' && unit.searchActiveUntil && now < unit.searchActiveUntil) {
+            radius = DESTROYER_SEARCH_VISION_RADIUS;
+        }
         const gridX = Math.floor(unit.x / cellSize);
         const gridY = Math.floor(unit.y / cellSize);
         const gridRadius = Math.ceil(radius / cellSize);
