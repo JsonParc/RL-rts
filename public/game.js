@@ -4218,6 +4218,9 @@ document.getElementById('skillBtn8').addEventListener('click', () => {
 function updateRankings() {
     const roomId = gameState.selectedRoom || localStorage.getItem('selectedRoom') || 'server1';
     const query = new URLSearchParams({ roomId });
+    if (gameState.userId != null) {
+        query.set('userId', String(gameState.userId));
+    }
     fetch(`/api/rankings?${query.toString()}`)
         .then(res => res.json())
         .then(rankings => {
@@ -4225,7 +4228,7 @@ function updateRankings() {
             list.innerHTML = rankings.map((rank, index) => `
                 <div class="ranking-item rank-${index + 1}">
                     <span class="rank-number">#${index + 1}</span>
-                    <div class="username">${rank.username}</div>
+                    <div class="username">${rank.username}${rank.isSelf ? ' (나)' : ''}</div>
                     <div class="stats">
                         점수: ${Math.floor(rank.score)} | 
                         자원: ${Math.floor(rank.resources)} | 
@@ -4234,6 +4237,9 @@ function updateRankings() {
                     </div>
                 </div>
             `).join('');
+        })
+        .catch(error => {
+            console.error('Ranking update failed:', error);
         });
 }
 

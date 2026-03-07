@@ -522,43 +522,6 @@ function buildClientUnitsPayload() {
   return units;
 }
 
-function buildClientUnitSyncPayload() {
-  const units = [];
-  gameState.units.forEach(unit => {
-    units.push({
-      id: unit.id,
-      x: unit.x,
-      y: unit.y,
-      hp: unit.hp,
-      targetX: unit.targetX ?? null,
-      targetY: unit.targetY ?? null,
-      gatheringResourceId: unit.gatheringResourceId ?? null,
-      buildingType: unit.buildingType ?? null,
-      buildTargetX: unit.buildTargetX ?? null,
-      buildTargetY: unit.buildTargetY ?? null,
-      sourceDestroyerId: unit.sourceDestroyerId ?? null,
-      isDetected: !!unit.isDetected,
-      kills: unit.kills ?? 0,
-      aimedShot: !!unit.aimedShot,
-      aimedShotCooldownUntil: unit.aimedShotCooldownUntil ?? null,
-      aegisMode: !!unit.aegisMode,
-      isIsolated: !!unit.isIsolated,
-      aircraft: unit.aircraft ?? null,
-      aircraftDeployed: unit.aircraftDeployed ?? null,
-      aircraftQueue: unit.aircraftQueue ?? [],
-      producingAircraft: unit.producingAircraft ?? null,
-      attackMove: !!unit.attackMove,
-      attackTargetId: unit.attackTargetId ?? null,
-      attackTargetType: unit.attackTargetType ?? null,
-      holdPosition: !!unit.holdPosition,
-      searchCooldownUntil: unit.searchCooldownUntil ?? null,
-      airstrikeReady: !!unit.airstrikeReady,
-      airstrikeCooldownUntil: unit.airstrikeCooldownUntil ?? null
-    });
-  });
-  return units;
-}
-
 function buildClientBuildingsPayload() {
   const buildings = [];
   gameState.buildings.forEach(building => {
@@ -570,28 +533,6 @@ function buildClientBuildingsPayload() {
       y: building.y,
       hp: building.hp,
       maxHp: building.maxHp,
-      buildProgress: building.buildProgress,
-      slbmCount: building.slbmCount ?? 0,
-      producing: building.producing ?? null,
-      missileProducing: building.missileProducing ?? null,
-      missileQueue: building.missileQueue ?? [],
-      attackTargetId: building.attackTargetId ?? null,
-      attackTargetType: building.attackTargetType ?? null,
-      turretAngle: building.turretAngle ?? null,
-      turretTargetX: building.turretTargetX ?? null,
-      turretTargetY: building.turretTargetY ?? null,
-      lastTurretTargetTime: building.lastTurretTargetTime ?? null
-    });
-  });
-  return buildings;
-}
-
-function buildClientBuildingSyncPayload() {
-  const buildings = [];
-  gameState.buildings.forEach(building => {
-    buildings.push({
-      id: building.id,
-      hp: building.hp,
       buildProgress: building.buildProgress,
       slbmCount: building.slbmCount ?? 0,
       producing: building.producing ?? null,
@@ -2977,10 +2918,10 @@ setInterval(() => {
 
     if (updateCounter % stride !== 0) return;
 
-    io.to(roomId).volatile.emit('gameUpdate', {
+    io.to(roomId).emit('gameUpdate', {
       players: buildClientPlayersPayload(),
-      units: buildClientUnitSyncPayload(),
-      buildings: buildClientBuildingSyncPayload()
+      units: buildClientUnitsPayload(),
+      buildings: buildClientBuildingsPayload()
     });
   });
 }, NETWORK_UPDATE_BASE_MS);
@@ -4324,6 +4265,7 @@ function updateGame(deltaTime) {
 app.get('/api/rankings', (req, res) => {
   // Rankings panel is room-local. Never merge same-named AI players across rooms.
   const requestedRoomId = typeof req.query.roomId === 'string' ? req.query.roomId : null;
+  const requestedUserId = typeof req.query.userId === 'string' ? req.query.userId : null;
   const room =
     (requestedRoomId && gameRooms.get(requestedRoomId)) ||
     gameRooms.get('server1') ||
@@ -4334,9 +4276,10 @@ app.get('/api/rankings', (req, res) => {
     return;
   }
 
-  const rankings = [...room.players.values()]
+  const scoredPlayers = [...room.players.values()]
     .filter(player => player && (player.isAI || player.online))
     .map((player) => ({
+      userId: String(player.userId),
       username: player.username,
       resources: Math.floor(player.resources || 0),
       population: player.population || 0,
@@ -4344,8 +4287,24 @@ app.get('/api/rankings', (req, res) => {
       score: calculatePlayerScore(player)
     }))
     .filter(player => player.score > 0)
-    .sort((a, b) => (b.score || 0) - (a.score || 0))
-    .slice(0, 10);
+    .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+  const rankings = scoredPlayers
+    .slice(0, 10)
+    .map(player => ({
+      ...player,
+      isSelf: requestedUserId != null && player.userId === requestedUserId
+    }));
+
+  if (requestedUserId != null && !rankings.some(player => player.userId === requestedUserId)) {
+    const ownPlayer = scoredPlayers.find(player => player.userId === requestedUserId);
+    if (ownPlayer) {
+      rankings.push({
+        ...ownPlayer,
+        isSelf: true
+      });
+    }
+  }
 
   res.json(rankings);
 });
