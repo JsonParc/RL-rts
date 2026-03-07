@@ -2188,9 +2188,7 @@ io.on('connection', (socket) => {
         flightTime: 5000,
         hp: SLBM_MAX_HP, maxHp: SLBM_MAX_HP,
         userId: socket.userId,
-        firingSubId: submarineId,
-        damageAccumulator: 0,
-        damageWindowStart: Date.now()
+        firingSubId: submarineId
       };
       gameState.activeSlbms.set(slbmId, slbm);
       
@@ -3045,6 +3043,7 @@ function applySlbmDamage(slbm) {
     const dy = target.y - slbm.targetY;
     if (Math.sqrt(dx * dx + dy * dy) <= damageRadius) {
       target.hp = Math.max(0, target.hp - 500);
+      target.lastDamageTime = Date.now();
       if (target.hp <= 0) {
         const targetOwner = gameState.players.get(target.userId);
         if (targetOwner) {
@@ -3066,6 +3065,7 @@ function applySlbmDamage(slbm) {
     const dy = target.y - slbm.targetY;
     if (Math.sqrt(dx * dx + dy * dy) <= damageRadius) {
       target.hp = Math.max(0, target.hp - 800);
+      target.lastDamageTime = Date.now();
       if (target.hp <= 0) {
         roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
         if (firingPlayer) firingPlayer.combatPower += 20;
@@ -3271,6 +3271,17 @@ function updateGame(deltaTime) {
   
   // Update buildings construction
   gameState.buildings.forEach(building => {
+    if (building.buildProgress >= 100 && building.hp < building.maxHp) {
+      const timeSinceLastDamage = building.lastDamageTime ? (now - building.lastDamageTime) : Infinity;
+      if (timeSinceLastDamage >= HP_REGEN_CONFIG.delayMs) {
+        const lastRegenTime = building.lastRegenTime || 0;
+        if (now - lastRegenTime >= HP_REGEN_CONFIG.regenIntervalMs) {
+          building.lastRegenTime = now;
+          building.hp = Math.min(building.maxHp, building.hp + HP_REGEN_CONFIG.regenPerSecond);
+        }
+      }
+    }
+
     if (building.buildProgress < 100) {
       const prevProgress = building.buildProgress;
       building.buildProgress += deltaTime * 10;
@@ -3430,7 +3441,7 @@ function updateGame(deltaTime) {
     }
   });
 
-  // Update active SLBM missiles - position, arrival, interception
+  // Update active SLBM missiles - position and arrival
   gameState.activeSlbms.forEach((slbm, slbmId) => {
     const elapsed = now - slbm.startTime;
     const progress = Math.min(1, elapsed / slbm.flightTime);
@@ -3438,28 +3449,6 @@ function updateGame(deltaTime) {
     // Update current position
     slbm.currentX = slbm.fromX + (slbm.targetX - slbm.fromX) * progress;
     slbm.currentY = slbm.fromY + (slbm.targetY - slbm.fromY) * progress;
-    
-    // DPS threshold check - SLBM only takes damage if 500+ DPS accumulated per 1-second window
-    if (!slbm.damageWindowStart) slbm.damageWindowStart = now;
-    const windowElapsed = now - slbm.damageWindowStart;
-    if (windowElapsed >= 1000) {
-      const dps = (slbm.damageAccumulator || 0);
-      if (dps >= 500) {
-        // Threshold met - apply accumulated damage
-        slbm.hp -= dps;
-        roomEmit('slbmDamaged', { id: slbm.id, hp: slbm.hp, maxHp: slbm.maxHp });
-        
-        if (slbm.hp <= 0) {
-          // SLBM intercepted by defense towers!
-          roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
-          gameState.activeSlbms.delete(slbmId);
-          return;
-        }
-      }
-      // Reset window
-      slbm.damageAccumulator = 0;
-      slbm.damageWindowStart = now;
-    }
     
     // Check if arrived at target
     if (progress >= 1) {
@@ -3563,6 +3552,7 @@ function updateGame(deltaTime) {
         const targetRadius = getBuildingCollisionSize(target.type) / 2;
         if (targetIntersectsDamageCircle(strike.targetX, strike.targetY, damageRadius, target.x, target.y, targetRadius)) {
           target.hp -= strike.damagePerPass;
+          target.lastDamageTime = now;
           if (target.hp <= 0) {
             roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
             gameState.buildings.delete(target.id);
@@ -3896,7 +3886,7 @@ function updateGame(deltaTime) {
       }
     }
     
-    // Defense tower SLBM interception (separate cooldown, 500 DPS threshold)
+    // Defense tower SLBM interception
     gameState.activeSlbms.forEach(slbm => {
       if (slbm.userId === building.userId) return;
       if (!slbm.currentX || !slbm.currentY) return;
@@ -3916,8 +3906,12 @@ function updateGame(deltaTime) {
           towerTrackedTarget = true;
           building.lastSlbmAttackTime = now;
           emitAttackProjectile(building, { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
-          // Accumulate damage - only applied if 500+ DPS threshold met
-          slbm.damageAccumulator = (slbm.damageAccumulator || 0) + towerDamage;
+          slbm.hp = Math.max(0, slbm.hp - towerDamage);
+          roomEmit('slbmDamaged', { id: slbm.id, hp: slbm.hp, maxHp: slbm.maxHp });
+          if (slbm.hp <= 0) {
+            roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
+            gameState.activeSlbms.delete(slbm.id);
+          }
         }
       }
     });
@@ -4217,9 +4211,9 @@ function updateGame(deltaTime) {
             }
           }
           
-          // For SLBM targets in aegis mode, accumulate damage like defense towers
+          // SLBMs take direct damage like other targets.
           if (unit.attackTargetType === 'slbm') {
-            target.damageAccumulator = (target.damageAccumulator || 0) + dmg;
+            target.hp = Math.max(0, target.hp - dmg);
           } else {
             target.hp -= dmg;
           }
@@ -4836,9 +4830,7 @@ function updateAI() {
           flightTime: 5000,
           hp: SLBM_MAX_HP, maxHp: SLBM_MAX_HP,
           userId: playerId,
-          firingSubId: sub.id,
-          damageAccumulator: 0,
-          damageWindowStart: now
+          firingSubId: sub.id
         };
         gameState.activeSlbms.set(slbmId, slbm);
         
