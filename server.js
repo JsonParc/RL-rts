@@ -663,7 +663,8 @@ function createRoomState() {
     map: null,
     landCellsSnapshot: null,
     lastUpdate: Date.now(),
-    fogOfWar: new Map()
+    fogOfWar: new Map(),
+    aiRespawnTimers: new Map()
   };
 }
 
@@ -692,6 +693,34 @@ function switchRoom(roomId) {
   currentRoomId = roomId;
   nextSlbmId = room.nextSlbmId;
   return true;
+}
+
+function removePlayerEntities(userId) {
+  const unitsToDelete = [];
+  gameState.units.forEach((unit, unitId) => {
+    if (unit.userId === userId) {
+      unitsToDelete.push(unitId);
+    }
+  });
+  unitsToDelete.forEach(unitId => gameState.units.delete(unitId));
+
+  const buildingsToDelete = [];
+  gameState.buildings.forEach((building, buildingId) => {
+    if (building.userId === userId) {
+      buildingsToDelete.push(buildingId);
+    }
+  });
+  buildingsToDelete.forEach(buildingId => gameState.buildings.delete(buildingId));
+}
+
+function removePlayerFromCurrentRoom(userId, options = {}) {
+  const { emitPlayerLeft = false } = options;
+  removePlayerEntities(userId);
+  gameState.players.delete(userId);
+  gameState.fogOfWar.delete(userId);
+  if (emitPlayerLeft && currentRoomId) {
+    io.to(currentRoomId).emit('playerLeft', userId);
+  }
 }
 
 // Save slbmId back to room
@@ -1696,22 +1725,7 @@ function findStartPosition() {
 
 // Spawn base with workers for a player
 function spawnPlayerBase(userId) {
-  // Delete all existing units and buildings for this player
-  const unitsToDelete = [];
-  gameState.units.forEach((unit, unitId) => {
-    if (unit.userId === userId) {
-      unitsToDelete.push(unitId);
-    }
-  });
-  unitsToDelete.forEach(unitId => gameState.units.delete(unitId));
-  
-  const buildingsToDelete = [];
-  gameState.buildings.forEach((building, buildingId) => {
-    if (building.userId === userId) {
-      buildingsToDelete.push(buildingId);
-    }
-  });
-  buildingsToDelete.forEach(buildingId => gameState.buildings.delete(buildingId));
+  removePlayerEntities(userId);
   
   // Find a good starting position
   const startPos = findStartPosition();
@@ -1890,63 +1904,52 @@ function checkPlayerDefeat(userId, attackerId = null) {
   if (!hasBuildings) {
     // Get player and attacker names for kill log
     const defeatedPlayer = gameState.players.get(userId);
+    if (!defeatedPlayer) {
+      console.warn(`checkPlayerDefeat: player ${userId} missing in room ${currentRoomId}`);
+      return;
+    }
     const attackerPlayer = attackerId ? gameState.players.get(attackerId) : null;
     const defeatedName = defeatedPlayer ? defeatedPlayer.username : `Player ${userId}`;
     const attackerName = attackerPlayer ? attackerPlayer.username : '알 수 없음';
-    
-    // Player defeated - delete all units
-    const unitsToDelete = [];
-    gameState.units.forEach((unit, unitId) => {
-      if (unit.userId === userId) {
-        unitsToDelete.push(unitId);
-      }
-    });
-    unitsToDelete.forEach(unitId => gameState.units.delete(unitId));
-    
-    // Update player data
-    const player = gameState.players.get(userId);
-    if (player) {
-      player.hasBase = false;
-      player.population = 0;
-      player.resources = 1000;
-      player.combatPower = 0;
-      player.score = 0;
-      player.maxPopulation = 10;
-      player.researchedSLBM = false;
-      player.missiles = 0;
-      
-      if (player.isAI) {
-        player.knownEnemyBases = [];
-        player.knownEnemyPositions = [];
-        player.scoutedIslands = new Set();
-        player.scoutTargets = [];
-        player.lastScoutTime = 0;
-        player.lastAttackTime = 0;
-        player.targetCombatPower = null;
-        player.isExpanding = false;
-        player.expansionTarget = null;
-        player.expansionBuilt = [];
-        // Reset counterattack system
-        player.recentAttackLocations = [];
-        player.priorityTargets = [];
-        player.isCounterattacking = false;
-        player.counterattackTarget = null;
-      }
+
+    if (defeatedPlayer.isAI) {
+      roomEmit('playerDefeated', {
+        userId,
+        respawned: false,
+        defeatedName,
+        attackerName,
+        attackerId: attackerId || null,
+        isAI: true,
+        respawnDelayMs: AI_CONFIG.respawnDelayMs
+      });
+      removePlayerFromCurrentRoom(userId, { emitPlayerLeft: true });
+      scheduleAIRespawn(userId);
+      console.log(`${defeatedName} was defeated by ${attackerName} and will respawn in ${AI_CONFIG.respawnDelayMs}ms`);
+      return;
     }
-    
-    if (!player || !player.isAI) {
-      try {
-        db.prepare(`UPDATE player_data SET 
-          has_base = 0, population = 0, resources = 1000, 
-          combat_power = 0, score = 0, max_population = 10,
-          researched_slbm = 0, missiles = 0
-          WHERE user_id = ?`).run(userId);
-      } catch(e) { /* no-op for temp users */ }
-    }
-    
+
+    removePlayerEntities(userId);
+
+    defeatedPlayer.hasBase = false;
+    defeatedPlayer.population = 0;
+    defeatedPlayer.resources = 1000;
+    defeatedPlayer.combatPower = 0;
+    defeatedPlayer.score = 0;
+    defeatedPlayer.maxPopulation = 10;
+    defeatedPlayer.researchedSLBM = false;
+    defeatedPlayer.missiles = 0;
+
+    try {
+      db.prepare(`UPDATE player_data SET 
+        has_base = 0, population = 0, resources = 1000, 
+        combat_power = 0, score = 0, max_population = 10,
+        researched_slbm = 0, missiles = 0
+        WHERE user_id = ?`).run(userId);
+    } catch(e) { /* no-op for temp users */ }
+
     // Respawn base at new location (findStartPosition avoids existing bases)
     spawnPlayerBase(userId);
-    
+
     // Emit defeat event with kill log info
     roomEmit('playerDefeated', { 
       userId, 
@@ -1955,12 +1958,8 @@ function checkPlayerDefeat(userId, attackerId = null) {
       attackerName,
       attackerId: attackerId || null
     });
-    
+
     console.log(`${defeatedName} was defeated by ${attackerName} and respawned`);
-    
-    if (player && player.isAI) {
-      console.log(`AI ${player.username} defeated and respawning at (${player.baseX}, ${player.baseY})`);
-    }
   }
 }
 
@@ -2512,24 +2511,7 @@ io.on('connection', (socket) => {
     switchRoom(socket.roomId);
     console.log(`Player disconnected: ${socket.username}`);
     try {
-      // Clean up all units and buildings for this player (no persistence)
-      const unitsToDelete = [];
-      gameState.units.forEach((unit, unitId) => {
-        if (unit.userId === socket.userId) unitsToDelete.push(unitId);
-      });
-      unitsToDelete.forEach(id => gameState.units.delete(id));
-
-      const buildingsToDelete = [];
-      gameState.buildings.forEach((building, buildingId) => {
-        if (building.userId === socket.userId) buildingsToDelete.push(buildingId);
-      });
-      buildingsToDelete.forEach(id => gameState.buildings.delete(id));
-
-      gameState.players.delete(socket.userId);
-      gameState.fogOfWar.delete(socket.userId);
-
-      // Notify other clients
-      socket.to(socket.roomId).emit('playerLeft', socket.userId);
+      removePlayerFromCurrentRoom(socket.userId, { emitPlayerLeft: true });
     } catch (error) {
       console.error('Error during disconnect:', error);
     }
@@ -4303,6 +4285,7 @@ app.get('/api/rankings', (req, res) => {
 const AI_CONFIG = {
   count: 2, // Number of AI players
   updateInterval: 3000, // AI decision interval (ms)
+  respawnDelayMs: 10000, // How long defeated AI stays out of the room
   scoutInterval: 10000, // How often to send scouts
   buildingPriority: ['power_plant', 'shipyard', 'naval_academy', 'missile_silo', 'defense_tower'],
   unitPriority: ['worker', 'destroyer', 'cruiser', 'frigate', 'submarine', 'battleship', 'carrier'],
@@ -4321,71 +4304,116 @@ const AI_CONFIG = {
   expansionBuildingThreshold: 10
 };
 
+function getAIUserId(aiIndex) {
+  return -1000 - aiIndex;
+}
+
+function getAIIndexFromUserId(aiUserId) {
+  if (aiUserId > -1000) return null;
+  return -1000 - aiUserId;
+}
+
+function getAIName(aiIndex) {
+  return `AI_Commander_${aiIndex + 1}`;
+}
+
+function spawnAIPlayer(aiIndex) {
+  const aiId = getAIUserId(aiIndex);
+  if (gameState.players.has(aiId)) {
+    return gameState.players.get(aiId);
+  }
+
+  const aiName = getAIName(aiIndex);
+  const startPos = findStartPosition();
+  if (!isOnLand(startPos.x, startPos.y)) {
+    const landPos = findNearestLandPosition(startPos.x, startPos.y);
+    startPos.x = landPos.x;
+    startPos.y = landPos.y;
+  }
+  const resolvedStartPos = findNearestValidBuildingPosition('headquarters', startPos.x, startPos.y);
+  if (resolvedStartPos) {
+    startPos.x = resolvedStartPos.x;
+    startPos.y = resolvedStartPos.y;
+  }
+
+  const aiPlayer = {
+    userId: aiId,
+    username: aiName,
+    resources: 1000,
+    population: 0,
+    maxPopulation: 10,
+    combatPower: 0,
+    score: 0,
+    baseX: startPos.x,
+    baseY: startPos.y,
+    hasBase: true,
+    researchedSLBM: false,
+    missiles: 0,
+    online: true,
+    isAI: true,
+    lastScoutTime: 0,
+    lastAttackTime: 0,
+    scoutTargets: [],
+    knownEnemyBases: [],
+    recentAttackLocations: [],
+    priorityTargets: [],
+    isCounterattacking: false,
+    counterattackTarget: null
+  };
+  gameState.players.set(aiId, aiPlayer);
+  gameState.fogOfWar.set(aiId, new Map());
+
+  const hqId = Date.now() * 1000 + Math.floor(Math.random() * 1000) + aiIndex * 100;
+  gameState.buildings.set(hqId, {
+    id: hqId,
+    userId: aiId,
+    type: 'headquarters',
+    x: startPos.x,
+    y: startPos.y,
+    hp: 1500,
+    maxHp: 1500,
+    buildProgress: 100
+  });
+
+  console.log(`AI Player ${aiName} initialized at (${startPos.x.toFixed(0)}, ${startPos.y.toFixed(0)})`);
+  return aiPlayer;
+}
+
+function scheduleAIRespawn(aiUserId) {
+  const roomId = currentRoomId;
+  const room = roomId ? gameRooms.get(roomId) : null;
+  const aiIndex = getAIIndexFromUserId(aiUserId);
+  if (!room || aiIndex == null) {
+    return;
+  }
+
+  const existingTimer = room.aiRespawnTimers.get(aiUserId);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  const timer = setTimeout(() => {
+    const targetRoom = gameRooms.get(roomId);
+    if (!targetRoom) return;
+
+    switchRoom(roomId);
+    targetRoom.aiRespawnTimers.delete(aiUserId);
+
+    const aiPlayer = spawnAIPlayer(aiIndex);
+    syncSlbmId();
+    io.to(roomId).emit('playerJoined', aiPlayer);
+    console.log(`AI ${aiPlayer.username} rejoined room ${roomId}`);
+  }, AI_CONFIG.respawnDelayMs);
+
+  room.aiRespawnTimers.set(aiUserId, timer);
+}
+
 // Initialize AI players
 function initializeAIPlayers() {
   console.log(`Initializing ${AI_CONFIG.count} AI players...`);
   
   for (let i = 0; i < AI_CONFIG.count; i++) {
-    const aiId = -1000 - i; // Negative IDs for AI players
-    const aiName = `AI_Commander_${i + 1}`;
-    
-    // Create AI player
-    const startPos = findStartPosition();
-    // Ensure AI base is on land
-    if (!isOnLand(startPos.x, startPos.y)) {
-      const landPos = findNearestLandPosition(startPos.x, startPos.y);
-      startPos.x = landPos.x;
-      startPos.y = landPos.y;
-    }
-    const resolvedStartPos = findNearestValidBuildingPosition('headquarters', startPos.x, startPos.y);
-    if (resolvedStartPos) {
-      startPos.x = resolvedStartPos.x;
-      startPos.y = resolvedStartPos.y;
-    }
-    gameState.players.set(aiId, {
-      userId: aiId,
-      username: aiName,
-      resources: 1000,
-      population: 0,
-      maxPopulation: 10,
-      combatPower: 0,
-      score: 0,
-      baseX: startPos.x,
-      baseY: startPos.y,
-      hasBase: true,
-      researchedSLBM: false,
-      missiles: 0,
-      online: true,
-      isAI: true,
-      lastScoutTime: 0,
-      lastAttackTime: 0,
-      scoutTargets: [],
-      knownEnemyBases: [],
-      // Counterattack system
-      recentAttackLocations: [],
-      priorityTargets: [], // { x, y, playerId, discoveredAt, priority } - ordered by priority (lower = higher priority)
-      isCounterattacking: false,
-      counterattackTarget: null
-    });
-    
-    // Create headquarters for AI
-    const hqId = Date.now() * 1000 + Math.floor(Math.random() * 1000) + i * 100;
-    gameState.buildings.set(hqId, {
-      id: hqId,
-      userId: aiId,
-      type: 'headquarters',
-      x: startPos.x,
-      y: startPos.y,
-      hp: 1500,
-      maxHp: 1500,
-      buildProgress: 100
-    });
-    
-    // AI starts with no workers - must build economy like human players
-    const player = gameState.players.get(aiId);
-    player.population = 0;
-    
-    console.log(`AI Player ${aiName} initialized at (${startPos.x.toFixed(0)}, ${startPos.y.toFixed(0)})`);
+    spawnAIPlayer(i);
   }
 }
 

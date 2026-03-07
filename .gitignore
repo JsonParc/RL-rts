@@ -3,3 +3,6 @@ game.db
 .env
 *.log
 .DS_Store
+.auto-commit.pid
+auto-commit.stdout.log
+auto-commit.stderr.log

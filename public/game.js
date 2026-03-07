@@ -4365,6 +4365,14 @@ function connectToGame() {
         }
         lastServerUpdateTime = nowMs;
 
+        const serverPlayerIds = new Set(data.players.map(p => p.userId));
+        const playersToDelete = [];
+        gameState.players.forEach((player, id) => {
+            if (!serverPlayerIds.has(id)) {
+                playersToDelete.push(id);
+            }
+        });
+        playersToDelete.forEach(id => gameState.players.delete(id));
         data.players.forEach(p => gameState.players.set(p.userId, p));
         
         // Track which units exist in this update
