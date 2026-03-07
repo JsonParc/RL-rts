@@ -14,7 +14,9 @@ const io = socketIo(server);
 const APP_NAME = 'MW Craft';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
 const GAME_TICK_RATE = 30; // 30 ticks per second
-const db = new Database('game.db');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'game.db');
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = new Database(DB_PATH);
 const COMBAT_SPATIAL_CELL_SIZE = 700;
 const COLLISION_SPATIAL_CELL_SIZE = 400;
 const NETWORK_UPDATE_BASE_MS = 100;
@@ -628,6 +630,10 @@ try {
 
 app.use(express.json());
 app.use(express.static('public'));
+
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ ok: true, app: APP_NAME });
+});
 
 // Room configuration
 const ROOM_CONFIG = [
@@ -5307,7 +5313,7 @@ if (!process.env.JWT_SECRET) {
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`${APP_NAME} server running on port ${PORT}`);
 });
 
