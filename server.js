@@ -32,8 +32,11 @@ const AIRSTRIKE_PASS_INTERVAL_MS = 667;
 const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
 const RECON_AIRCRAFT_BUILD_TIME_MS = 18000;
 const RECON_AIRCRAFT_LOITER_MS = 8000;
-const RECON_AIRCRAFT_TARGET_THRESHOLD = 8;
+const RECON_AIRCRAFT_TARGET_THRESHOLD = 160;
 const RECON_AIRCRAFT_DOCK_RADIUS = 90;
+const RECON_AIRCRAFT_ORBIT_RADIUS = 260;
+const RECON_AIRCRAFT_ORBIT_ANGULAR_SPEED = 1.6;
+const RECON_AIRCRAFT_RETURN_ALIGN_THRESHOLD = 0.42;
 const RED_ZONE_SELECTION_INTERVAL_MS = 10 * 60 * 1000;
 const RED_ZONE_WARNING_DURATION_MS = 30 * 1000;
 const RED_ZONE_COUNTDOWN_START_MS = 10 * 1000;
@@ -48,6 +51,7 @@ const BUILDING_BASE_DISPLAY_HEIGHT = 60 * 6.6;
 const COASTAL_BUILDING_SIZE_SCALE = 0.6;
 const POWER_PLANT_SIZE_SCALE = COASTAL_BUILDING_SIZE_SCALE * 0.7;
 const FIXED_BUILDING_IMAGE_MAX_DIMENSION = 200;
+const HEADQUARTERS_BUILD_COST = 800;
 const MISSILE_SILO_COST = 1600;
 const BUILDING_PLACEMENT_BUFFER = 50;
 const BUILDING_PLACEMENT_SEARCH_RADIUS = 4000;
@@ -166,6 +170,17 @@ function hasValidSlbmPosition(slbm) {
 
 function createUniqueEntityId(offset = 0) {
   return (Date.now() * 1000) + Math.floor(Math.random() * 1000) + offset;
+}
+
+function normalizeAngle(angle) {
+  let normalized = angle;
+  while (normalized > Math.PI) normalized -= Math.PI * 2;
+  while (normalized < -Math.PI) normalized += Math.PI * 2;
+  return normalized;
+}
+
+function getAngleDelta(a, b) {
+  return normalizeAngle(a - b);
 }
 
 const UNIT_DEFINITIONS = {
@@ -2459,6 +2474,8 @@ io.on('connection', (socket) => {
       scoutBaseTargetY: targetY,
       scoutState: 'outbound',
       scoutLoiterUntil: null,
+      scoutOrbitAngle: null,
+      scoutOrbitDirection: 1,
       scoutNextOrbitAt: now,
       holdPosition: true
     };
@@ -3044,7 +3061,7 @@ function buildBuilding(userId, type, x, y) {
   if (!player) return;
   
   const buildingTypes = {
-    'headquarters': { cost: 0, hp: 1500, size: getBuildingCollisionSize('headquarters') },
+    'headquarters': { cost: HEADQUARTERS_BUILD_COST, hp: 1500, size: getBuildingCollisionSize('headquarters') },
     'shipyard': { cost: 200, hp: 800, size: getBuildingCollisionSize('shipyard'), popBonus: 5 },
     'power_plant': { cost: 150, hp: 600, size: getBuildingCollisionSize('power_plant'), popBonus: 3 },
     'defense_tower': { cost: 250, hp: 700, size: getBuildingCollisionSize('defense_tower') },
@@ -3071,7 +3088,7 @@ function buildBuilding(userId, type, x, y) {
     }
   });
 
-  if (!workerNearby && type !== 'headquarters') {
+  if (!workerNearby) {
     return; // Workers must be nearby to build
   }
   
@@ -4036,9 +4053,12 @@ function updateGame(deltaTime) {
 
     const baseTargetX = Number.isFinite(recon.scoutBaseTargetX) ? recon.scoutBaseTargetX : recon.scoutTargetX;
     const baseTargetY = Number.isFinite(recon.scoutBaseTargetY) ? recon.scoutBaseTargetY : recon.scoutTargetY;
-    const targetDx = (recon.scoutTargetX ?? carrier.x) - recon.x;
-    const targetDy = (recon.scoutTargetY ?? carrier.y) - recon.y;
+    const targetDx = (recon.scoutTargetX ?? baseTargetX) - recon.x;
+    const targetDy = (recon.scoutTargetY ?? baseTargetY) - recon.y;
     const distToAssignedTarget = Math.sqrt((targetDx * targetDx) + (targetDy * targetDy));
+    const baseTargetDx = baseTargetX - recon.x;
+    const baseTargetDy = baseTargetY - recon.y;
+    const distToBaseTarget = Math.sqrt((baseTargetDx * baseTargetDx) + (baseTargetDy * baseTargetDy));
     const carrierDx = carrier.x - recon.x;
     const carrierDy = carrier.y - recon.y;
     const distToCarrier = Math.sqrt((carrierDx * carrierDx) + (carrierDy * carrierDy));
@@ -4049,40 +4069,52 @@ function updateGame(deltaTime) {
 
     if (recon.scoutState === 'outbound') {
       if (!Number.isFinite(recon.targetX) || !Number.isFinite(recon.targetY)) {
-        assignMoveTarget(recon, recon.scoutTargetX, recon.scoutTargetY);
+        assignMoveTarget(recon, baseTargetX, baseTargetY);
       }
-      if (distToAssignedTarget <= RECON_AIRCRAFT_TARGET_THRESHOLD) {
-        recon.x = recon.scoutTargetX;
-        recon.y = recon.scoutTargetY;
-        recon.scoutState = 'loiter';
+      if (distToBaseTarget <= RECON_AIRCRAFT_TARGET_THRESHOLD) {
+        const radialAngle = Math.atan2(recon.y - baseTargetY, recon.x - baseTargetX);
+        const tangentClockwise = normalizeAngle(radialAngle - (Math.PI / 2));
+        const tangentCounterClockwise = normalizeAngle(radialAngle + (Math.PI / 2));
+        const angleToCarrier = Math.atan2(carrier.y - recon.y, carrier.x - recon.x);
+        const clockwiseDelta = Math.abs(getAngleDelta(tangentClockwise, angleToCarrier));
+        const counterClockwiseDelta = Math.abs(getAngleDelta(tangentCounterClockwise, angleToCarrier));
+        recon.scoutState = 'orbit';
         recon.scoutLoiterUntil = now + RECON_AIRCRAFT_LOITER_MS;
-        recon.scoutNextOrbitAt = now;
-        recon.targetX = null;
-        recon.targetY = null;
-        recon.pathWaypoints = null;
+        recon.scoutOrbitAngle = radialAngle;
+        recon.scoutOrbitDirection = counterClockwiseDelta <= clockwiseDelta ? 1 : -1;
       }
       return;
     }
 
-    if (recon.scoutState === 'loiter') {
+    if (recon.scoutState === 'orbit') {
+      if (!Number.isFinite(recon.scoutOrbitAngle)) {
+        recon.scoutOrbitAngle = Math.atan2(recon.y - baseTargetY, recon.x - baseTargetX);
+      }
+
+      recon.scoutOrbitAngle = normalizeAngle(
+        recon.scoutOrbitAngle + (recon.scoutOrbitDirection || 1) * RECON_AIRCRAFT_ORBIT_ANGULAR_SPEED * deltaTime
+      );
+
+      const orbitTarget = clampToMapBounds(
+        baseTargetX + Math.cos(recon.scoutOrbitAngle) * RECON_AIRCRAFT_ORBIT_RADIUS,
+        baseTargetY + Math.sin(recon.scoutOrbitAngle) * RECON_AIRCRAFT_ORBIT_RADIUS
+      );
+      recon.scoutTargetX = orbitTarget.x;
+      recon.scoutTargetY = orbitTarget.y;
+      assignMoveTarget(recon, orbitTarget.x, orbitTarget.y);
+
       if (!Number.isFinite(recon.scoutLoiterUntil) || now >= recon.scoutLoiterUntil) {
-        recon.scoutState = 'returning';
-        recon.scoutNextOrbitAt = now;
-        assignMoveTarget(recon, carrier.x, carrier.y);
-        return;
+        const tangentAngle = normalizeAngle(
+          recon.scoutOrbitAngle + ((recon.scoutOrbitDirection || 1) > 0 ? (Math.PI / 2) : -(Math.PI / 2))
+        );
+        const angleToCarrier = Math.atan2(carrier.y - recon.y, carrier.x - recon.x);
+        const alignDelta = Math.abs(getAngleDelta(tangentAngle, angleToCarrier));
+        if (alignDelta <= RECON_AIRCRAFT_RETURN_ALIGN_THRESHOLD || now >= recon.scoutLoiterUntil + 2500) {
+          recon.scoutState = 'returning';
+          recon.scoutNextOrbitAt = now;
+          assignMoveTarget(recon, carrier.x, carrier.y);
+        }
       }
-
-      if (
-        distToAssignedTarget > RECON_AIRCRAFT_TARGET_THRESHOLD &&
-        (!Number.isFinite(recon.targetX) || !Number.isFinite(recon.targetY))
-      ) {
-        assignMoveTarget(recon, baseTargetX, baseTargetY);
-        return;
-      }
-
-      recon.targetX = null;
-      recon.targetY = null;
-      recon.pathWaypoints = null;
       return;
     }
 

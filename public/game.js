@@ -2371,6 +2371,7 @@ function updateSelectionInfo() {
         
         const player = gameState.players.get(gameState.userId);
         const buildData = [
+            { type: 'headquarters', name: '본부 건물', cost: 800, desc: '일꾼 생산' },
             { type: 'shipyard', name: '조선소', cost: 200, desc: '인구+5' },
             { type: 'power_plant', name: '발전소', cost: 150, desc: '인구+3' },
             { type: 'defense_tower', name: '방어 타워', cost: 250, desc: '' },
