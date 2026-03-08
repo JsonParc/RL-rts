@@ -22,6 +22,8 @@ const db = new Database(DB_PATH);
 const COMBAT_SPATIAL_CELL_SIZE = 700;
 const COLLISION_SPATIAL_CELL_SIZE = 400;
 const NETWORK_UPDATE_BASE_MS = 100;
+const NETWORK_VIEWPORT_MARGIN_WORLD = 2200;
+const NETWORK_VIEWPORT_STATE_STALE_MS = 5000;
 const SLBM_DAMAGE_RADIUS = 800;
 const AIRSTRIKE_DAMAGE_RADIUS = 400;
 const AIRSTRIKE_VISUAL_RADIUS = 400;
@@ -552,7 +554,7 @@ function destroyUnitFromGame(unit) {
     targetOwner.population = Math.max(0, targetOwner.population - popCost);
   }
   if (isNavalUnitType(unit.type)) {
-    roomEmit('unitDestroyed', { id: unit.id, x: unit.x, y: unit.y, type: unit.type });
+    emitUnitDestroyedEvent(unit);
   }
   gameState.units.delete(unit.id);
   return true;
@@ -610,7 +612,7 @@ function destroyCombatTargetByUnit(attackerUnit, target, targetType) {
   const attacker = gameState.players.get(attackerUnit.userId);
 
   if (targetType === 'slbm') {
-    roomEmit('slbmDestroyed', { id: target.id, x: target.currentX, y: target.currentY });
+    emitSlbmDestroyedEvent({ id: target.id, x: target.currentX, y: target.currentY, userId: target.userId });
     gameState.activeSlbms.delete(target.id);
     if (attacker) attacker.combatPower += 30;
     registerUnitKill(attackerUnit);
@@ -624,7 +626,7 @@ function destroyCombatTargetByUnit(attackerUnit, target, targetType) {
     return;
   }
 
-  roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+  emitBuildingDestroyedEvent(target);
   gameState.buildings.delete(target.id);
   if (attacker) attacker.combatPower += 20;
   checkPlayerDefeat(target.userId, attackerUnit.userId);
@@ -1304,9 +1306,10 @@ function buildClientPlayersPayload() {
   return players;
 }
 
-function buildClientUnitsPayload() {
+function buildClientUnitsPayload(filterFn = null) {
   const units = [];
   gameState.units.forEach(unit => {
+    if (filterFn && !filterFn(unit)) return;
     initializeUnitRuntimeState(unit);
     units.push({
       id: unit.id,
@@ -1362,9 +1365,10 @@ function buildClientUnitsPayload() {
   return units;
 }
 
-function buildClientBuildingsPayload() {
+function buildClientBuildingsPayload(filterFn = null) {
   const buildings = [];
   gameState.buildings.forEach(building => {
+    if (filterFn && !filterFn(building)) return;
     buildings.push({
       id: building.id,
       userId: building.userId,
@@ -1388,6 +1392,247 @@ function buildClientBuildingsPayload() {
     });
   });
   return buildings;
+}
+
+function sanitizeViewportState(data) {
+  if (!data || typeof data !== 'object') return null;
+  const centerX = Number(data.x);
+  const centerY = Number(data.y);
+  const zoom = Number(data.zoom);
+  const width = Number(data.width);
+  const height = Number(data.height);
+  if (!Number.isFinite(centerX) || !Number.isFinite(centerY) || !Number.isFinite(zoom)) return null;
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+
+  return {
+    x: centerX,
+    y: centerY,
+    zoom: Math.max(0.3, Math.min(2, zoom)),
+    width: Math.max(320, Math.min(4096, width)),
+    height: Math.max(240, Math.min(2160, height)),
+    updatedAt: Date.now()
+  };
+}
+
+function getSocketInterestBounds(socket) {
+  if (!socket || !socket.viewportState || !gameState || !gameState.map) return null;
+  if ((Date.now() - socket.viewportState.updatedAt) > NETWORK_VIEWPORT_STATE_STALE_MS) return null;
+
+  const { x, y, zoom, width, height } = socket.viewportState;
+  const halfWorldWidth = (width / zoom) / 2 + NETWORK_VIEWPORT_MARGIN_WORLD;
+  const halfWorldHeight = (height / zoom) / 2 + NETWORK_VIEWPORT_MARGIN_WORLD;
+
+  return {
+    left: x - halfWorldWidth,
+    right: x + halfWorldWidth,
+    top: y - halfWorldHeight,
+    bottom: y + halfWorldHeight
+  };
+}
+
+function isEntityRelevantToSocket(socket, entity, bounds) {
+  if (!entity || !socket) return false;
+  if (entity.userId === socket.userId) return true;
+  if (!bounds) return true;
+  return entity.x >= bounds.left
+    && entity.x <= bounds.right
+    && entity.y >= bounds.top
+    && entity.y <= bounds.bottom;
+}
+
+function buildClientStatePayloadForSocket(socket, sharedPlayersPayload = null) {
+  const bounds = getSocketInterestBounds(socket);
+  return {
+    players: sharedPlayersPayload || buildClientPlayersPayload(),
+    units: buildClientUnitsPayload(unit => isEntityRelevantToSocket(socket, unit, bounds)),
+    buildings: buildClientBuildingsPayload(building => isEntityRelevantToSocket(socket, building, bounds))
+  };
+}
+
+function normalizeScopedUserIds(userIds) {
+  if (userIds instanceof Set) return userIds;
+  if (!Array.isArray(userIds)) return null;
+  const normalized = userIds.filter(userId => userId != null);
+  return normalized.length > 0 ? new Set(normalized) : null;
+}
+
+function createPointBounds(x, y, padding = 0) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return {
+    left: x - padding,
+    right: x + padding,
+    top: y - padding,
+    bottom: y + padding
+  };
+}
+
+function createSegmentBounds(x1, y1, x2, y2, padding = 0) {
+  if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(x2) || !Number.isFinite(y2)) return null;
+  return {
+    left: Math.min(x1, x2) - padding,
+    right: Math.max(x1, x2) + padding,
+    top: Math.min(y1, y2) - padding,
+    bottom: Math.max(y1, y2) + padding
+  };
+}
+
+function doBoundsOverlap(a, b) {
+  if (!a || !b) return true;
+  return a.left <= b.right
+    && a.right >= b.left
+    && a.top <= b.bottom
+    && a.bottom >= b.top;
+}
+
+function emitScopedRoomEvent(event, data, options = {}) {
+  const roomId = options.roomId || currentRoomId;
+  const bounds = options.bounds || null;
+  const userIds = normalizeScopedUserIds(options.userIds);
+  const volatile = !!options.volatile;
+
+  if (!roomId) {
+    io.emit(event, data);
+    return;
+  }
+
+  const socketsInRoom = getConnectedSocketsForRoom(roomId);
+  socketsInRoom.forEach(socket => {
+    if (!socket) return;
+    if (userIds && userIds.has(socket.userId)) {
+      (volatile ? socket.volatile : socket).emit(event, data);
+      return;
+    }
+    if (!bounds) {
+      (volatile ? socket.volatile : socket).emit(event, data);
+      return;
+    }
+    const interestBounds = getSocketInterestBounds(socket);
+    if (!interestBounds || doBoundsOverlap(interestBounds, bounds)) {
+      (volatile ? socket.volatile : socket).emit(event, data);
+    }
+  });
+}
+
+function emitUnitCreatedEvent(unit) {
+  if (!unit) return;
+  emitScopedRoomEvent('unitCreated', unit, {
+    bounds: createPointBounds(unit.x, unit.y, 900),
+    userIds: [unit.userId]
+  });
+}
+
+function emitBuildingCreatedEvent(building) {
+  if (!building) return;
+  emitScopedRoomEvent('buildingCreated', building, {
+    bounds: createPointBounds(building.x, building.y, 1200),
+    userIds: [building.userId]
+  });
+}
+
+function emitUnitDestroyedEvent(unit) {
+  if (!unit) return;
+  emitScopedRoomEvent('unitDestroyed', {
+    id: unit.id,
+    x: unit.x,
+    y: unit.y,
+    type: unit.type,
+    userId: unit.userId
+  }, {
+    bounds: createPointBounds(unit.x, unit.y, 1100),
+    userIds: [unit.userId]
+  });
+}
+
+function emitBuildingDestroyedEvent(building) {
+  if (!building) return;
+  emitScopedRoomEvent('buildingDestroyed', {
+    id: building.id,
+    x: building.x,
+    y: building.y,
+    type: building.type,
+    userId: building.userId
+  }, {
+    bounds: createPointBounds(building.x, building.y, 1400),
+    userIds: [building.userId]
+  });
+}
+
+function emitAttackProjectileFiredEvent(payload, extraUserIds = []) {
+  if (!payload) return;
+  emitScopedRoomEvent('attackProjectileFired', payload, {
+    bounds: createSegmentBounds(payload.fromX, payload.fromY, payload.targetX, payload.targetY, 900),
+    userIds: extraUserIds,
+    volatile: true
+  });
+}
+
+function emitSlbmFiredEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('slbmFired', payload, {
+    bounds: createSegmentBounds(payload.fromX, payload.fromY, payload.targetX, payload.targetY, 1400),
+    userIds: [payload.userId],
+    volatile: true
+  });
+}
+
+function emitSlbmImpactEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('slbmImpact', payload, {
+    bounds: createPointBounds(payload.x, payload.y, SLBM_DAMAGE_RADIUS + 1200),
+    userIds: [payload.userId]
+  });
+}
+
+function emitSlbmDestroyedEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('slbmDestroyed', payload, {
+    bounds: createPointBounds(payload.x, payload.y, 1200),
+    userIds: [payload.userId],
+    volatile: true
+  });
+}
+
+function emitSlbmDamagedEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('slbmDamaged', payload, {
+    bounds: createPointBounds(payload.x, payload.y, 1200),
+    userIds: [payload.userId],
+    volatile: true
+  });
+}
+
+function emitSearchActivatedEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('searchActivated', payload, {
+    bounds: createPointBounds(payload.x, payload.y, (payload.radius || 0) + 600),
+    userIds: [payload.userId],
+    volatile: true
+  });
+}
+
+function emitAirstrikeLaunchedEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('airstrikeLaunched', payload, {
+    bounds: createSegmentBounds(payload.fromX, payload.fromY, payload.exitX ?? payload.targetX, payload.exitY ?? payload.targetY, AIRSTRIKE_VISUAL_RADIUS + 1200),
+    userIds: [payload.userId]
+  });
+}
+
+function emitAirstrikePassEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('airstrikePass', payload, {
+    bounds: createPointBounds(payload.targetX, payload.targetY, (payload.radius || AIRSTRIKE_VISUAL_RADIUS) + 1200),
+    userIds: [payload.userId],
+    volatile: true
+  });
+}
+
+function emitAirstrikeCancelledEvent(payload) {
+  if (!payload) return;
+  emitScopedRoomEvent('airstrikeCancelled', payload, {
+    bounds: createPointBounds(payload.targetX, payload.targetY, AIRSTRIKE_VISUAL_RADIUS + 1200),
+    userIds: [payload.userId]
+  });
 }
 
 function buildClientRedZonePayload() {
@@ -2789,7 +3034,7 @@ function emitAttackProjectile(attacker, target, options = {}) {
   const maxFlightTime = attacker.type === 'missile_launcher' ? 3200 : 2200;
   const flightTimeMs = Math.max(minFlightTime, Math.min(maxFlightTime, Math.round((distance / projectileSpeed) * 1000)));
 
-  roomEmit('attackProjectileFired', {
+  emitAttackProjectileFiredEvent({
     id: projectileId,
     fromX,
     fromY,
@@ -2803,7 +3048,7 @@ function emitAttackProjectile(attacker, target, options = {}) {
     turretIndices,
     startTime,
     flightTime: flightTimeMs
-  });
+  }, [attacker.userId, target.userId]);
 }
 
 function findNonOverlappingPosition(x, y, size) {
@@ -3393,6 +3638,7 @@ io.use((socket, next) => {
 // Socket.io connection handling
 io.on('connection', (socket) => {
   const wasRoomIdle = !roomHasHumanPlayers(socket.roomId);
+  socket.viewportState = null;
 
   // Join the selected room
   socket.join(socket.roomId);
@@ -3442,12 +3688,13 @@ io.on('connection', (socket) => {
     
     // Send initial game state
     const player = gameState.players.get(socket.userId);
+    const initialState = buildClientStatePayloadForSocket(socket);
     const initData = {
       userId: socket.userId,
       map: buildClientMapPayload(),
-      players: buildClientPlayersPayload(),
-      units: buildClientUnitsPayload(),
-      buildings: buildClientBuildingsPayload(),
+      players: initialState.players,
+      units: initialState.units,
+      buildings: initialState.buildings,
       missiles: player ? (player.missiles || 0) : 0,
       redZones: buildClientRedZonePayload()
     };
@@ -3465,6 +3712,14 @@ io.on('connection', (socket) => {
   }
   
   // Handle unit commands
+  socket.on('viewportUpdate', (data) => {
+    switchRoom(socket.roomId);
+    const viewportState = sanitizeViewportState(data);
+    if (viewportState) {
+      socket.viewportState = viewportState;
+    }
+  });
+
   socket.on('moveUnits', (data) => {
     switchRoom(socket.roomId);
     const { unitIds, targetX, targetY } = data;
@@ -3581,7 +3836,7 @@ io.on('connection', (socket) => {
       };
       gameState.activeSlbms.set(slbmId, slbm);
       
-      roomEmit('slbmFired', {
+      emitSlbmFiredEvent({
         id: slbmId,
         fromX: unit.x,
         fromY: unit.y,
@@ -3760,7 +4015,7 @@ io.on('connection', (socket) => {
     assignMoveTarget(reconAircraft, assignedTarget.x, assignedTarget.y);
     gameState.units.set(reconId, reconAircraft);
     carrier.reconAircraftDeployed.push(reconId);
-    roomEmit('unitCreated', reconAircraft);
+    emitUnitCreatedEvent(reconAircraft);
   }
 
   socket.on('launchReconAircraft', (data) => {
@@ -4013,7 +4268,7 @@ io.on('connection', (socket) => {
           continue;
         }
         gameState.units.set(createdUnit.id, createdUnit);
-        roomEmit('unitCreated', createdUnit);
+        emitUnitCreatedEvent(createdUnit);
       }
     });
   });
@@ -4053,7 +4308,7 @@ io.on('connection', (socket) => {
           }
           revealFogCircleForPlayer(gameState.fogOfWar.get(unit.userId), unit.x, unit.y, vr, now);
         }
-        roomEmit('searchActivated', { unitId: unit.id, x: unit.x, y: unit.y, radius: vr });
+        emitSearchActivatedEvent({ unitId: unit.id, x: unit.x, y: unit.y, radius: vr, userId: unit.userId });
       }
     });
   });
@@ -4100,7 +4355,7 @@ io.on('connection', (socket) => {
       kills: 0
     };
     gameState.units.set(mineId, mine);
-    roomEmit('unitCreated', mine);
+    emitUnitCreatedEvent(mine);
   });
 
   // Carrier: launch airstrike (requires 10 aircraft, consumes all, 20s cooldown after refill)
@@ -4169,7 +4424,7 @@ io.on('connection', (socket) => {
         explosionsPerPass: 30
       };
       gameState.activeAirstrikes.set(id, strike);
-      roomEmit('airstrikeLaunched', {
+      emitAirstrikeLaunchedEvent({
         id, fromX: entryX, fromY: entryY,
         exitX, exitY,
         targetX: clamped.x, targetY: clamped.y,
@@ -4577,7 +4832,7 @@ function buildBuilding(userId, type, x, y) {
       slbmCount: 0
     });
     
-    roomEmit('buildingCreated', gameState.buildings.get(buildingId));
+    emitBuildingCreatedEvent(gameState.buildings.get(buildingId));
   }
 }
 
@@ -4624,11 +4879,11 @@ setInterval(() => {
     else if (humanCount >= 2) stride = Math.max(stride, 2);
 
     if (updateCounter % stride !== 0) return;
-
-    io.to(roomId).volatile.emit('gameUpdate', {
-      players: buildClientPlayersPayload(),
-      units: buildClientUnitsPayload(),
-      buildings: buildClientBuildingsPayload()
+    const socketsInRoom = getConnectedSocketsForRoom(roomId);
+    if (socketsInRoom.length === 0) return;
+    const playersPayload = buildClientPlayersPayload();
+    socketsInRoom.forEach(socket => {
+      socket.volatile.emit('gameUpdate', buildClientStatePayloadForSocket(socket, playersPayload));
     });
   });
 }, NETWORK_UPDATE_BASE_MS);
@@ -4717,7 +4972,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
     target.lastDamageTime = now;
     if (target.hp <= 0) {
       if (target.type === 'mine') {
-        roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+        emitUnitDestroyedEvent(target);
         gameState.units.delete(target.id);
       } else {
         destroyUnitFromGame(target);
@@ -4735,7 +4990,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
     target.hp = Math.max(0, target.hp - 800);
     target.lastDamageTime = now;
     if (target.hp <= 0) {
-      roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+      emitBuildingDestroyedEvent(target);
       if (firingPlayer) firingPlayer.combatPower += 20;
       gameState.buildings.delete(target.id);
       checkPlayerDefeat(target.userId, slbm.userId);
@@ -4746,14 +5001,14 @@ function applySlbmDamage(slbm, now = Date.now()) {
 function resolveActiveSlbmImpacts(now) {
   gameState.activeSlbms.forEach((slbm, slbmId) => {
     if (slbm.hp <= 0) {
-      roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
+      emitSlbmDestroyedEvent({ id: slbm.id, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
       gameState.activeSlbms.delete(slbmId);
       return;
     }
     if (!slbm.hasReachedTarget) return;
 
     applySlbmDamage(slbm, now);
-    roomEmit('slbmImpact', { id: slbmId, x: slbm.targetX, y: slbm.targetY });
+    emitSlbmImpactEvent({ id: slbmId, x: slbm.targetX, y: slbm.targetY, userId: slbm.userId });
 
     if (ENABLE_SERVER_FOG_SNAPSHOTS) {
       const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
@@ -5262,7 +5517,7 @@ function updateGame(deltaTime) {
         }
 
         gameState.units.set(unitId, createdUnit);
-        roomEmit('unitCreated', createdUnit);
+        emitUnitCreatedEvent(createdUnit);
         
         // Frigate spawns 2 units at once
         if (unitType === 'frigate') {
@@ -5270,7 +5525,7 @@ function updateGame(deltaTime) {
           const unitId2 = Date.now() * 1000 + Math.floor(Math.random() * 1000) + 1;
           const createdUnit2 = initializeUnitRuntimeState({ ...createdUnit, id: unitId2, x: spawnPoint2.x, y: spawnPoint2.y });
           gameState.units.set(unitId2, createdUnit2);
-          roomEmit('unitCreated', createdUnit2);
+          emitUnitCreatedEvent(createdUnit2);
         }
         
         building.producing = null;
@@ -5344,13 +5599,13 @@ function updateGame(deltaTime) {
           targetOwner.population = Math.max(0, targetOwner.population - popCost);
         }
         if (isNavalUnitType(target.type)) {
-          roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+          emitUnitDestroyedEvent(target);
         }
         const mineOwner = gameState.players.get(mine.userId);
         if (mineOwner) mineOwner.combatPower += 10;
         gameState.units.delete(targetId);
         // Mine also consumed
-        roomEmit('unitDestroyed', { id: mine.id, x: mine.x, y: mine.y, type: 'mine' });
+        emitUnitDestroyedEvent(mine);
         mine.hp = 0;
         gameState.units.delete(mineId);
       }
@@ -5382,7 +5637,7 @@ function updateGame(deltaTime) {
           target.lastDamageTime = now;
           if (target.hp <= 0) {
             if (target.type === 'mine') {
-              roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+              emitUnitDestroyedEvent(target);
               gameState.units.delete(target.id);
             } else {
               destroyUnitFromGame(target);
@@ -5400,7 +5655,7 @@ function updateGame(deltaTime) {
           target.hp -= strike.damagePerPass;
           target.lastDamageTime = now;
           if (target.hp <= 0) {
-            roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+            emitBuildingDestroyedEvent(target);
             gameState.buildings.delete(target.id);
             checkPlayerDefeat(target.userId, strike.userId);
           }
@@ -5408,13 +5663,14 @@ function updateGame(deltaTime) {
       });
       strike.damageApplied = true;
       
-      roomEmit('airstrikePass', {
+      emitAirstrikePassEvent({
         id: strikeId,
         passNum: strike.passNumber || 1,
         targetX: strike.targetX,
         targetY: strike.targetY,
         radius: strike.visualRadius,
-        explosionsPerPass: strike.explosionsPerPass
+        explosionsPerPass: strike.explosionsPerPass,
+        userId: strike.userId
       });
     }
     
@@ -5594,7 +5850,7 @@ function updateGame(deltaTime) {
           gameState.units.set(acId, ac);
           unit.aircraftDeployed.push(acId);
           unit.lastAircraftDeploy = now;
-          roomEmit('unitCreated', ac);
+          emitUnitCreatedEvent(ac);
         }
       }
       unit.deployAircraft = false;
@@ -5611,7 +5867,7 @@ function updateGame(deltaTime) {
     const carrier = gameState.units.get(ac.carrierId);
     if (!carrier) {
       // Carrier destroyed - aircraft is also destroyed
-      roomEmit('unitDestroyed', { id: ac.id, x: ac.x, y: ac.y, type: 'aircraft' });
+      emitUnitDestroyedEvent(ac);
       gameState.units.delete(ac.id);
       return;
     }
@@ -5842,7 +6098,7 @@ function updateGame(deltaTime) {
             }
             // Emit death effect for ships
             if (isNavalUnitType(nearestTarget.type)) {
-              roomEmit('unitDestroyed', { id: nearestTarget.id, x: nearestTarget.x, y: nearestTarget.y, type: nearestTarget.type });
+              emitUnitDestroyedEvent(nearestTarget);
             }
             gameState.units.delete(nearestTarget.id);
             building.attackTargetId = null;
@@ -5874,9 +6130,9 @@ function updateGame(deltaTime) {
           building.lastSlbmAttackTime = now;
           emitAttackProjectile(building, { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
           slbm.hp = Math.max(0, slbm.hp - towerDamage);
-          roomEmit('slbmDamaged', { id: slbm.id, hp: slbm.hp, maxHp: slbm.maxHp });
+          emitSlbmDamagedEvent({ id: slbm.id, hp: slbm.hp, maxHp: slbm.maxHp, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
           if (slbm.hp <= 0) {
-            roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
+            emitSlbmDestroyedEvent({ id: slbm.id, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
             gameState.activeSlbms.delete(slbm.id);
           }
         }
@@ -6241,7 +6497,7 @@ function updateGame(deltaTime) {
           
           // Broadcast SLBM HP update to clients
           if (unit.attackTargetType === 'slbm') {
-            roomEmit('slbmDamaged', { id: target.id, hp: target.hp, maxHp: target.maxHp });
+            emitSlbmDamagedEvent({ id: target.id, hp: target.hp, maxHp: target.maxHp, x: target.currentX, y: target.currentY, userId: target.userId });
           }
           
           // Consume aimed shot after firing and start 16s cooldown
@@ -6487,10 +6743,11 @@ function clearActiveWeaponsForUser(userId) {
   slbmIdsToDelete.forEach(slbmId => {
     const slbm = gameState.activeSlbms.get(slbmId);
     gameState.activeSlbms.delete(slbmId);
-    roomEmit('slbmDestroyed', {
+    emitSlbmDestroyedEvent({
       id: slbmId,
       x: slbm ? slbm.currentX : null,
-      y: slbm ? slbm.currentY : null
+      y: slbm ? slbm.currentY : null,
+      userId: slbm ? slbm.userId : null
     });
   });
 
@@ -6505,8 +6762,14 @@ function clearActiveWeaponsForUser(userId) {
     }
   });
   strikeIdsToDelete.forEach(strikeId => {
+    const strike = gameState.activeAirstrikes.get(strikeId);
     gameState.activeAirstrikes.delete(strikeId);
-    roomEmit('airstrikeCancelled', { id: strikeId });
+    emitAirstrikeCancelledEvent({
+      id: strikeId,
+      targetX: strike ? strike.targetX : null,
+      targetY: strike ? strike.targetY : null,
+      userId: strike ? strike.userId : null
+    });
   });
 }
 
@@ -6808,7 +7071,7 @@ function updateAI() {
         };
         gameState.activeSlbms.set(slbmId, slbm);
         
-        roomEmit('slbmFired', {
+        emitSlbmFiredEvent({
           id: slbmId,
           fromX: sub.x, fromY: sub.y,
           targetX: clampedTarget.x, targetY: clampedTarget.y,
@@ -7635,7 +7898,7 @@ function applyRedZoneBombardment(zone, now) {
       targetOwner.population = Math.max(0, targetOwner.population - popCost);
     }
     if (isNavalUnitType(target.type) || target.type === 'mine') {
-      roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+      emitUnitDestroyedEvent(target);
     }
     gameState.units.delete(target.id);
   });
@@ -7651,7 +7914,7 @@ function applyRedZoneBombardment(zone, now) {
   });
 
   destroyedBuildings.forEach(target => {
-    roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+    emitBuildingDestroyedEvent(target);
     gameState.buildings.delete(target.id);
     ownersToCheck.add(target.userId);
   });
@@ -7843,4 +8106,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`${APP_NAME} server running on port ${PORT}`);
 });
-

@@ -64,13 +64,18 @@ let interpolationDurationMs = 100;
 let lastServerUpdateTime = 0;
 let serverTickAvgMs = 100;
 let lastMinimapInvalidateTime = 0;
+let lastViewportSyncAt = 0;
+let lastViewportSyncState = null;
 let isPointerInCanvas = false;
 let attackTarget = null; // { id, type, name, x, y } - currently designated attack target for HUD display
 let commandGroup = new Set(); // Units that have been given commands and should NOT be deselected by panel clicks
 const APP_NAME = 'MW Craft';
 const CAMERA_EDGE_PAN_SPEED = 3800;
 const FOG_UPDATE_INTERVAL = 650;
+const FOG_VISIBLE_WINDOW_MS = 1000;
+const FOG_BASE_FILL_STYLE = 'rgba(0,0,0,0.5)';
 const MINIMAP_UPDATE_INTERVAL = 500;
+const VIEWPORT_SYNC_INTERVAL_MS = 150;
 const SECRET_CLICK_STREAK_RESET_MS = 900;
 const SECRET_RANKING_CLICK_TARGET = 10;
 const SECRET_MINIMAP_CLICK_TARGET = 22;
@@ -95,12 +100,6 @@ let roomAnnihilationLogoutTimeoutId = null;
 let fogLayerCanvas = null;
 let fogLayerCtx   = null;
 let fogLayerGridSize = 0;
-
-// Pre-computed alpha strings for 20 discrete fog buckets (0 ??0.5 in 0.025 steps).
-// Reusing these strings avoids per-frame template-string allocations.
-const _FOG_ALPHA_STRINGS = Object.freeze(
-    Array.from({ length: 20 }, (_, i) => `rgba(0,0,0,${(i / 19 * 0.5).toFixed(3)})`)
-);
 
 // Reusable array for own-units iteration inside updateFogOfWar (avoids new [] each tick).
 const _ownUnitsTemp = [];
@@ -1244,6 +1243,22 @@ let fogTexture = null;
 let mapTexture = null;
 let landMaskTexture = null;
 
+function attachUnitSpriteEntry(entry) {
+    if (!entry || !unitLayer || entry.container.parent === unitLayer) return;
+    unitLayer.addChild(entry.container);
+}
+
+function detachUnitSpriteEntry(entry) {
+    if (!entry || !entry.container.parent) return;
+    entry.container.parent.removeChild(entry.container);
+}
+
+function destroyUnitSpriteEntry(entry) {
+    if (!entry) return;
+    detachUnitSpriteEntry(entry);
+    entry.container.destroy({ children: true });
+}
+
 function getOrCreateTexture(image) {
     if (!image || !image.complete || !image.naturalWidth) return null;
     let tex = texCache.get(image.src);
@@ -1382,10 +1397,43 @@ function resizeCanvas() {
     minimap.width = 240;
     minimap.height = 240;
     clampCameraToMapBounds();
+    maybeSyncViewportState(true);
 }
 
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
+
+function buildViewportSyncPayload() {
+    return {
+        x: gameState.camera.x,
+        y: gameState.camera.y,
+        zoom: gameState.camera.zoom,
+        width: canvas.width,
+        height: canvas.height
+    };
+}
+
+function hasViewportSyncChanged(prev, next) {
+    if (!prev) return true;
+    return Math.abs(prev.x - next.x) > 20
+        || Math.abs(prev.y - next.y) > 20
+        || Math.abs(prev.zoom - next.zoom) > 0.02
+        || prev.width !== next.width
+        || prev.height !== next.height;
+}
+
+function maybeSyncViewportState(force = false) {
+    if (!socket || !socket.connected || !gameState.map) return;
+
+    const now = Date.now();
+    const payload = buildViewportSyncPayload();
+    if (!force && !hasViewportSyncChanged(lastViewportSyncState, payload)) return;
+    if (!force && (now - lastViewportSyncAt) < VIEWPORT_SYNC_INTERVAL_MS) return;
+
+    socket.emit('viewportUpdate', payload);
+    lastViewportSyncAt = now;
+    lastViewportSyncState = payload;
+}
 
 function getCanvasPoint(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
@@ -3706,54 +3754,34 @@ function ensureFogLayerCanvas(gridSize) {
     fogLayerCanvas.height = gridSize;
     fogLayerCtx   = fogLayerCanvas.getContext('2d');
     fogLayerGridSize = gridSize;
-    // Fill as fully unexplored on creation so the very first frame looks correct.
-    fogLayerCtx.fillStyle = 'rgba(0,0,0,0.85)';
+    fogLayerCtx.fillStyle = FOG_BASE_FILL_STYLE;
     fogLayerCtx.fillRect(0, 0, gridSize, gridSize);
 }
 
 /**
  * Redraws the entire fogLayerCanvas to reflect the current fog state.
  * Called once per updateFogOfWar() tick (??.5 Hz), NOT every rAF frame.
- * Algorithm (visual result = identical to original renderFogOfWar):
- *   1. Fill everything with 0.85-alpha black  (unexplored)
- *   2. destination-out erase every explored cell   (make transparent)
- *   3. source-over draw stale-explored cells with 0??.5 alpha gradual overlay
+ * Algorithm:
+ *   1. Fill everything with the default dim fog
+ *   2. destination-out erase only the cells inside the current vision snapshot
  */
 function refreshFogLayer(gridSize, now) {
     if (!fogLayerCtx) return;
     const fctx = fogLayerCtx;
 
-    // Step 1 ??paint whole canvas as unexplored (opaque fog)
     fctx.globalCompositeOperation = 'source-over';
-    fctx.fillStyle = 'rgba(0,0,0,0.85)';
+    fctx.fillStyle = FOG_BASE_FILL_STYLE;
     fctx.fillRect(0, 0, gridSize, gridSize);
 
-    // Step 2 ??punch out all explored cells so they're transparent
     fctx.globalCompositeOperation = 'destination-out';
     fctx.fillStyle = '#000';
     gameState.fogOfWar.forEach((fogInfo, key) => {
-        if (!fogInfo.explored) return;
+        if (!fogInfo.explored || now - fogInfo.lastSeen >= FOG_VISIBLE_WINDOW_MS) return;
         const x = key % gridSize;
         const y = (key / gridSize) | 0;
         fctx.fillRect(x, y, 1, 1);
     });
 
-    // Step 3 ??re-add semi-transparent overlay for stale (out-of-vision) cells
-    fctx.globalCompositeOperation = 'source-over';
-    gameState.fogOfWar.forEach((fogInfo, key) => {
-        if (!fogInfo.explored) return;
-        const timeSince = now - fogInfo.lastSeen;
-        if (timeSince <= 500) return; // still visible ??leave transparent
-        const alpha  = Math.min(0.5, timeSince / 10000 * 0.5);
-        // Snap to one of 20 pre-computed strings to avoid per-cell string allocation
-        const bucket = Math.min(19, (alpha / 0.5 * 19 + 0.5) | 0);
-        fctx.fillStyle = _FOG_ALPHA_STRINGS[bucket];
-        const x = key % gridSize;
-        const y = (key / gridSize) | 0;
-        fctx.fillRect(x, y, 1, 1);
-    });
-
-    // Restore default composite mode
     fctx.globalCompositeOperation = 'source-over';
 }
 
@@ -3797,9 +3825,8 @@ function isPositionVisible(worldX, worldY) {
     const fogInfo = gameState.fogOfWar.get(key);
     if (!fogInfo || !fogInfo.explored) return false;
     
-    // Currently visible if seen within the last 1.5 seconds
     const timeSince = Date.now() - fogInfo.lastSeen;
-    return timeSince < 1500;
+    return timeSince < FOG_VISIBLE_WINDOW_MS;
 }
 
 function isLandAtWorldPosition(worldX, worldY) {
@@ -4128,33 +4155,31 @@ function syncUnitLayer() {
         let entry = unitSpriteMap.get(unitId);
         if (!entry || entry.unitType !== unit.type) {
             // Remove old sprite if type changed
-            if (entry) { unitLayer.removeChild(entry.container); entry.container.destroy({ children: true }); }
+            if (entry) destroyUnitSpriteEntry(entry);
             entry = createUnitSpriteEntry(unit, size);
             unitSpriteMap.set(unitId, entry);
-            unitLayer.addChild(entry.container);
+            attachUnitSpriteEntry(entry);
         }
 
         // If entry was created with fallback shape but image is now loaded, recreate
         if (!entry.mainSprite && unit.type !== 'worker' && unit.type !== 'battleship') {
             const img = getUnitImage(unit);
             if (img) {
-                unitLayer.removeChild(entry.container);
-                entry.container.destroy({ children: true });
+                destroyUnitSpriteEntry(entry);
                 entry = createUnitSpriteEntry(unit, size);
                 unitSpriteMap.set(unitId, entry);
-                unitLayer.addChild(entry.container);
+                attachUnitSpriteEntry(entry);
             }
         }
 
         if (unit.type === 'battleship' && entry.gfxShape) {
             const bodyImg = getBattleshipBodyImage(unit);
             if (bodyImg) {
-                unitLayer.removeChild(entry.container);
-                entry.container.destroy({ children: true });
+                destroyUnitSpriteEntry(entry);
                 entry = createUnitSpriteEntry(unit, size);
                 entry.battleshipAegisMode = !!unit.battleshipAegisMode;
                 unitSpriteMap.set(unitId, entry);
-                unitLayer.addChild(entry.container);
+                attachUnitSpriteEntry(entry);
             }
         }
 
@@ -4162,35 +4187,33 @@ function syncUnitLayer() {
             const desiredBodyImg = getBattleshipBodyImage(unit);
             const desiredBodySrc = desiredBodyImg ? desiredBodyImg.src : null;
             if (desiredBodySrc && entry.battleshipBodySrc !== desiredBodySrc) {
-                unitLayer.removeChild(entry.container);
-                entry.container.destroy({ children: true });
+                destroyUnitSpriteEntry(entry);
                 entry = createUnitSpriteEntry(unit, size);
                 entry.battleshipAegisMode = !!unit.battleshipAegisMode;
                 unitSpriteMap.set(unitId, entry);
-                unitLayer.addChild(entry.container);
+                attachUnitSpriteEntry(entry);
             }
         }
         
         // Cruiser aegis mode sprite swap: recreate when aegisMode toggles
         if (unit.type === 'cruiser' && entry.aegisMode !== !!unit.aegisMode) {
-            unitLayer.removeChild(entry.container);
-            entry.container.destroy({ children: true });
+            destroyUnitSpriteEntry(entry);
             entry = createUnitSpriteEntry(unit, size);
             entry.aegisMode = !!unit.aegisMode;
             unitSpriteMap.set(unitId, entry);
-            unitLayer.addChild(entry.container);
+            attachUnitSpriteEntry(entry);
         }
 
         if (unit.type === 'battleship' && entry.battleshipAegisMode !== !!unit.battleshipAegisMode) {
-            unitLayer.removeChild(entry.container);
-            entry.container.destroy({ children: true });
+            destroyUnitSpriteEntry(entry);
             entry = createUnitSpriteEntry(unit, size);
             entry.battleshipAegisMode = !!unit.battleshipAegisMode;
             unitSpriteMap.set(unitId, entry);
-            unitLayer.addChild(entry.container);
+            attachUnitSpriteEntry(entry);
         }
 
         syncImageUnitSprite(entry, unit, size);
+        attachUnitSpriteEntry(entry);
 
         // Update position and rotation
         entry.container.position.set(posX, posY);
@@ -4243,11 +4266,12 @@ function syncUnitLayer() {
 
     // Remove sprites for units that no longer exist
     unitSpriteMap.forEach((entry, id) => {
-        if (!activeIds.has(id)) {
-            entry.container.visible = false;
-            unitLayer.removeChild(entry.container);
-            entry.container.destroy({ children: true });
+        if (!gameState.units.has(id)) {
+            destroyUnitSpriteEntry(entry);
             unitSpriteMap.delete(id);
+        } else if (!activeIds.has(id)) {
+            entry.container.visible = false;
+            detachUnitSpriteEntry(entry);
         }
     });
 }
@@ -5016,15 +5040,9 @@ function renderMinimap() {
         } else if (revealAll) {
             minimapCtx.fillStyle = '#ff0000';
             minimapCtx.fillRect(displayX * scaleX - 1, displayY * scaleY - 1, 4, 4);
-        } else if (gridSize > 0 && fogCellSize > 0) {
-            const fogX = Math.floor(unit.x / fogCellSize);
-            const fogY = Math.floor(unit.y / fogCellSize);
-            const gridKey = getFogKey(fogX, fogY, gridSize);
-            const fogData = gameState.fogOfWar.get(gridKey);
-            if (fogData && fogData.explored && now - fogData.lastSeen < 5000) {
-                minimapCtx.fillStyle = '#ff0000';
-                minimapCtx.fillRect(displayX * scaleX - 1, displayY * scaleY - 1, 4, 4);
-            }
+        } else if (gridSize > 0 && fogCellSize > 0 && isPositionVisible(unit.x, unit.y)) {
+            minimapCtx.fillStyle = '#ff0000';
+            minimapCtx.fillRect(displayX * scaleX - 1, displayY * scaleY - 1, 4, 4);
         }
     });
     
@@ -5039,15 +5057,9 @@ function renderMinimap() {
         } else if (revealAll) {
             minimapCtx.fillStyle = '#ff0000';
             minimapCtx.fillRect(building.x * scaleX - 2, building.y * scaleY - 2, 5, 5);
-        } else if (gridSize > 0 && fogCellSize > 0) {
-            const fogX = Math.floor(building.x / fogCellSize);
-            const fogY = Math.floor(building.y / fogCellSize);
-            const gridKey = getFogKey(fogX, fogY, gridSize);
-            const fogData = gameState.fogOfWar.get(gridKey);
-            if (fogData && fogData.explored && now - fogData.lastSeen < 5000) {
-                minimapCtx.fillStyle = '#ff0000';
-                minimapCtx.fillRect(building.x * scaleX - 2, building.y * scaleY - 2, 5, 5);
-            }
+        } else if (gridSize > 0 && fogCellSize > 0 && isPositionVisible(building.x, building.y)) {
+            minimapCtx.fillStyle = '#ff0000';
+            minimapCtx.fillRect(building.x * scaleX - 2, building.y * scaleY - 2, 5, 5);
         }
     });
     
@@ -5374,6 +5386,7 @@ function update() {
             lastFrameTime = now - (elapsed % FRAME_INTERVAL);
             updateUnitInterpolation();
             updateCamera(elapsed);
+            maybeSyncViewportState();
             render();
         }
         
@@ -5887,6 +5900,8 @@ function logout() {
     resetSecretClickStreak(workerPortraitSecretClicks);
     clearTemporaryFullMapReveal();
     lastSeenRedZoneActivationAt = 0;
+    lastViewportSyncAt = 0;
+    lastViewportSyncState = null;
     slbmMissiles = [];
     stopAllManagedBattleSounds();
     attackProjectiles = [];
@@ -5952,6 +5967,8 @@ function connectToGame() {
     console.log('connectToGame called');
     stopUpdate();
     stopBackgroundLoops();
+    lastViewportSyncAt = 0;
+    lastViewportSyncState = null;
     
     // Disconnect existing socket if any
     if (socket) {
@@ -5998,6 +6015,8 @@ function connectToGame() {
     
     socket.on('disconnect', (reason) => {
         console.log('Disconnected:', reason);
+        lastViewportSyncAt = 0;
+        lastViewportSyncState = null;
         stopAllManagedBattleSounds();
         if (reason === 'io server disconnect' || reason === 'io client disconnect') {
             // Don't auto-reconnect
@@ -6066,7 +6085,8 @@ function connectToGame() {
             } else {
                 console.warn('Player data not found!');
             }
-            
+            maybeSyncViewportState(true);
+             
             console.log('Starting game update loop...');
             updateHUD();
             updateFogOfWar(true); // Initial fog of war update
@@ -6753,6 +6773,12 @@ function updateFogOfWar(force = false) {
         const gridX = Math.floor(strike.targetX / cellSize);
         const gridY = Math.floor(strike.targetY / cellSize);
         revealFogArea(gridX, gridY, gridSize, airstrikeOffsets, now);
+    });
+
+    gameState.fogOfWar.forEach((fogInfo, key) => {
+        if (!fogInfo.explored || now - fogInfo.lastSeen >= FOG_VISIBLE_WINDOW_MS) {
+            gameState.fogOfWar.delete(key);
+        }
     });
 
     // Rebuild the offscreen fog canvas to reflect all reveals made in this tick.
