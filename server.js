@@ -101,6 +101,7 @@ const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
 const FRIGATE_ENGINE_OVERDRIVE_TICK_MS = 1000;
 const NAVAL_COLLISION_WAKE_MS = 700;
 const THREAT_SCAN_EXCLUDED_AIR_TYPES = new Set(['aircraft']);
+const ENABLE_SERVER_FOG_SNAPSHOTS = false;
 const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
   DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y,
   DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x
@@ -1971,6 +1972,7 @@ function clampToMapBounds(x, y) {
 }
 
 function revealFogCircleForPlayer(playerFog, worldX, worldY, radius, now) {
+  if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
   const map = gameState.map;
   if (!map || !playerFog) return;
 
@@ -1990,6 +1992,7 @@ function revealFogCircleForPlayer(playerFog, worldX, worldY, radius, now) {
 }
 
 function revealFogCircleForAllPlayers(worldX, worldY, radius, now) {
+  if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
   gameState.players.forEach((player, playerId) => {
     if (!gameState.fogOfWar.has(playerId)) {
       gameState.fogOfWar.set(playerId, new Map());
@@ -3414,7 +3417,7 @@ io.on('connection', (socket) => {
       missiles: 0,
       online: true
     });
-    if (!gameState.fogOfWar.has(socket.userId)) {
+    if (ENABLE_SERVER_FOG_SNAPSHOTS && !gameState.fogOfWar.has(socket.userId)) {
       gameState.fogOfWar.set(socket.userId, new Map());
     }
 
@@ -4044,10 +4047,12 @@ io.on('connection', (socket) => {
         unit.searchCooldownUntil = now + 16000;
         unit.searchActiveUntil = now + SEARCH_REVEAL_DURATION_MS;
         const vr = DESTROYER_SEARCH_VISION_RADIUS;
-        if (!gameState.fogOfWar.has(unit.userId)) {
-          gameState.fogOfWar.set(unit.userId, new Map());
+        if (ENABLE_SERVER_FOG_SNAPSHOTS) {
+          if (!gameState.fogOfWar.has(unit.userId)) {
+            gameState.fogOfWar.set(unit.userId, new Map());
+          }
+          revealFogCircleForPlayer(gameState.fogOfWar.get(unit.userId), unit.x, unit.y, vr, now);
         }
-        revealFogCircleForPlayer(gameState.fogOfWar.get(unit.userId), unit.x, unit.y, vr, now);
         roomEmit('searchActivated', { unitId: unit.id, x: unit.x, y: unit.y, radius: vr });
       }
     });
@@ -4255,7 +4260,7 @@ function loadPlayerData(userId) {
     }
     
     // Initialize fog of war for player
-    if (!gameState.fogOfWar.has(userId)) {
+    if (ENABLE_SERVER_FOG_SNAPSHOTS && !gameState.fogOfWar.has(userId)) {
       gameState.fogOfWar.set(userId, new Map());
     }
     
@@ -4594,6 +4599,7 @@ setInterval(() => {
 
 // Separate fog of war update (less frequent) - all rooms
 setInterval(() => {
+  if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
   gameRooms.forEach((room, roomId) => {
     if (!roomHasHumanPlayers(roomId)) return;
     switchRoom(roomId);
@@ -4610,13 +4616,16 @@ setInterval(() => {
 
     switchRoom(roomId);
     const entityCount = gameState.units.size + gameState.buildings.size;
+    const humanCount = getRoomHumanCount(roomId);
     let stride = 1;
     if (entityCount > 800) stride = 3;
     else if (entityCount > 350) stride = 2;
+    if (humanCount >= 4) stride = Math.max(stride, 3);
+    else if (humanCount >= 2) stride = Math.max(stride, 2);
 
     if (updateCounter % stride !== 0) return;
 
-    io.to(roomId).emit('gameUpdate', {
+    io.to(roomId).volatile.emit('gameUpdate', {
       players: buildClientPlayersPayload(),
       units: buildClientUnitsPayload(),
       buildings: buildClientBuildingsPayload()
@@ -4626,9 +4635,11 @@ setInterval(() => {
 
 // Separate fog of war update function
 function updateFogOfWar() {
+  if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
   const now = Date.now();
   
   gameState.players.forEach((player, playerId) => {
+    if (!player || player.isAI || player.online === false) return;
     if (!gameState.fogOfWar.has(playerId)) {
       gameState.fogOfWar.set(playerId, new Map());
     }
@@ -4744,23 +4755,25 @@ function resolveActiveSlbmImpacts(now) {
     applySlbmDamage(slbm, now);
     roomEmit('slbmImpact', { id: slbmId, x: slbm.targetX, y: slbm.targetY });
 
-    const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
-    const impactVisionRadius = 2000;
-    const gridX = Math.floor(slbm.targetX / cellSize);
-    const gridY = Math.floor(slbm.targetY / cellSize);
-    const gridRadius = Math.ceil(impactVisionRadius / cellSize);
-    gameState.players.forEach((player, playerId) => {
-      const playerFog = gameState.fogOfWar.get(playerId);
-      if (!playerFog) return;
-      for (let dx = -gridRadius; dx <= gridRadius; dx++) {
-        for (let dy = -gridRadius; dy <= gridRadius; dy++) {
-          if (dx * dx + dy * dy <= gridRadius * gridRadius) {
-            const key = `${gridX + dx}_${gridY + dy}`;
-            playerFog.set(key, { lastSeen: now, explored: true });
+    if (ENABLE_SERVER_FOG_SNAPSHOTS) {
+      const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
+      const impactVisionRadius = 2000;
+      const gridX = Math.floor(slbm.targetX / cellSize);
+      const gridY = Math.floor(slbm.targetY / cellSize);
+      const gridRadius = Math.ceil(impactVisionRadius / cellSize);
+      gameState.players.forEach((player, playerId) => {
+        const playerFog = gameState.fogOfWar.get(playerId);
+        if (!playerFog) return;
+        for (let dx = -gridRadius; dx <= gridRadius; dx++) {
+          for (let dy = -gridRadius; dy <= gridRadius; dy++) {
+            if (dx * dx + dy * dy <= gridRadius * gridRadius) {
+              const key = `${gridX + dx}_${gridY + dy}`;
+              playerFog.set(key, { lastSeen: now, explored: true });
+            }
           }
         }
-      }
-    });
+      });
+    }
 
     gameState.activeSlbms.delete(slbmId);
   });
@@ -6403,7 +6416,9 @@ function spawnAIPlayer(aiIndex) {
     counterattackTarget: null
   };
   gameState.players.set(aiId, aiPlayer);
-  gameState.fogOfWar.set(aiId, new Map());
+  if (ENABLE_SERVER_FOG_SNAPSHOTS) {
+    gameState.fogOfWar.set(aiId, new Map());
+  }
 
   const hqId = Date.now() * 1000 + Math.floor(Math.random() * 1000) + aiIndex * 100;
   gameState.buildings.set(hqId, {

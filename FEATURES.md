@@ -4,8 +4,6 @@
 
 ### 1. 일꾼 시스템 (Worker System)
 - **일꾼 생산**: 본부(Headquarters)에서 생산 가능 (비용: 50 자원, 인구: 1)
-- **자원 채취**: 일꾼 선택 후 `G` 키를 누르고 자원을 클릭하여 채취
-- **건물 건설**: 일꾼 선택 후 `B` 키를 눌러 건설 메뉴 열기
 - **정찰**: 일꾼이 이동하면 그 지역의 시야가 확보됨
 
 ### 2. 시야 및 전장의 안개 (Fog of War)
@@ -27,8 +25,7 @@
 
 ### 4. SLBM 시스템 (Submarine-Launched Ballistic Missile)
 - **연구소 건설**: 인구 100 이상 달성 후 건설 가능 (비용: 500 자원)
-- **SLBM 연구**: 연구소에서 2000 자원으로 연구
-- **미사일 격납고**: 800 자원으로 건설
+- **미사일 격납고**: 1500 자원으로 건설
 - **SLBM 생산**: 미사일 격납고에서 1500 자원으로 생산 (한 번에 1개)
 - **발사 방법**:
   1. 잠수함 선택
@@ -85,6 +82,8 @@
 - **S**: 잠수함 SLBM 발사 (연구 완료 시)
 - **ESC**: 현재 명령 취소
 - **WASD**: 카메라 이동
+
+- **H**: 홀드 포지션( 그자리에 멈춰서서 적 감지시에 공격) 
 - **마우스 휠**: 줌 인/아웃
 - **우클릭**: 유닛 이동/공격
 
@@ -111,36 +110,6 @@
 | 연구소 | 500 | 800 | SLBM 연구 (인구 100 필요) |
 | 미사일 격납고 | 800 | 1000 | SLBM 생산 및 저장 |
 
-## 🎨 이미지 추가 방법
-
-이미지를 추가하려면 다음 폴더 구조를 만들고 이미지 파일을 추가하세요:
-
-```
-public/
-  assets/
-    units/
-      worker.png
-      destroyer.png
-      cruiser.png
-      battleship.png
-      carrier.png
-      submarine.png
-    buildings/
-      headquarters.png
-      shipyard.png
-      resource_dock.png
-      defense_tower.png
-      naval_academy.png
-      research_lab.png
-      missile_silo.png
-    resources/
-      metal.png
-      oil.png
-    particles/
-      explosion.png
-      torpedo.png
-      slbm.png
-```
 
 ## 🚀 실행 방법
 
@@ -154,8 +123,7 @@ npm start
 
 ## 💡 전략 팁
 
-1. **초반**: 일꾼으로 자원을 빠르게 채취하고 자원 부두 건설
-2. **중반**: 인구를 100까지 늘려 연구소 해금
+1. **초반**: 일꾼으로 자원을 빠르게 채취하고 발전소 건설
 3. **후반**: SLBM으로 적 기지를 원거리 공격
 4. **정찰**: 일꾼과 유닛을 맵 곳곳에 배치하여 시야 확보
 5. **잠수함**: 은신 상태를 유지하며 전략적 위치에 배치
@@ -164,7 +132,7 @@ npm start
 ## 🐛 알려진 이슈
 
 - 첫 로그인 시 Ctrl+Shift+R로 하드 리프레시 필요 (CSS 캐시 문제)
-- 잠수함이 너무 가까이 있으면 은신이 풀림 (의도된 기능)
+
 
 ## 📝 변경 사항 요약
 
