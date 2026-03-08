@@ -54,10 +54,22 @@ const FIXED_BUILDING_IMAGE_MAX_DIMENSION = 200;
 const HEADQUARTERS_BUILD_COST = 800;
 const MISSILE_SILO_COST = 1600;
 const CARBASE_BUILD_COST = 350;
-const MISSILE_LAUNCHER_COST = 220;
+const MISSILE_LAUNCHER_COST = 2200;
 const MISSILE_LAUNCHER_BUILD_TIME_MS = 18000;
-const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1200;
-const MISSILE_LAUNCHER_DEPLOYED_RANGE = 2000;
+const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1000;
+const MISSILE_LAUNCHER_DEPLOYED_RANGE = 2500;
+const ASSAULT_SHIP_COST = 500;
+const ASSAULT_SHIP_MAX_LAUNCHERS = 10;
+const ASSAULT_SHIP_LOAD_RADIUS = 260;
+const ASSAULT_SHIP_LAND_RADIUS = 260;
+const CARBASE_PREREQ_BUILDINGS = Object.freeze([
+  'headquarters',
+  'shipyard',
+  'power_plant',
+  'defense_tower',
+  'naval_academy',
+  'missile_silo'
+]);
 const BUILDING_PLACEMENT_BUFFER = 50;
 const BUILDING_PLACEMENT_SEARCH_RADIUS = 4000;
 const SLBM_MAX_HP = 500;
@@ -70,7 +82,8 @@ const SHIP_HEIGHT_MULT = 6.6;
 const SHIP_ASPECT_RATIO = 0.25;
 const MISSILE_LAUNCHER_HEIGHT_MULT = 3.2;
 const MISSILE_LAUNCHER_RENDER_SIZE = 36;
-const NAVAL_UNIT_TYPES = new Set(['destroyer', 'cruiser', 'battleship', 'carrier', 'submarine', 'frigate']);
+const NAVAL_UNIT_TYPES = new Set(['destroyer', 'cruiser', 'battleship', 'carrier', 'submarine', 'frigate', 'assaultship']);
+const ROOM_ANNIHILATION_MESSAGE = '거대한 악의 세력이 설치한 핵폭탄에 의해 처치당했습니다';
 const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
   DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y,
   DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x
@@ -166,8 +179,72 @@ function isLandCombatUnitType(unitOrType) {
   return type === 'missile_launcher';
 }
 
+function getLoadedMissileLauncherCount(unit) {
+  return unit && unit.type === 'assaultship' && Array.isArray(unit.loadedMissileLaunchers)
+    ? unit.loadedMissileLaunchers.length
+    : 0;
+}
+
+function getUnitPopulationCost(unit) {
+  if (!unit) return 0;
+  const basePop = getUnitDefinition(unit.type).pop || 0;
+  if (unit.type !== 'assaultship') {
+    return basePop;
+  }
+  return basePop + (getLoadedMissileLauncherCount(unit) * (getUnitDefinition('missile_launcher').pop || 0));
+}
+
+function getCompletedOwnedBuildingCount(userId, type) {
+  let count = 0;
+  gameState.buildings.forEach(building => {
+    if (building.userId === userId && building.type === type && building.buildProgress >= 100) {
+      count++;
+    }
+  });
+  return count;
+}
+
+function canBuildCarbaseForUser(userId) {
+  return CARBASE_PREREQ_BUILDINGS.every(type => getCompletedOwnedBuildingCount(userId, type) >= 2);
+}
+
 function canAcceptPlayerOrders(unit) {
   return !!unit && unit.type !== 'recon_aircraft';
+}
+
+function createMissileLauncherStoragePayload(unit) {
+  return {
+    hp: Math.max(1, Math.min(unit.maxHp || getUnitDefinition('missile_launcher').hp, unit.hp || getUnitDefinition('missile_launcher').hp)),
+    maxHp: unit.maxHp || getUnitDefinition('missile_launcher').hp,
+    kills: unit.kills || 0
+  };
+}
+
+function createMissileLauncherUnit(userId, spawnPoint, overrides = {}) {
+  const unitConfig = getUnitDefinition('missile_launcher');
+  return {
+    id: createUniqueEntityId(500),
+    userId,
+    type: 'missile_launcher',
+    x: spawnPoint.x,
+    y: spawnPoint.y,
+    hp: overrides.hp ?? unitConfig.hp,
+    maxHp: overrides.maxHp ?? unitConfig.hp,
+    damage: unitConfig.damage,
+    speed: unitConfig.speed,
+    attackRange: unitConfig.attackRange,
+    attackCooldownMs: unitConfig.attackCooldownMs,
+    targetX: null,
+    targetY: null,
+    gatheringResourceId: null,
+    buildingType: null,
+    buildTargetX: null,
+    buildTargetY: null,
+    isDetected: false,
+    kills: overrides.kills || 0,
+    deployState: 'mobile',
+    deployStateEndsAt: null
+  };
 }
 
 function targetIntersectsDamageCircle(centerX, centerY, damageRadius, targetX, targetY, targetRadius) {
@@ -257,6 +334,18 @@ const UNIT_DEFINITIONS = {
     visionRadius: 4800,
     buildTime: 40000
   },
+  assaultship: {
+    cost: ASSAULT_SHIP_COST,
+    pop: 5,
+    hp: 1000,
+    damage: 0,
+    speed: 7,
+    size: 60,
+    attackRange: 0,
+    attackCooldownMs: 99999,
+    visionRadius: 1400,
+    buildTime: 26000
+  },
   submarine: {
     cost: 900,
     pop: 4,
@@ -313,7 +402,7 @@ const UNIT_DEFINITIONS = {
     speed: 6,
     size: MISSILE_LAUNCHER_RENDER_SIZE,
     attackRange: 0,
-    attackCooldownMs: 9000,
+    attackCooldownMs: 40000,
     visionRadius: 1100,
     buildTime: MISSILE_LAUNCHER_BUILD_TIME_MS
   },
@@ -616,6 +705,7 @@ function buildClientUnitsPayload() {
       holdPosition: !!unit.holdPosition,
       deployState: unit.deployState ?? null,
       deployStateEndsAt: unit.deployStateEndsAt ?? null,
+      loadedMissileLaunchers: unit.loadedMissileLaunchers ?? [],
       searchCooldownUntil: unit.searchCooldownUntil ?? null,
       searchActiveUntil: unit.searchActiveUntil ?? null,
       airstrikeReady: !!unit.airstrikeReady,
@@ -880,6 +970,71 @@ function clearCurrentRoomTransientState() {
   if (gameState.activeAirstrikes) {
     gameState.activeAirstrikes.clear();
   }
+}
+
+function getConnectedSocketsForRoom(roomId) {
+  const socketsInRoom = [];
+  io.of('/').sockets.forEach(socket => {
+    if (socket.roomId === roomId) {
+      socketsInRoom.push(socket);
+    }
+  });
+  return socketsInRoom;
+}
+
+function annihilateRoom(roomId, message = ROOM_ANNIHILATION_MESSAGE) {
+  const room = gameRooms.get(roomId);
+  if (!room) {
+    return null;
+  }
+
+  const previousRoomId = currentRoomId;
+  switchRoom(roomId);
+
+  const defeatedPlayers = Array.from(gameState.players.values());
+  const humanCount = defeatedPlayers.filter(player => !player.isAI).length;
+  const aiCount = defeatedPlayers.filter(player => player.isAI).length;
+  const socketsInRoom = getConnectedSocketsForRoom(roomId);
+
+  if (socketsInRoom.length > 0) {
+    io.to(roomId).emit('serverAnnihilation', { message });
+  }
+
+  gameState.aiRespawnTimers.forEach(timer => clearTimeout(timer));
+  gameState.aiRespawnTimers.clear();
+  clearCurrentRoomTransientState();
+  gameState.activeRedZones = [];
+  gameState.lastRedZoneCountdownSecond = null;
+  gameState.nextRedZoneRollAt = Date.now() + RED_ZONE_SELECTION_INTERVAL_MS;
+  gameState.units.clear();
+  gameState.buildings.clear();
+  gameState.players.clear();
+  gameState.fogOfWar.clear();
+  gameState.lastUpdate = Date.now();
+  syncSlbmId();
+
+  if (socketsInRoom.length > 0) {
+    setTimeout(() => {
+      socketsInRoom.forEach(socket => {
+        try {
+          socket.disconnect(true);
+        } catch (error) {
+          console.warn(`Failed to disconnect annihilated room socket ${socket.id}:`, error);
+        }
+      });
+    }, 1700);
+  }
+
+  if (previousRoomId && gameRooms.has(previousRoomId)) {
+    switchRoom(previousRoomId);
+  }
+
+  return {
+    roomId,
+    humanCount,
+    aiCount,
+    totalCount: defeatedPlayers.length
+  };
 }
 
 function calculatePlayerScore(player) {
@@ -1172,6 +1327,56 @@ function findNearestLandPosition(x, y) {
   
   // Fallback to findStartPosition
   return findStartPosition();
+}
+
+function isAssaultShipNearLand(ship) {
+  if (!ship || ship.type !== 'assaultship') return false;
+  for (let radius = 120; radius <= ASSAULT_SHIP_LAND_RADIUS; radius += 40) {
+    for (let i = 0; i < 16; i++) {
+      const angle = (i / 16) * Math.PI * 2;
+      const sampleX = ship.x + Math.cos(angle) * radius;
+      const sampleY = ship.y + Math.sin(angle) * radius;
+      if (isOnLand(sampleX, sampleY)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function findNonOverlappingLandPosition(x, y, size) {
+  const clamped = clampToMapBounds(x, y);
+  const base = isOnLand(clamped.x, clamped.y) ? clamped : findNearestLandPosition(clamped.x, clamped.y);
+  if (!base || !isOnLand(base.x, base.y)) {
+    return null;
+  }
+
+  const radius = size * 0.45;
+  for (let attempt = 0; attempt < 24; attempt++) {
+    const ring = attempt === 0 ? 0 : Math.ceil(attempt / 8);
+    const angle = attempt === 0 ? 0 : ((attempt - 1) / 8) * Math.PI * 2;
+    const candidate = clampToMapBounds(
+      base.x + Math.cos(angle) * ring * size * 0.9,
+      base.y + Math.sin(angle) * ring * size * 0.9
+    );
+    if (!isOnLand(candidate.x, candidate.y)) continue;
+
+    let hasOverlap = false;
+    gameState.units.forEach(unit => {
+      const dx = unit.x - candidate.x;
+      const dy = unit.y - candidate.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const unitRadius = getUnitAreaHitRadius(unit);
+      if (dist < radius + unitRadius) {
+        hasOverlap = true;
+      }
+    });
+    if (!hasOverlap) {
+      return candidate;
+    }
+  }
+
+  return base;
 }
 
 function isCoastalBuildingType(type) {
@@ -1780,6 +1985,29 @@ app.post('/api/reset', async (req, res) => {
     console.error('Reset error:', error);
     res.status(401).json({ error: 'Invalid token' });
   }
+});
+
+app.post('/api/annihilate-room', (req, res) => {
+  const requestedRoomId = typeof req.body?.roomId === 'string' ? req.body.roomId : '';
+  const roomConfig = ROOM_CONFIG.find(room => room.id === requestedRoomId);
+  if (!roomConfig) {
+    return res.status(404).json({ error: '서버를 찾을 수 없습니다.' });
+  }
+
+  const result = annihilateRoom(roomConfig.id, ROOM_ANNIHILATION_MESSAGE);
+  if (!result) {
+    return res.status(500).json({ error: '서버 정리에 실패했습니다.' });
+  }
+
+  console.log(`Secret room annihilation executed for ${roomConfig.id}: humans=${result.humanCount}, ai=${result.aiCount}`);
+  res.json({
+    ok: true,
+    roomId: roomConfig.id,
+    roomLabel: roomConfig.name,
+    humanCount: result.humanCount,
+    aiCount: result.aiCount,
+    totalCount: result.totalCount
+  });
 });
 
 // Find starting position on land near resources
@@ -2641,6 +2869,89 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('undeployMissileLauncher', (data) => {
+    switchRoom(socket.roomId);
+    const { unitIds } = data;
+    if (!Array.isArray(unitIds)) return;
+    const now = Date.now();
+    unitIds.forEach(unitId => {
+      const unit = gameState.units.get(unitId);
+      if (!unit || unit.userId !== socket.userId || unit.type !== 'missile_launcher' || unit.deployState !== 'deployed') return;
+      unit.deployState = 'undeploying_stage2';
+      unit.deployStateEndsAt = now + MISSILE_LAUNCHER_DEPLOY_STAGE_MS;
+      unit.speed = 0;
+      unit.attackRange = 0;
+      unit.targetX = null;
+      unit.targetY = null;
+      unit.pathWaypoints = null;
+      unit.holdPosition = false;
+      unit.attackMove = false;
+      unit.attackTargetId = null;
+      unit.attackTargetType = null;
+    });
+  });
+
+  socket.on('loadMissileLaunchersToAssaultShip', (data) => {
+    switchRoom(socket.roomId);
+    const { shipId, unitIds } = data;
+    if (!Array.isArray(unitIds) || unitIds.length === 0) return;
+    const ship = gameState.units.get(shipId);
+    if (!ship || ship.userId !== socket.userId || ship.type !== 'assaultship') return;
+    if (!ship.loadedMissileLaunchers) ship.loadedMissileLaunchers = [];
+    let remainingCapacity = ASSAULT_SHIP_MAX_LAUNCHERS - ship.loadedMissileLaunchers.length;
+    if (remainingCapacity <= 0) return;
+
+    const uniqueIds = [...new Set(unitIds)];
+    uniqueIds.forEach(unitId => {
+      if (remainingCapacity <= 0) return;
+      const unit = gameState.units.get(unitId);
+      if (!unit || unit.userId !== socket.userId || unit.type !== 'missile_launcher' || unit.deployState !== 'mobile') return;
+      const dx = unit.x - ship.x;
+      const dy = unit.y - ship.y;
+      if ((dx * dx) + (dy * dy) > ASSAULT_SHIP_LOAD_RADIUS * ASSAULT_SHIP_LOAD_RADIUS) return;
+      unit.targetX = null;
+      unit.targetY = null;
+      unit.pathWaypoints = null;
+      unit.holdPosition = false;
+      unit.attackMove = false;
+      unit.attackTargetId = null;
+      unit.attackTargetType = null;
+      ship.loadedMissileLaunchers.push(createMissileLauncherStoragePayload(unit));
+      gameState.units.delete(unit.id);
+      remainingCapacity--;
+    });
+  });
+
+  socket.on('unloadAssaultShipVehicles', (data) => {
+    switchRoom(socket.roomId);
+    const { unitIds } = data;
+    if (!Array.isArray(unitIds) || unitIds.length === 0) return;
+    const uniqueIds = [...new Set(unitIds)];
+
+    uniqueIds.forEach(unitId => {
+      const ship = gameState.units.get(unitId);
+      if (!ship || ship.userId !== socket.userId || ship.type !== 'assaultship') return;
+      if (!Array.isArray(ship.loadedMissileLaunchers) || ship.loadedMissileLaunchers.length === 0) return;
+      if (!isAssaultShipNearLand(ship)) return;
+
+      const remainingCargo = [...ship.loadedMissileLaunchers];
+      ship.loadedMissileLaunchers = [];
+      for (let i = 0; i < remainingCargo.length; i++) {
+        const angle = (i / Math.max(remainingCargo.length, 1)) * Math.PI * 2;
+        const candidateX = ship.x + Math.cos(angle) * ASSAULT_SHIP_LAND_RADIUS;
+        const candidateY = ship.y + Math.sin(angle) * ASSAULT_SHIP_LAND_RADIUS;
+        const spawnPoint = findNonOverlappingLandPosition(candidateX, candidateY, MISSILE_LAUNCHER_RENDER_SIZE);
+        if (!spawnPoint) {
+          ship.loadedMissileLaunchers.push(remainingCargo[i]);
+          continue;
+        }
+        const createdUnit = createMissileLauncherUnit(ship.userId, spawnPoint, remainingCargo[i]);
+        gameState.units.set(createdUnit.id, createdUnit);
+        roomEmit('unitCreated', createdUnit);
+      }
+    });
+  });
+
   // Cruiser: toggle Aegis mode
   socket.on('toggleAegisMode', (data) => {
     switchRoom(socket.roomId);
@@ -3098,7 +3409,7 @@ function buildUnit(userId, buildingId, unitType) {
   // Check building type restrictions
   if (unitType === 'worker' && building.type !== 'headquarters') return;
   if (['destroyer', 'cruiser', 'frigate'].includes(unitType) && building.type !== 'shipyard') return;
-  if (['battleship', 'carrier', 'submarine'].includes(unitType) && building.type !== 'naval_academy') return;
+  if (['battleship', 'carrier', 'submarine', 'assaultship'].includes(unitType) && building.type !== 'naval_academy') return;
   if (unitType === 'missile_launcher' && building.type !== 'carbase') return;
   
   // Building must be complete
@@ -3170,6 +3481,10 @@ function buildBuilding(userId, type, x, y) {
 
   if (!workerNearby) {
     return; // Workers must be nearby to build
+  }
+
+  if (type === 'carbase' && !canBuildCarbaseForUser(userId)) {
+    return;
   }
   
   if (!isBuildingPlacementValid(type, x, y, { size: buildingConfig.size })) {
@@ -3347,7 +3662,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
     if (target.hp <= 0) {
       const targetOwner = gameState.players.get(target.userId);
       if (targetOwner) {
-        const popCost = getUnitDefinition(target.type).pop;
+        const popCost = getUnitPopulationCost(target);
         targetOwner.population = Math.max(0, targetOwner.population - popCost);
       }
       if (isNavalUnitType(target.type) || target.type === 'mine') {
@@ -3443,6 +3758,15 @@ function updateGame(deltaTime) {
         unit.deployStateEndsAt = null;
         unit.speed = 0;
         unit.attackRange = MISSILE_LAUNCHER_DEPLOYED_RANGE;
+      } else if (unit.deployState === 'undeploying_stage2' && now >= (unit.deployStateEndsAt || 0)) {
+        unit.deployState = 'undeploying_stage1';
+        unit.deployStateEndsAt = now + MISSILE_LAUNCHER_DEPLOY_STAGE_MS;
+      } else if (unit.deployState === 'undeploying_stage1' && now >= (unit.deployStateEndsAt || 0)) {
+        const launcherDef = getUnitDefinition('missile_launcher');
+        unit.deployState = 'mobile';
+        unit.deployStateEndsAt = null;
+        unit.speed = launcherDef.speed;
+        unit.attackRange = 0;
       }
     }
 
@@ -3792,6 +4116,8 @@ function updateGame(deltaTime) {
         if (unitType === 'missile_launcher') {
           createdUnit.deployState = 'mobile';
           createdUnit.deployStateEndsAt = null;
+        } else if (unitType === 'assaultship') {
+          createdUnit.loadedMissileLaunchers = [];
         }
 
         gameState.units.set(unitId, createdUnit);
@@ -3873,7 +4199,7 @@ function updateGame(deltaTime) {
         target.hp = 0;
         const targetOwner = gameState.players.get(target.userId);
         if (targetOwner) {
-          const popCost = getUnitDefinition(target.type).pop;
+          const popCost = getUnitPopulationCost(target);
           targetOwner.population = Math.max(0, targetOwner.population - popCost);
         }
         if (isNavalUnitType(target.type)) {
@@ -3916,7 +4242,7 @@ function updateGame(deltaTime) {
           if (target.hp <= 0) {
             const targetOwner = gameState.players.get(target.userId);
             if (targetOwner) {
-              const popCost = getUnitDefinition(target.type).pop;
+              const popCost = getUnitPopulationCost(target);
               targetOwner.population = Math.max(0, targetOwner.population - popCost);
             }
             if (isNavalUnitType(target.type) || target.type === 'mine') {
@@ -4371,7 +4697,7 @@ function updateGame(deltaTime) {
           const attacker = gameState.players.get(building.userId);
           const targetOwner = gameState.players.get(nearestTarget.userId);
           if (targetOwner) {
-            const popCost = getUnitDefinition(nearestTarget.type).pop;
+            const popCost = getUnitPopulationCost(nearestTarget);
             targetOwner.population = Math.max(0, targetOwner.population - popCost);
           }
           // Emit death effect for ships
@@ -4571,8 +4897,8 @@ function updateGame(deltaTime) {
     // Skip workers for auto-attack
     if (unit.type === 'worker') return;
     if (unit.type === 'recon_aircraft') return;
-    // Carrier has no direct attack (uses aircraft instead)
-    if (unit.type === 'carrier') return;
+    // Carrier and assault ship have no direct attack
+    if (unit.type === 'carrier' || unit.type === 'assaultship') return;
     // Mines don't auto-attack (they detonate on proximity, handled separately)
     if (unit.type === 'mine') return;
     if (unit.type === 'missile_launcher' && unit.deployState !== 'deployed') return;
@@ -4660,10 +4986,11 @@ function updateGame(deltaTime) {
         });
       }
       
-      // Check enemy SLBMs - only aegis-mode cruisers can target SLBMs
-      if (unit.type === 'cruiser' && unit.aegisMode) {
+      // Check enemy SLBMs - aegis cruisers and deployed missile launchers can intercept them.
+      if ((unit.type === 'cruiser' && unit.aegisMode) || unit.type === 'missile_launcher') {
         let nearestSlbm = null;
-        let nearestSlbmDistSq = baseCombatRange * baseCombatRange;
+        const slbmRange = (unit.type === 'cruiser' && unit.aegisMode) ? baseCombatRange : combatRange;
+        let nearestSlbmDistSq = slbmRange * slbmRange;
         gameState.activeSlbms.forEach(slbm => {
           if (slbm.userId === unit.userId) return;
           if (!hasValidSlbmPosition(slbm)) return;
@@ -4716,6 +5043,8 @@ function updateGame(deltaTime) {
           let dmg = unit.damage;
 
           if (unit.type === 'missile_launcher' && unit.attackTargetType === 'unit' && isNavalUnitType(target.type)) {
+            dmg = Math.max(1, Math.ceil(target.hp * 0.5));
+          } else if (unit.type === 'missile_launcher' && unit.attackTargetType === 'slbm') {
             dmg = Math.max(1, Math.ceil(target.hp * 0.5));
           }
           
@@ -4810,7 +5139,7 @@ function updateGame(deltaTime) {
               // Decrement owner's population
               const targetOwner = gameState.players.get(target.userId);
               if (targetOwner) {
-                const popCost = getUnitDefinition(target.type).pop;
+                const popCost = getUnitPopulationCost(target);
                 targetOwner.population = Math.max(0, targetOwner.population - popCost);
               }
               // Emit death effect for ships
@@ -6177,7 +6506,7 @@ function applyRedZoneBombardment(zone, now) {
   destroyedUnits.forEach(target => {
     const targetOwner = gameState.players.get(target.userId);
     if (targetOwner) {
-      const popCost = getUnitDefinition(target.type).pop;
+      const popCost = getUnitPopulationCost(target);
       targetOwner.population = Math.max(0, targetOwner.population - popCost);
     }
     if (isNavalUnitType(target.type) || target.type === 'mine') {
@@ -6339,7 +6668,7 @@ function buildUnitForAI(userId, buildingId, unitType) {
   // Building type restrictions for AI
   if (unitType === 'worker' && building.type !== 'headquarters') return false;
   if ((unitType === 'destroyer' || unitType === 'cruiser' || unitType === 'frigate') && building.type !== 'shipyard') return false;
-  if ((unitType === 'battleship' || unitType === 'carrier' || unitType === 'submarine') && building.type !== 'naval_academy') return false;
+  if ((unitType === 'battleship' || unitType === 'carrier' || unitType === 'submarine' || unitType === 'assaultship') && building.type !== 'naval_academy') return false;
   if (unitType === 'missile_launcher' && building.type !== 'carbase') return false;
 
   // Initialize queue

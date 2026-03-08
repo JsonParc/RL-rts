@@ -40,16 +40,19 @@ const MINIMAP_UPDATE_INTERVAL = 500;
 const SECRET_CLICK_STREAK_RESET_MS = 900;
 const SECRET_RANKING_CLICK_TARGET = 10;
 const SECRET_MINIMAP_CLICK_TARGET = 22;
+const SECRET_LOGIN_PANEL_CLICK_TARGET = 22;
 const SECRET_WORKER_PORTRAIT_CLICK_TARGET = 29;
 const SECRET_WORKER_PORTRAIT_CLICK_RESET_MS = 2500;
 const TEMPORARY_FULL_MAP_REVEAL_MS = 5000;
 const fogCircleOffsetsCache = new Map();
 const rankingPanelSecretClicks = { count: 0, lastAt: 0 };
 const minimapSecretClicks = { count: 0, lastAt: 0 };
+const loginPanelSecretClicks = { count: 0, lastAt: 0 };
 const workerPortraitSecretClicks = { count: 0, lastAt: 0 };
 let fullMapRevealUntil = 0;
 let fullMapRevealTimeoutId = null;
 let lastSeenRedZoneActivationAt = 0;
+let roomAnnihilationLogoutTimeoutId = null;
 
 // --- Fog Offscreen Canvas ---
 // fogLayerCanvas is a gridSize횞gridSize pixel canvas drawn once per fog update
@@ -95,6 +98,10 @@ let cruiserImageLoaded = false;
 // Carrier image
 let carrierImage = null;
 let carrierImageLoaded = false;
+
+// Assault ship image
+let assaultShipImage = null;
+let assaultShipImageLoaded = false;
 
 // Frigate image
 let frigateImage = null;
@@ -174,12 +181,24 @@ const RECON_AIRCRAFT_BUILD_TIME_MS = 18000;
 const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
 const RECON_AIRCRAFT_VISION_RADIUS = 2600;
 const CARBASE_BUILD_COST = 350;
-const MISSILE_LAUNCHER_COST = 220;
+const MISSILE_LAUNCHER_COST = 2200;
 const MISSILE_LAUNCHER_BUILD_TIME_MS = 18000;
-const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1200;
-const MISSILE_LAUNCHER_RANGE = 2000;
+const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1000;
+const MISSILE_LAUNCHER_RANGE = 2500;
 const MISSILE_LAUNCHER_SELECTION_SIZE = 36;
 const MISSILE_LAUNCHER_HEIGHT_MULTIPLIER = 3.2;
+const ASSAULT_SHIP_COST = 500;
+const ASSAULT_SHIP_MAX_LAUNCHERS = 10;
+const ASSAULT_SHIP_LOAD_RADIUS = 260;
+const ASSAULT_SHIP_LAND_RADIUS = 260;
+const CARBASE_PREREQ_BUILDINGS = Object.freeze([
+    'headquarters',
+    'shipyard',
+    'power_plant',
+    'defense_tower',
+    'naval_academy',
+    'missile_silo'
+]);
 const RED_ZONE_MINIMAP_PENDING_COLOR = 'rgba(124, 124, 124, 0.68)';
 const RED_ZONE_MINIMAP_AFTERSHOCK_COLOR = 'rgba(96, 96, 96, 0.48)';
 const RED_ZONE_MINIMAP_BUILDING_WARNING_COLOR = '#8c8c8c';
@@ -197,8 +216,7 @@ const WORKER_BUILD_CATEGORIES = Object.freeze({
         items: Object.freeze([
             { type: 'headquarters', name: '본부 건물', cost: 800, desc: '일꾼 생산' },
             { type: 'power_plant', name: '발전소', cost: 150, desc: '인구+3' },
-            { type: 'shipyard', name: '조선소', cost: 200, desc: '인구+5' },
-            { type: 'carbase', name: '차량기지', cost: CARBASE_BUILD_COST, desc: '지상병력 생산' }
+            { type: 'shipyard', name: '조선소', cost: 200, desc: '인구+5' }
         ])
     }),
     advanced: Object.freeze({
@@ -206,7 +224,8 @@ const WORKER_BUILD_CATEGORIES = Object.freeze({
         items: Object.freeze([
             { type: 'defense_tower', name: '방어 타워', cost: 250, desc: '' },
             { type: 'naval_academy', name: '대형조선소', cost: 300, desc: '인구+10' },
-            { type: 'missile_silo', name: '미사일 사일로', cost: 1600, desc: '' }
+            { type: 'missile_silo', name: '미사일 사일로', cost: 1600, desc: '' },
+            { type: 'carbase', name: '차량기지', cost: CARBASE_BUILD_COST, desc: '모든 건물 2개 이상 필요' }
         ])
     })
 });
@@ -312,6 +331,20 @@ function loadFighterImage() {
     }
 }
 
+function loadAssaultShipImage() {
+    if (!assaultShipImage) {
+        assaultShipImage = new Image();
+        assaultShipImage.onload = () => {
+            assaultShipImageLoaded = true;
+            console.log('Assault ship image loaded');
+        };
+        assaultShipImage.onerror = () => {
+            console.warn('Failed to load assaultship.png');
+        };
+        assaultShipImage.src = '/assets/images/units/assaultship.png';
+    }
+}
+
 function loadReconAircraftImage() {
     if (!reconAircraftImage) {
         reconAircraftImage = new Image();
@@ -411,6 +444,7 @@ loadBattleshipImages();
 loadSubmarineImage();
 loadCruiserImage();
 loadCarrierImage();
+loadAssaultShipImage();
 loadFrigateImage();
 loadFighterImage();
 loadReconAircraftImage();
@@ -1030,6 +1064,7 @@ function getUnitImage(unitOrType) {
             if (unit && unit.aegisMode && cruiserAegisImageLoaded) return cruiserAegisImage;
             return cruiserImageLoaded ? cruiserImage : null;
         case 'carrier': return carrierImageLoaded ? carrierImage : null;
+        case 'assaultship': return assaultShipImageLoaded ? assaultShipImage : null;
         case 'frigate': return frigateImageLoaded ? frigateImage : null;
         case 'aircraft': return fighterImageLoaded ? fighterImage : null;
         case 'recon_aircraft': return reconAircraftImageLoaded ? reconAircraftImage : null;
@@ -1038,6 +1073,8 @@ function getUnitImage(unitOrType) {
             if (unit && unit.deployState === 'deployed') return thaadStage2ImageLoaded ? thaadStage2Image : null;
             if (unit && unit.deployState === 'deploying_stage2') return thaadStage2ImageLoaded ? thaadStage2Image : null;
             if (unit && unit.deployState === 'deploying_stage1') return thaadStage1ImageLoaded ? thaadStage1Image : null;
+            if (unit && unit.deployState === 'undeploying_stage2') return thaadStage2ImageLoaded ? thaadStage2Image : null;
+            if (unit && unit.deployState === 'undeploying_stage1') return thaadStage1ImageLoaded ? thaadStage1Image : null;
             return thaadImageLoaded ? thaadImage : null;
         default: return null;
     }
@@ -1053,6 +1090,7 @@ function getUnitRenderHeightMultiplier(unitOrType) {
 function getMissileLauncherStateLabel(unit) {
     if (!unit || unit.type !== 'missile_launcher') return '';
     if (unit.deployState === 'deployed') return '배치 완료';
+    if (unit.deployState === 'undeploying_stage1' || unit.deployState === 'undeploying_stage2') return '배치 해제 중';
     if (unit.deployState === 'deploying_stage1' || unit.deployState === 'deploying_stage2') return '배치 중';
     return '이동식';
 }
@@ -1323,10 +1361,11 @@ function getUnitTypeName(type) {
         'cruiser': '순양함',
         'battleship': '전함',
         'carrier': '항공모함',
+        'assaultship': '강습상륙함',
         'submarine': '잠수함',
         'aircraft': '함재기',
         'recon_aircraft': '정찰기',
-        'missile_launcher': '미사일 발사차량',
+        'missile_launcher': '발사차량',
         'frigate': '호위함'
     };
     return names[type] || type;
@@ -1833,6 +1872,10 @@ function getSelectedOwnedCarriers() {
     return getSelectedOwnedUnits().filter(unit => unit.type === 'carrier');
 }
 
+function getSelectedOwnedAssaultShips() {
+    return getSelectedOwnedUnits().filter(unit => unit.type === 'assaultship');
+}
+
 function getSelectedOwnedMissileLaunchers() {
     return getSelectedOwnedUnits().filter(unit => unit.type === 'missile_launcher');
 }
@@ -1848,6 +1891,10 @@ function getDeployableMissileLaunchers() {
     return getSelectedOwnedMissileLaunchers().filter(unit => !unit.deployState || unit.deployState === 'mobile');
 }
 
+function getUndeployableMissileLaunchers() {
+    return getSelectedOwnedMissileLaunchers().filter(unit => unit.deployState === 'deployed');
+}
+
 function canReceiveManualOrders(unit) {
     return !!unit
         && unit.userId === gameState.userId
@@ -1856,7 +1903,7 @@ function canReceiveManualOrders(unit) {
 }
 
 function canReceiveManualAttackOrders(unit) {
-    return canReceiveManualOrders(unit) && unit.type !== 'worker' && unit.type !== 'missile_launcher';
+    return canReceiveManualOrders(unit) && unit.type !== 'worker' && unit.type !== 'missile_launcher' && unit.type !== 'assaultship';
 }
 
 function hasOnlyOwnedCarriersSelected() {
@@ -1864,6 +1911,31 @@ function hasOnlyOwnedCarriersSelected() {
         .map(id => gameState.units.get(id))
         .filter(Boolean);
     return selectedUnits.length > 0 && selectedUnits.every(unit => unit.userId === gameState.userId && unit.type === 'carrier');
+}
+
+function hasOnlyOwnedAssaultShipsSelected() {
+    const selectedUnits = Array.from(gameState.selection)
+        .map(id => gameState.units.get(id))
+        .filter(Boolean);
+    return selectedUnits.length > 0 && selectedUnits.every(unit => unit.userId === gameState.userId && unit.type === 'assaultship');
+}
+
+function canUnloadFromAssaultShip(ship) {
+    if (!ship || ship.type !== 'assaultship') return false;
+    if (!Array.isArray(ship.loadedMissileLaunchers) || ship.loadedMissileLaunchers.length <= 0) return false;
+    for (let radius = 120; radius <= ASSAULT_SHIP_LAND_RADIUS; radius += 40) {
+        for (let i = 0; i < 16; i++) {
+            const angle = (i / 16) * Math.PI * 2;
+            if (isLandAtWorldPosition(ship.x + Math.cos(angle) * radius, ship.y + Math.sin(angle) * radius)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function getUnloadReadyAssaultShips() {
+    return getSelectedOwnedAssaultShips().filter(canUnloadFromAssaultShip);
 }
 
 function getReadyReconCarriers() {
@@ -1960,6 +2032,58 @@ function findInspectableEnemyUnitAt(worldX, worldY) {
     return clickedUnitId;
 }
 
+function findOwnedUnitAt(worldX, worldY, predicate = null) {
+    let clickedUnitId = null;
+    let closestDistanceSq = Infinity;
+
+    gameState.units.forEach((unit, unitId) => {
+        if (unit.userId !== gameState.userId) return;
+        if (predicate && !predicate(unit)) return;
+        if (!isPointInsideUnitHitbox(unit, worldX, worldY)) return;
+
+        const { x, y } = getUnitDisplayPosition(unit);
+        const dx = worldX - x;
+        const dy = worldY - y;
+        const distanceSq = dx * dx + dy * dy;
+        if (distanceSq < closestDistanceSq) {
+            closestDistanceSq = distanceSq;
+            clickedUnitId = unitId;
+        }
+    });
+
+    return clickedUnitId;
+}
+
+function tryLoadSelectedLaunchersIntoAssaultShip(clickX, clickY) {
+    if (!socket) return false;
+    const assaultShipId = findOwnedUnitAt(clickX, clickY, unit => unit.type === 'assaultship');
+    if (!assaultShipId) return false;
+    const ship = gameState.units.get(assaultShipId);
+    if (!ship) return false;
+    const remainingCapacity = ASSAULT_SHIP_MAX_LAUNCHERS - ((ship.loadedMissileLaunchers || []).length);
+    if (remainingCapacity <= 0) return false;
+
+    const launchers = getDeployableMissileLaunchers().filter(unit => {
+        const dx = unit.x - ship.x;
+        const dy = unit.y - ship.y;
+        return (dx * dx) + (dy * dy) <= ASSAULT_SHIP_LOAD_RADIUS * ASSAULT_SHIP_LOAD_RADIUS;
+    }).slice(0, remainingCapacity);
+    if (launchers.length <= 0) return false;
+
+    socket.emit('loadMissileLaunchersToAssaultShip', {
+        shipId: assaultShipId,
+        unitIds: launchers.map(unit => unit.id)
+    });
+
+    gameState.selection.clear();
+    gameState.selection.add(assaultShipId);
+    gameState.inspectedUnitId = null;
+    commandGroup.clear();
+    attackTarget = null;
+    updateSelectionInfo();
+    return true;
+}
+
 function getInspectedUnit() {
     if (!gameState.inspectedUnitId) return null;
     const unit = gameState.units.get(gameState.inspectedUnitId);
@@ -2003,6 +2127,10 @@ function selectUnits() {
     
     // If click lands on a building, check if we should preserve current unit selection
     if (isClick) {
+        if (tryLoadSelectedLaunchersIntoAssaultShip(clickX, clickY)) {
+            return;
+        }
+
         let clickedBuilding = null;
         gameState.buildings.forEach((building, buildingId) => {
             if (building.userId === gameState.userId) {
@@ -2094,7 +2222,9 @@ function renderSingleUnitPanel(unit, options = {}) {
     if (unit.type === 'carrier') {
         displayDamage = '함재기 / 정찰기';
     } else if (unit.type === 'missile_launcher') {
-        displayDamage = unit.deployState === 'deployed' ? '함선 현재 체력 50%' : '배치 필요';
+        displayDamage = unit.deployState === 'deployed' ? '함선/SLBM 현재 체력 50%' : '배치 필요';
+    } else if (unit.type === 'assaultship') {
+        displayDamage = '수송 전용';
     } else if (unit.type === 'cruiser' && unit.aegisMode) {
         displayDamage = '25 (이지스)';
     } else if (unit.aimedShot) {
@@ -2107,6 +2237,8 @@ function renderSingleUnitPanel(unit, options = {}) {
     let displayRange = unit.attackRange || 0;
     if (unit.type === 'missile_launcher' && unit.deployState !== 'deployed') {
         displayRange = '배치 필요';
+    } else if (unit.type === 'assaultship') {
+        displayRange = '-';
     } else if (unit.aimedShot) {
         displayRange = `${displayRange * 2} (조준)`;
     } else if (unit.type === 'cruiser' && unit.aegisMode) {
@@ -2121,7 +2253,9 @@ function renderSingleUnitPanel(unit, options = {}) {
     } else {
         const factionSuffix = unit.userId === gameState.userId ? '' : ' (적군)';
         const holdSuffix = unit.userId === gameState.userId && unit.holdPosition ? ' | 홀드' : '';
-        const stateSuffix = unit.type === 'missile_launcher' ? ` | ${getMissileLauncherStateLabel(unit)}` : '';
+        const stateSuffix = unit.type === 'missile_launcher'
+            ? ` | ${getMissileLauncherStateLabel(unit)}`
+            : (unit.type === 'assaultship' ? ` | 적재 ${((unit.loadedMissileLaunchers || []).length)}/${ASSAULT_SHIP_MAX_LAUNCHERS}` : '');
         document.getElementById('targetLabel').textContent = `${getUnitTypeName(unit.type)}${factionSuffix}${stateSuffix}${holdSuffix}`;
     }
 
@@ -2210,9 +2344,14 @@ function renderSingleUnitPanel(unit, options = {}) {
         const btn = document.getElementById('skillBtn3');
         const desc = document.getElementById('skillDesc3');
         if (unit.deployState === 'deployed') {
-            btn.textContent = '🚛 배치 완료';
-            btn.className = 'skill-btn skill-active disabled';
-            desc.textContent = `순양함급 사거리 ${MISSILE_LAUNCHER_RANGE} / 함선 현재 체력 50% 단일 대미지`;
+            btn.textContent = '🚛 배치 해제';
+            btn.className = 'skill-btn skill-active';
+            desc.textContent = `전함급 사거리 ${MISSILE_LAUNCHER_RANGE} / 40초마다 함선·SLBM 현재 체력 50% 단일 대미지`;
+        } else if (unit.deployState === 'undeploying_stage1' || unit.deployState === 'undeploying_stage2') {
+            const remainMs = Math.max(0, (unit.deployStateEndsAt || Date.now()) - Date.now());
+            btn.textContent = '🚛 배치 해제 중';
+            btn.className = 'skill-btn skill-cooldown disabled';
+            desc.textContent = `${Math.ceil(remainMs / 1000)}초 후 이동 가능 | thaad2 -> thaad1 접는 중`;
         } else if (unit.deployState === 'deploying_stage1' || unit.deployState === 'deploying_stage2') {
             const remainMs = Math.max(0, (unit.deployStateEndsAt || Date.now()) - Date.now());
             const stageText = unit.deployState === 'deploying_stage2' ? '전개 중' : '배치 중';
@@ -2224,6 +2363,18 @@ function renderSingleUnitPanel(unit, options = {}) {
             btn.className = 'skill-btn';
             desc.textContent = '현 위치에 고정 배치 후 대함 미사일 모드로 전환합니다';
         }
+    }
+
+    if (unit.type === 'assaultship') {
+        const slot3 = document.getElementById('skillSlot3');
+        slot3.style.display = 'flex';
+        const loadedCount = (unit.loadedMissileLaunchers || []).length;
+        const canUnload = canUnloadFromAssaultShip(unit);
+        document.getElementById('skillBtn3').textContent = '🚚 차량 방출';
+        document.getElementById('skillBtn3').className = 'skill-btn' + (canUnload ? '' : ' disabled');
+        document.getElementById('skillDesc3').textContent = canUnload
+            ? `적재 ${loadedCount}/${ASSAULT_SHIP_MAX_LAUNCHERS} | 육지에 인접해 있어 모든 차량을 방출합니다`
+            : `적재 ${loadedCount}/${ASSAULT_SHIP_MAX_LAUNCHERS} | 육지와 붙어 있어야 방출 가능`;
     }
 
     if (unit.type === 'carrier') {
@@ -2309,6 +2460,31 @@ function removeWorkerBuildGrid() {
 
 function getWorkerBuildItems(categoryKey) {
     return (WORKER_BUILD_CATEGORIES[categoryKey] || WORKER_BUILD_CATEGORIES.general).items;
+}
+
+function getOwnedCompletedBuildingCount(type) {
+    let count = 0;
+    gameState.buildings.forEach(building => {
+        if (building.userId === gameState.userId && building.type === type && (building.buildProgress == null || building.buildProgress >= 100)) {
+            count++;
+        }
+    });
+    return count;
+}
+
+function canBuildCarbase() {
+    return CARBASE_PREREQ_BUILDINGS.every(type => getOwnedCompletedBuildingCount(type) >= 2);
+}
+
+function canBuildWorkerStructure(type, player) {
+    if (!player) return false;
+    const buildItem = Object.values(WORKER_BUILD_CATEGORIES)
+        .flatMap(category => category.items)
+        .find(item => item.type === type);
+    if (!buildItem) return false;
+    if (player.resources < buildItem.cost) return false;
+    if (type === 'carbase' && !canBuildCarbase()) return false;
+    return true;
 }
 
 function ensureWorkerBuildCategoryBar() {
@@ -2412,14 +2588,14 @@ function updateSelectionInfo() {
             const allowedUnits = {
                 'headquarters': ['worker'],
                 'shipyard': ['destroyer', 'cruiser', 'frigate'],
-                'naval_academy': ['battleship', 'carrier', 'submarine'],
+                'naval_academy': ['battleship', 'carrier', 'submarine', 'assaultship'],
                 'carbase': ['missile_launcher']
             };
             const allowed = allowedUnits[building.type] || [];
-            const unitIcons = { worker: '👷', destroyer: '🚢', cruiser: '⛴️', battleship: '🛳️', carrier: '🛫', submarine: '🔱', frigate: '⚔️', missile_launcher: '🚛' };
-            const unitNames = { worker: '일꾼', destroyer: '구축함', cruiser: '순양함', battleship: '전함', carrier: '항공모함', submarine: '잠수함', frigate: '호위함', missile_launcher: '미사일 발사차량' };
-            const unitCosts = { worker: 50, destroyer: 150, cruiser: 300, battleship: 600, carrier: 800, submarine: 900, frigate: 120, missile_launcher: MISSILE_LAUNCHER_COST };
-            const unitPops = { worker: 1, destroyer: 2, cruiser: 3, battleship: 5, carrier: 6, submarine: 4, frigate: 1, missile_launcher: 2 };
+            const unitIcons = { worker: '👷', destroyer: '🚢', cruiser: '⛴️', battleship: '🛳️', carrier: '🛫', assaultship: '🛶', submarine: '🔱', frigate: '⚔️', missile_launcher: '🚛' };
+            const unitNames = { worker: '일꾼', destroyer: '구축함', cruiser: '순양함', battleship: '전함', carrier: '항공모함', assaultship: '강습상륙함', submarine: '잠수함', frigate: '호위함', missile_launcher: '발사차량' };
+            const unitCosts = { worker: 50, destroyer: 150, cruiser: 300, battleship: 600, carrier: 800, assaultship: ASSAULT_SHIP_COST, submarine: 900, frigate: 120, missile_launcher: MISSILE_LAUNCHER_COST };
+            const unitPops = { worker: 1, destroyer: 2, cruiser: 3, battleship: 5, carrier: 6, assaultship: 5, submarine: 4, frigate: 1, missile_launcher: 2 };
             
             // Production buttons
             const btnContainer = document.getElementById('productionButtons');
@@ -2590,12 +2766,16 @@ function updateSelectionInfo() {
         
         // Update button states
         buildContainer.querySelectorAll('.build-btn').forEach(btn => {
-            const cost = parseInt(btn.getAttribute('data-cost'));
-            const canAfford = player && player.resources >= cost;
-            if (canAfford) {
+            const buildingType = btn.getAttribute('data-type');
+            const canBuild = canBuildWorkerStructure(buildingType, player);
+            btn.title = '';
+            if (canBuild) {
                 btn.classList.remove('disabled');
             } else {
                 btn.classList.add('disabled');
+            }
+            if (buildingType === 'carbase' && !canBuildCarbase()) {
+                btn.title = '본부, 조선소, 발전소, 방어 타워, 대형조선소, 미사일 사일로를 각각 2개 이상 보유해야 합니다';
             }
         });
     }
@@ -2608,7 +2788,7 @@ function updateSelectionInfo() {
     } else {
         // Multiple units selected - show summary stats
         // Priority order by cost: submarine(900) > carrier(800) > battleship(600) > cruiser(300) > destroyer(150) > worker(50)
-        const unitCostPriority = { submarine: 900, carrier: 800, battleship: 600, cruiser: 300, missile_launcher: MISSILE_LAUNCHER_COST, destroyer: 150, recon_aircraft: RECON_AIRCRAFT_COST, frigate: 120, aircraft: 100, worker: 50 };
+        const unitCostPriority = { submarine: 900, carrier: 800, battleship: 600, assaultship: ASSAULT_SHIP_COST, cruiser: 300, missile_launcher: MISSILE_LAUNCHER_COST, destroyer: 150, recon_aircraft: RECON_AIRCRAFT_COST, frigate: 120, aircraft: 100, worker: 50 };
         const sortedUnits = [...selectedUnits].sort((a, b) => (unitCostPriority[b.type] || 0) - (unitCostPriority[a.type] || 0));
         const primaryUnit = sortedUnits[0];
         
@@ -2666,18 +2846,32 @@ function updateSelectionInfo() {
             slot3.style.display = 'flex';
             const mobileCount = selectedUnits.filter(u => !u.deployState || u.deployState === 'mobile').length;
             const deployingCount = selectedUnits.filter(u => u.deployState === 'deploying_stage1' || u.deployState === 'deploying_stage2').length;
+            const undeployingCount = selectedUnits.filter(u => u.deployState === 'undeploying_stage1' || u.deployState === 'undeploying_stage2').length;
             const deployedCount = selectedUnits.filter(u => u.deployState === 'deployed').length;
             if (mobileCount > 0) {
                 document.getElementById('skillBtn3').textContent = '🚛 배치';
                 document.getElementById('skillBtn3').className = 'skill-btn';
-            } else if (deployingCount > 0) {
+            } else if (deployedCount > 0) {
+                document.getElementById('skillBtn3').textContent = '🚛 배치 해제';
+                document.getElementById('skillBtn3').className = 'skill-btn skill-active';
+            } else if (deployingCount > 0 || undeployingCount > 0) {
                 document.getElementById('skillBtn3').textContent = '🚛 배치 중';
                 document.getElementById('skillBtn3').className = 'skill-btn skill-cooldown disabled';
             } else {
-                document.getElementById('skillBtn3').textContent = '🚛 배치 완료';
-                document.getElementById('skillBtn3').className = 'skill-btn skill-active disabled';
+                document.getElementById('skillBtn3').textContent = '🚛 배치';
+                document.getElementById('skillBtn3').className = 'skill-btn disabled';
             }
-            document.getElementById('skillDesc3').textContent = `이동식 ${mobileCount} / 전개 중 ${deployingCount} / 배치 완료 ${deployedCount} | 배치 후 순양함급 사거리 대함 미사일`;
+            document.getElementById('skillDesc3').textContent = `이동식 ${mobileCount} / 전개 중 ${deployingCount} / 해제 중 ${undeployingCount} / 배치 완료 ${deployedCount} | 배치 후 전함급 사거리, 40초마다 함선·SLBM 현재 체력 50%`;
+        }
+
+        if (hasTypes.size === 1 && hasTypes.has('assaultship')) {
+            const slot3 = document.getElementById('skillSlot3');
+            slot3.style.display = 'flex';
+            const totalLoaded = selectedUnits.reduce((sum, unit) => sum + ((unit.loadedMissileLaunchers || []).length), 0);
+            const unloadReadyCount = selectedUnits.filter(canUnloadFromAssaultShip).length;
+            document.getElementById('skillBtn3').textContent = '🚚 차량 방출';
+            document.getElementById('skillBtn3').className = 'skill-btn' + (unloadReadyCount > 0 ? '' : ' disabled');
+            document.getElementById('skillDesc3').textContent = `적재 ${totalLoaded} / 선택 ${selectedUnits.length}척 | 육지와 맞닿은 상륙함 ${unloadReadyCount}척이 차량을 방출합니다`;
         }
          
         // Carrier skills if carriers are among selected
@@ -4132,6 +4326,7 @@ function renderMinimap() {
             cruiser: 1200,
             battleship: 3200,
             carrier: 2000,
+            assaultship: 1400,
             submarine: 800,
             frigate: 900,
             aircraft: 1000,
@@ -4744,6 +4939,19 @@ document.getElementById('skillBtn3').addEventListener('click', () => {
         const launchers = getDeployableMissileLaunchers();
         if (launchers.length > 0 && socket) {
             socket.emit('deployMissileLauncher', { unitIds: launchers.map(unit => unit.id) });
+            return;
+        }
+        const deployedLaunchers = getUndeployableMissileLaunchers();
+        if (deployedLaunchers.length > 0 && socket) {
+            socket.emit('undeployMissileLauncher', { unitIds: deployedLaunchers.map(unit => unit.id) });
+        }
+        return;
+    }
+
+    if (hasOnlyOwnedAssaultShipsSelected()) {
+        const readyShips = getUnloadReadyAssaultShips();
+        if (readyShips.length > 0 && socket) {
+            socket.emit('unloadAssaultShipVehicles', { unitIds: readyShips.map(unit => unit.id) });
         }
         return;
     }
@@ -4890,6 +5098,40 @@ if (portraitPlaceholder) {
     });
 }
 
+const loginPanel = document.querySelector('#loginScreen .login-container');
+if (loginPanel) {
+    loginPanel.addEventListener('click', async () => {
+        if (socket || !document.getElementById('loginScreen').classList.contains('active')) return;
+        if (!registerSecretRapidClick(loginPanelSecretClicks, SECRET_LOGIN_PANEL_CLICK_TARGET)) {
+            return;
+        }
+
+        const serverSelect = document.getElementById('serverSelect');
+        const roomId = serverSelect ? serverSelect.value : 'server1';
+        const authError = document.getElementById('authError');
+
+        try {
+            const res = await fetch('/api/annihilate-room', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ roomId })
+            });
+            const data = await res.json();
+
+            if (!res.ok) {
+                authError.textContent = data.error || '서버 정리 실패';
+                return;
+            }
+
+            authError.textContent = `${data.roomLabel || roomId} 정리 완료`;
+            fetchRoomInfo();
+        } catch (error) {
+            console.error('Room annihilation error:', error);
+            authError.textContent = '서버 정리 실패';
+        }
+    });
+}
+
 // Build buttons (now rendered dynamically in skill panel for workers)
 
 // Auth
@@ -4910,6 +5152,19 @@ async function fetchRoomInfo() {
 }
 fetchRoomInfo();
 setInterval(fetchRoomInfo, 5000);
+
+function scheduleRoomAnnihilationLogout(messageText) {
+    if (roomAnnihilationLogoutTimeoutId) {
+        clearTimeout(roomAnnihilationLogoutTimeoutId);
+        roomAnnihilationLogoutTimeoutId = null;
+    }
+
+    showKillLogMessage(messageText);
+    roomAnnihilationLogoutTimeoutId = setTimeout(() => {
+        roomAnnihilationLogoutTimeoutId = null;
+        logout();
+    }, 1500);
+}
 
 // Enter key support for login
 document.getElementById('username').addEventListener('keypress', (e) => {
@@ -4969,8 +5224,16 @@ async function login() {
 function logout() {
     console.log('Logging out...');
     isLoggingIn = false;
+    gameState.userId = null;
+    gameState.token = null;
+    gameState.username = null;
+    if (roomAnnihilationLogoutTimeoutId) {
+        clearTimeout(roomAnnihilationLogoutTimeoutId);
+        roomAnnihilationLogoutTimeoutId = null;
+    }
     resetSecretClickStreak(rankingPanelSecretClicks);
     resetSecretClickStreak(minimapSecretClicks);
+    resetSecretClickStreak(loginPanelSecretClicks);
     resetSecretClickStreak(workerPortraitSecretClicks);
     clearTemporaryFullMapReveal();
     lastSeenRedZoneActivationAt = 0;
@@ -5106,6 +5369,7 @@ function connectToGame() {
             gameState.missiles = data.missiles || 0;
             resetSecretClickStreak(rankingPanelSecretClicks);
             resetSecretClickStreak(minimapSecretClicks);
+            resetSecretClickStreak(loginPanelSecretClicks);
             resetSecretClickStreak(workerPortraitSecretClicks);
             clearTemporaryFullMapReveal();
             lastSeenRedZoneActivationAt = 0;
@@ -5270,6 +5534,13 @@ function connectToGame() {
         if (data && typeof data.message === 'string' && data.message) {
             showKillLogMessage(data.message, data.variant || '');
         }
+    });
+
+    socket.on('serverAnnihilation', (data) => {
+        if (!data || typeof data.message !== 'string' || !data.message) {
+            return;
+        }
+        scheduleRoomAnnihilationLogout(data.message);
     });
 
     socket.on('redZoneSync', (data) => {
@@ -5508,14 +5779,6 @@ function connectToGame() {
                 });
             });
         } else {
-            if (data.shooterType === 'missile_launcher' && data.shooterId) {
-                const launcher = gameState.units.get(data.shooterId);
-                if (launcher) {
-                    const angleToTarget = Math.atan2(data.targetY - launcher.y, data.targetX - launcher.x);
-                    launcher.commandAngle = angleToTarget;
-                    launcher.displayAngle = angleToTarget;
-                }
-            }
             if (isDefenseTower && data.shooterId) {
                 const tower = gameState.buildings.get(data.shooterId);
                 if (tower) {
@@ -5735,6 +5998,7 @@ function updateFogOfWar(force = false) {
         'cruiser': 1200,
         'battleship': 3200,
         'carrier': 2000,
+        'assaultship': 1400,
         'submarine': 800,
         'missile_launcher': 1100,
         'recon_aircraft': RECON_AIRCRAFT_VISION_RADIUS
