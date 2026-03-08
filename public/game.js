@@ -244,6 +244,7 @@ const RED_ZONE_MINIMAP_BUILDING_BLINK_MS = 500;
 const DESTROYER_VISION_RADIUS = 1000;
 const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
+const SLBM_OWNER_VISION_RADIUS = 1200;
 const BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER = 1.10;
 const BATTLESHIP_AEGIS_RANGE_MULTIPLIER = 1.5;
 const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
@@ -6716,6 +6717,30 @@ function updateFogOfWar(force = false) {
             const offsets = getFogCircleOffsets(gridRadius);
             revealFogArea(gridX, gridY, gridSize, offsets, now);
         }
+    });
+
+    const slbmGridRadius = Math.ceil(SLBM_OWNER_VISION_RADIUS / cellSize);
+    const slbmOffsets = getFogCircleOffsets(slbmGridRadius);
+    slbmMissiles.forEach(missile => {
+        if (missile.userId !== gameState.userId) return;
+
+        let visionX = null;
+        let visionY = null;
+        if (!missile.impacted) {
+            const position = getSlbmWorldPosition(missile, now);
+            if (!position) return;
+            visionX = position.x;
+            visionY = position.y;
+        } else if (missile.impactTime && (now - missile.impactTime < 10000)) {
+            visionX = missile.targetX;
+            visionY = missile.targetY;
+        } else {
+            return;
+        }
+
+        const gridX = Math.floor(visionX / cellSize);
+        const gridY = Math.floor(visionY / cellSize);
+        revealFogArea(gridX, gridY, gridSize, slbmOffsets, now);
     });
 
     const airstrikeGridRadius = Math.ceil(AIRSTRIKE_TARGET_RADIUS / cellSize);

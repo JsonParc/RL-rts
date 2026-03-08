@@ -557,14 +557,18 @@ function destroyUnitFromGame(unit) {
 
 function applyUnitSelfDamage(unit, damage, now = Date.now()) {
   if (!unit || !gameState.units.has(unit.id)) return true;
-  unit.hp = Math.max(0, unit.hp - damage);
+  const currentHp = Math.max(0, unit.hp || 0);
+  if (currentHp <= 0) {
+    destroyUnitFromGame(unit);
+    return true;
+  }
+  const appliedDamage = Math.max(0, Number.isFinite(damage) ? damage : 0);
+  unit.hp = appliedDamage > 0
+    ? Math.max(1, currentHp - appliedDamage)
+    : currentHp;
   unit.lastDamageTime = now;
   if (unit.type === 'frigate') {
     refreshFrigateEngineOverdrive(unit);
-  }
-  if (unit.hp <= 0) {
-    destroyUnitFromGame(unit);
-    return true;
   }
   return false;
 }
@@ -1466,27 +1470,124 @@ function roomEmit(event, data) {
   }
 }
 
-function canNavalUnitOccupyPosition(unit, candidateX, candidateY, navalSpatialMap) {
-  if (!usesNavalContactCollision(unit) || !navalSpatialMap) return true;
+function collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialMap, ignoredIds = null) {
+  const blockers = [];
+  if (!usesNavalContactCollision(unit) || !navalSpatialMap) return blockers;
 
-  let blocked = false;
   const ownEllipse = getSelectionEllipseForUnit(unit);
   const probeRange = Math.max(320, Math.max(ownEllipse.semiMajor, ownEllipse.semiMinor) + 260);
   forEachNearbyEntity(navalSpatialMap, candidateX, candidateY, probeRange, other => {
-    if (blocked || !other || other.id === unit.id || !gameState.units.has(other.id)) return;
+    if (!other || other.id === unit.id || !gameState.units.has(other.id)) return;
+    if (ignoredIds && ignoredIds.has(other.id)) return;
     if (!usesNavalContactCollision(other)) return;
     if (doSelectionEllipsesOverlap(unit, candidateX, candidateY, other, other.x, other.y)) {
-      blocked = true;
+      blockers.push(other);
     }
   }, COLLISION_SPATIAL_CELL_SIZE);
-  return !blocked;
+  return blockers;
+}
+
+function canNavalUnitOccupyPosition(unit, candidateX, candidateY, navalSpatialMap, options = {}) {
+  if (!usesNavalContactCollision(unit) || !navalSpatialMap) return true;
+  const ignoredIds = options.ignoredIds || null;
+  return collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialMap, ignoredIds).length === 0;
+}
+
+function isNavalUnitStationary(unit) {
+  return !!unit
+    && usesNavalContactCollision(unit)
+    && unit.targetX === null
+    && unit.targetY === null
+    && (!Array.isArray(unit.pathWaypoints) || unit.pathWaypoints.length === 0);
+}
+
+function tryDisplaceStationaryNavalBlocker(movingUnit, blocker, desiredX, desiredY, navalSpatialMap) {
+  if (!isNavalUnitStationary(blocker)) return false;
+
+  const moveDx = desiredX - movingUnit.x;
+  const moveDy = desiredY - movingUnit.y;
+  const moveDistance = Math.hypot(moveDx, moveDy) || 1;
+  const forwardX = moveDx / moveDistance;
+  const forwardY = moveDy / moveDistance;
+  const sideX = -forwardY;
+  const sideY = forwardX;
+  const awayDx = blocker.x - desiredX;
+  const awayDy = blocker.y - desiredY;
+  const awayDistance = Math.hypot(awayDx, awayDy) || 1;
+  const awayX = awayDx / awayDistance;
+  const awayY = awayDy / awayDistance;
+  const movingEllipse = getSelectionEllipseForUnit(movingUnit);
+  const blockerEllipse = getSelectionEllipseForUnit(blocker);
+  const shoveDistance = Math.max(
+    blockerEllipse.semiMinor + movingEllipse.semiMinor + 8,
+    blockerEllipse.semiMajor * 0.35
+  );
+
+  const oldX = blocker.x;
+  const oldY = blocker.y;
+  const ignoredIds = new Set([movingUnit.id, blocker.id]);
+  const candidateOffsets = [
+    [sideX, sideY],
+    [-sideX, -sideY],
+    [awayX, awayY],
+    [forwardX * 0.35 + sideX, forwardY * 0.35 + sideY],
+    [forwardX * 0.35 - sideX, forwardY * 0.35 - sideY]
+  ];
+
+  for (let ring = 1; ring <= 3; ring++) {
+    for (let i = 0; i < candidateOffsets.length; i++) {
+      let [dirX, dirY] = candidateOffsets[i];
+      const dirLength = Math.hypot(dirX, dirY) || 1;
+      dirX /= dirLength;
+      dirY /= dirLength;
+      const sampleX = oldX + (dirX * shoveDistance * ring);
+      const sampleY = oldY + (dirY * shoveDistance * ring);
+      const candidate = normalizeFormationTargetForUnit(blocker, sampleX, sampleY);
+      if (!candidate) continue;
+      if (doSelectionEllipsesOverlap(blocker, candidate.x, candidate.y, movingUnit, desiredX, desiredY)) {
+        continue;
+      }
+      if (!canNavalUnitOccupyPosition(blocker, candidate.x, candidate.y, navalSpatialMap, { ignoredIds })) {
+        continue;
+      }
+
+      blocker.x = candidate.x;
+      blocker.y = candidate.y;
+      updateEntitySpatialMapPosition(
+        navalSpatialMap,
+        blocker,
+        oldX,
+        oldY,
+        blocker.x,
+        blocker.y,
+        COLLISION_SPATIAL_CELL_SIZE
+      );
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function tryDisplaceStationaryNavalBlockers(movingUnit, desiredX, desiredY, navalSpatialMap, blockers) {
+  if (!Array.isArray(blockers) || blockers.length <= 0) return true;
+  for (let i = 0; i < blockers.length; i++) {
+    if (!tryDisplaceStationaryNavalBlocker(movingUnit, blockers[i], desiredX, desiredY, navalSpatialMap)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
   if (!usesNavalContactCollision(unit) || !navalSpatialMap) {
     return { x: desiredX, y: desiredY };
   }
-  if (canNavalUnitOccupyPosition(unit, desiredX, desiredY, navalSpatialMap)) {
+  let blockers = collectNavalOverlapBlockers(unit, desiredX, desiredY, navalSpatialMap);
+  if (blockers.length > 0 && tryDisplaceStationaryNavalBlockers(unit, desiredX, desiredY, navalSpatialMap, blockers)) {
+    blockers = collectNavalOverlapBlockers(unit, desiredX, desiredY, navalSpatialMap);
+  }
+  if (blockers.length === 0) {
     return { x: desiredX, y: desiredY };
   }
 
@@ -1498,7 +1599,11 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
     const mid = (low + high) * 0.5;
     const testX = unit.x + ((desiredX - unit.x) * mid);
     const testY = unit.y + ((desiredY - unit.y) * mid);
-    if (canNavalUnitOccupyPosition(unit, testX, testY, navalSpatialMap)) {
+    let midBlockers = collectNavalOverlapBlockers(unit, testX, testY, navalSpatialMap);
+    if (midBlockers.length > 0 && tryDisplaceStationaryNavalBlockers(unit, testX, testY, navalSpatialMap, midBlockers)) {
+      midBlockers = collectNavalOverlapBlockers(unit, testX, testY, navalSpatialMap);
+    }
+    if (midBlockers.length === 0) {
       bestX = testX;
       bestY = testY;
       low = mid;
