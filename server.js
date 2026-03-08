@@ -99,6 +99,8 @@ const FRIGATE_ENGINE_OVERDRIVE_HP_COST_RATIO = 0.10;
 const FRIGATE_ENGINE_OVERDRIVE_SPEED_MULTIPLIER = 1.10;
 const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
 const FRIGATE_ENGINE_OVERDRIVE_TICK_MS = 1000;
+const NAVAL_COLLISION_WAKE_MS = 700;
+const THREAT_SCAN_EXCLUDED_AIR_TYPES = new Set(['aircraft']);
 const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
   DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y,
   DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x
@@ -1034,6 +1036,82 @@ function forEachNearbyEntity(spatialMap, x, y, range, callback, cellSize = COMBA
       }
     }
   }
+}
+
+function someNearbyEntity(spatialMap, x, y, range, predicate, cellSize = COMBAT_SPATIAL_CELL_SIZE) {
+  if (!spatialMap) return false;
+  const centerCellX = Math.floor(x / cellSize);
+  const centerCellY = Math.floor(y / cellSize);
+  const cellRadius = Math.ceil(range / cellSize);
+
+  for (let dy = -cellRadius; dy <= cellRadius; dy++) {
+    for (let dx = -cellRadius; dx <= cellRadius; dx++) {
+      const key = `${centerCellX + dx}_${centerCellY + dy}`;
+      const bucket = spatialMap.get(key);
+      if (!bucket) continue;
+      for (let i = 0; i < bucket.length; i++) {
+        if (predicate(bucket[i])) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function hasNearbyEnemyPresence(
+  ownerUserId,
+  x,
+  y,
+  range,
+  unitSpatialIndex,
+  buildingSpatialIndex,
+  options = {}
+) {
+  const rangeSq = range * range;
+  const excludedUnitTypes = options.excludedUnitTypes || null;
+  const includeBuildings = options.includeBuildings !== false;
+  const ignoreUndetectedStealth = options.ignoreUndetectedStealth !== false;
+
+  if (unitSpatialIndex && someNearbyEntity(unitSpatialIndex, x, y, range, enemy => {
+    if (!enemy || enemy.userId === ownerUserId || enemy.hp <= 0) return false;
+    if (excludedUnitTypes && excludedUnitTypes.has(enemy.type)) return false;
+    if (ignoreUndetectedStealth && (enemy.type === 'submarine' || enemy.type === 'mine') && !enemy.isDetected) return false;
+    const dx = enemy.x - x;
+    const dy = enemy.y - y;
+    return ((dx * dx) + (dy * dy)) <= rangeSq;
+  })) {
+    return true;
+  }
+
+  if (!includeBuildings || !buildingSpatialIndex) return false;
+  return someNearbyEntity(buildingSpatialIndex, x, y, range, building => {
+    if (!building || building.userId === ownerUserId || building.hp <= 0) return false;
+    const dx = building.x - x;
+    const dy = building.y - y;
+    return ((dx * dx) + (dy * dy)) <= rangeSq;
+  });
+}
+
+function hasNearbyAlliedPresence(userId, selfId, x, y, range, unitSpatialIndex, buildingSpatialIndex) {
+  const rangeSq = range * range;
+
+  if (unitSpatialIndex && someNearbyEntity(unitSpatialIndex, x, y, range, ally => {
+    if (!ally || ally.id === selfId || ally.userId !== userId || ally.hp <= 0) return false;
+    const dx = ally.x - x;
+    const dy = ally.y - y;
+    return ((dx * dx) + (dy * dy)) <= rangeSq;
+  })) {
+    return true;
+  }
+
+  if (!buildingSpatialIndex) return false;
+  return someNearbyEntity(buildingSpatialIndex, x, y, range, building => {
+    if (!building || building.userId !== userId || building.hp <= 0) return false;
+    const dx = building.x - x;
+    const dy = building.y - y;
+    return ((dx * dx) + (dy * dy)) <= rangeSq;
+  });
 }
 
 // Load map configuration
@@ -4912,6 +4990,14 @@ function updateGame(deltaTime) {
             unit.y,
             COLLISION_SPATIAL_CELL_SIZE
           );
+          if (
+            unit.targetX !== null ||
+            unit.targetY !== null ||
+            Math.abs(unit.x - moveStartX) > 0.01 ||
+            Math.abs(unit.y - moveStartY) > 0.01
+          ) {
+            unit.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
+          }
         }
       } else {
         // Arrived at current waypoint target
@@ -4968,6 +5054,14 @@ function updateGame(deltaTime) {
             unit.y,
             COLLISION_SPATIAL_CELL_SIZE
           );
+          if (
+            unit.targetX !== null ||
+            unit.targetY !== null ||
+            Math.abs(unit.x - moveStartX) > 0.01 ||
+            Math.abs(unit.y - moveStartY) > 0.01
+          ) {
+            unit.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
+          }
         }
         
         // Worker reached final destination (no more waypoints)
@@ -5385,6 +5479,15 @@ function updateGame(deltaTime) {
     }
   });
 
+  const threatUnitSpatialIndex = new Map();
+  const threatBuildingSpatialIndex = new Map();
+  gameState.units.forEach(unit => {
+    if (unit.hp > 0) addToSpatialMap(threatUnitSpatialIndex, unit);
+  });
+  gameState.buildings.forEach(building => {
+    if (building.hp > 0) addToSpatialMap(threatBuildingSpatialIndex, building);
+  });
+
   // Carrier aircraft system processing
   gameState.units.forEach((unit, unitId) => {
     if (unit.type !== 'carrier') return;
@@ -5434,26 +5537,15 @@ function updateGame(deltaTime) {
     }
      
     // Auto-deploy aircraft when enemies are nearby
-    let enemyNearCarrier = false;
-    gameState.units.forEach(enemy => {
-      if (enemy.userId !== unit.userId && enemy.type !== 'aircraft') {
-        if (enemy.type === 'submarine' && !enemy.isDetected) return;
-        const ex = enemy.x - unit.x;
-        const ey = enemy.y - unit.y;
-        if (Math.sqrt(ex * ex + ey * ey) <= (unit.attackRange || 800) + 200) {
-          enemyNearCarrier = true;
-        }
-      }
-    });
-    gameState.buildings.forEach(enemy => {
-      if (enemy.userId !== unit.userId) {
-        const ex = enemy.x - unit.x;
-        const ey = enemy.y - unit.y;
-        if (Math.sqrt(ex * ex + ey * ey) <= (unit.attackRange || 800) + 200) {
-          enemyNearCarrier = true;
-        }
-      }
-    });
+    const enemyNearCarrier = hasNearbyEnemyPresence(
+      unit.userId,
+      unit.x,
+      unit.y,
+      (unit.attackRange || 800) + 200,
+      threatUnitSpatialIndex,
+      threatBuildingSpatialIndex,
+      { excludedUnitTypes: THREAT_SCAN_EXCLUDED_AIR_TYPES }
+    );
     
     // If carrier has attack target, deploy command, or enemies nearby, deploy aircraft
     if (unit.attackTargetId || unit.deployAircraft || enemyNearCarrier) {
@@ -5517,17 +5609,18 @@ function updateGame(deltaTime) {
     const maxRange = ac.carrierRange || 800;
     
     // Check if there's an enemy in carrier range
-    let hasEnemyNearby = false;
-    gameState.units.forEach(enemy => {
-      if (enemy.userId !== ac.userId && enemy.type !== 'aircraft') {
-        if ((enemy.type === 'submarine' || enemy.type === 'mine') && !enemy.isDetected) return;
-        const ex = enemy.x - carrier.x;
-        const ey = enemy.y - carrier.y;
-        if (Math.sqrt(ex * ex + ey * ey) <= maxRange + 200) {
-          hasEnemyNearby = true;
-        }
+    const hasEnemyNearby = hasNearbyEnemyPresence(
+      ac.userId,
+      carrier.x,
+      carrier.y,
+      maxRange + 200,
+      threatUnitSpatialIndex,
+      null,
+      {
+        excludedUnitTypes: THREAT_SCAN_EXCLUDED_AIR_TYPES,
+        includeBuildings: false
       }
-    });
+    );
     
     if (!hasEnemyNearby && !ac.attackTargetId) {
       // No enemies - return to carrier
@@ -5811,6 +5904,11 @@ function updateGame(deltaTime) {
   for (let i = 0; i < unitArray.length; i++) {
     const a = unitArray[i];
     if (!usesNavalContactCollision(a)) continue;
+    const aCollisionActive =
+      a.targetX !== null
+      || a.targetY !== null
+      || (Number.isFinite(a.collisionWakeUntil) && now < a.collisionWakeUntil);
+    if (!aCollisionActive) continue;
     const cellX = Math.floor(a.x / COLLISION_SPATIAL_CELL_SIZE);
     const cellY = Math.floor(a.y / COLLISION_SPATIAL_CELL_SIZE);
 
@@ -5875,38 +5973,13 @@ function updateGame(deltaTime) {
             a.y -= pushY;
             b.x += pushX;
             b.y += pushY;
+            a.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
+            b.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
           }
         }
       }
     }
   }
-
-  // === Cruiser Lone Wolf passive: check isolation ===
-  gameState.units.forEach((unit) => {
-    if (unit.type !== 'cruiser' || unit.hp <= 0) return;
-    const vr = 1200; // cruiser visionRadius
-    const vrSq = vr * vr;
-    let hasAlly = false;
-    // Check allied units in vision range
-    gameState.units.forEach((other) => {
-      if (hasAlly) return;
-      if (other.id === unit.id || other.userId !== unit.userId || other.hp <= 0) return;
-      const dx = other.x - unit.x;
-      const dy = other.y - unit.y;
-      if (dx * dx + dy * dy <= vrSq) hasAlly = true;
-    });
-    // Check allied buildings in vision range
-    if (!hasAlly) {
-      gameState.buildings.forEach((bld) => {
-        if (hasAlly) return;
-        if (bld.userId !== unit.userId || bld.hp <= 0) return;
-        const dx = bld.x - unit.x;
-        const dy = bld.y - unit.y;
-        if (dx * dx + dy * dy <= vrSq) hasAlly = true;
-      });
-    }
-    unit.isIsolated = !hasAlly;
-  });
 
   // Spatial indexes for combat target search.
   const combatUnitSpatialIndex = new Map();
@@ -5916,6 +5989,20 @@ function updateGame(deltaTime) {
   });
   gameState.buildings.forEach(building => {
     if (building.hp > 0) addToSpatialMap(combatBuildingSpatialIndex, building);
+  });
+
+  // === Cruiser Lone Wolf passive: check isolation ===
+  gameState.units.forEach((unit) => {
+    if (unit.type !== 'cruiser' || unit.hp <= 0) return;
+    unit.isIsolated = !hasNearbyAlliedPresence(
+      unit.userId,
+      unit.id,
+      unit.x,
+      unit.y,
+      1200,
+      combatUnitSpatialIndex,
+      combatBuildingSpatialIndex
+    );
   });
   
   // Combat processing for all units
@@ -6244,6 +6331,8 @@ const AI_CONFIG = {
   unitPriority: ['worker', 'destroyer', 'cruiser', 'frigate', 'submarine', 'battleship', 'carrier'],
   attackerTrackingDuration: 5000, // How long to remember attackers (5 seconds)
   counterattackThreshold: 3, // Minimum attackers to trigger counterattack response
+  priorityTargetDuration: 60000, // Drop stale raid targets after 1 minute
+  maxPriorityTargets: 12,
   // Combat power scoring per unit type
   combatPower: {
     frigate: 5,
@@ -6832,6 +6921,21 @@ function updateAI() {
     // --- COUNTERATTACK DETECTION: Check if AI units were attacked by 3+ enemies ---
     if (!player.recentAttackLocations) player.recentAttackLocations = [];
     if (!player.priorityTargets) player.priorityTargets = [];
+
+    player.priorityTargets = player.priorityTargets
+      .filter(target =>
+        target &&
+        Number.isFinite(target.x) &&
+        Number.isFinite(target.y) &&
+        (now - (target.discoveredAt || now)) < AI_CONFIG.priorityTargetDuration
+      )
+      .sort((a, b) => (a.priority || 0) - (b.priority || 0))
+      .slice(0, AI_CONFIG.maxPriorityTargets)
+      .map((target, index) => ({
+        ...target,
+        discoveredAt: Number.isFinite(target.discoveredAt) ? target.discoveredAt : now,
+        priority: index
+      }));
     
     // Clean up old attack locations
     player.recentAttackLocations = player.recentAttackLocations.filter(
