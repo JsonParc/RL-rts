@@ -854,6 +854,27 @@ let gameState = {
     workerMode: null, // 'gather' or 'build'
     missiles: 0 // Player's missile count
 };
+let selectionInfoSuspendUntil = 0;
+
+function suspendSelectionInfoRefresh(durationMs = 250) {
+    selectionInfoSuspendUntil = Math.max(selectionInfoSuspendUntil, Date.now() + durationMs);
+}
+
+function getClosestProductionButton(target) {
+    const elementTarget = target instanceof Element
+        ? target
+        : (target && target.parentElement ? target.parentElement : null);
+    return elementTarget ? elementTarget.closest('.prod-btn') : null;
+}
+
+function getProductionButtonBuildingId(btn) {
+    if (!btn) return null;
+    if (btn._buildingId !== undefined) return btn._buildingId;
+    const raw = btn.getAttribute('data-building');
+    if (raw == null) return null;
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : raw;
+}
 
 function resetSecretClickStreak(streak) {
     streak.count = 0;
@@ -2502,6 +2523,31 @@ function canBuildWorkerStructure(type, player) {
     return true;
 }
 
+function getProductionUnitSummary(unitType, pop) {
+    switch (unitType) {
+        case 'worker':
+            return `인구 ${pop} | 건설, 수리, 채집 담당`;
+        case 'destroyer':
+            return `인구 ${pop} | 기뢰 매설과 잠수함 탐지 보조`;
+        case 'cruiser':
+            return `인구 ${pop} | 중형 화력, 이지스 모드 운용 가능`;
+        case 'frigate':
+            return `인구 ${pop} | 값싼 초반 해상 전투 유닛`;
+        case 'battleship':
+            return `인구 ${pop} | 장거리 주력 화력함`;
+        case 'carrier':
+            return `인구 ${pop} | 함재기와 정찰기 운용`;
+        case 'submarine':
+            return `인구 ${pop} | 잠항 기습과 은밀한 압박`;
+        case 'assaultship':
+            return `인구 ${pop} | 발사차량 적재 및 상륙 지원`;
+        case 'missile_launcher':
+            return `인구 ${pop} | 배치 후 전함급 사거리에서 함선·SLBM 현재 체력 50% 타격`;
+        default:
+            return `인구 ${pop}`;
+    }
+}
+
 function ensureWorkerBuildCategoryBar() {
     const workerBuildMenu = document.getElementById('workerBuildMenu');
     if (!workerBuildMenu) return null;
@@ -2553,10 +2599,7 @@ function updateSelectionInfo() {
     document.getElementById('slbmProgressBar').style.display = 'none';
     document.getElementById('aircraftProgressBar').style.display = 'none';
     
-    // Clear production buttons when hiding production display
     const btnContainer = document.getElementById('productionButtons');
-    btnContainer.innerHTML = '';
-    btnContainer.removeAttribute('data-building-type');
     
     if (gameState.selection.size === 0 && !inspectedUnit) {
         // Remove worker build grid if exists when nothing is selected
@@ -2617,30 +2660,32 @@ function updateSelectionInfo() {
             const player = gameState.players.get(gameState.userId);
             const queueLen = (building.productionQueue || []).length;
             
-            // Check if we need to recreate buttons (building type changed or first time)
-            const currentBuildingType = btnContainer.getAttribute('data-building-type');
-            if (currentBuildingType !== building.type) {
+            // Only recreate when the production roster actually changes.
+            const productionKey = `${building.type}:${allowed.join(',')}`;
+            const currentProductionKey = btnContainer.getAttribute('data-production-key');
+            if (currentProductionKey !== productionKey) {
                 btnContainer.innerHTML = '';
-                btnContainer.setAttribute('data-building-type', building.type);
+                btnContainer.setAttribute('data-production-key', productionKey);
             }
             
-            // Only create buttons if they don't exist
             if (btnContainer.children.length === 0) {
                 btnContainer.innerHTML = allowed.map(uType => {
                     const cost = unitCosts[uType];
-                    return `<button class="prod-btn" data-type="${uType}" data-building="${building.id}">${unitNames[uType]}<br><span style="font-size:9px">${cost}</span></button>`;
+                    const pop = unitPops[uType];
+                    const summary = getProductionUnitSummary(uType, pop);
+                    return `
+                        <button class="prod-btn prod-btn-row" data-type="${uType}" data-building="${building.id}">
+                            <span class="prod-btn-main">
+                                <span class="prod-btn-name">${unitNames[uType]}</span>
+                                <span class="prod-btn-cost">${cost} 에너지</span>
+                            </span>
+                            <span class="prod-btn-desc">${summary}</span>
+                        </button>
+                    `;
                 }).join('');
                 
-                // Add click handlers (only once)
-                btnContainer.querySelectorAll('.prod-btn').forEach(btn => {
-                    btn.onclick = () => {
-                        if (btn.classList.contains('disabled')) return;
-                        socket.emit('buildUnit', { buildingId: building.id, unitType: btn.getAttribute('data-type') });
-                    };
-                });
             }
             
-            // Update button states
             btnContainer.querySelectorAll('.prod-btn').forEach(btn => {
                 const uType = btn.getAttribute('data-type');
                 const cost = unitCosts[uType];
@@ -2648,13 +2693,14 @@ function updateSelectionInfo() {
                 const canAfford = player && player.resources >= cost && player.population + pop <= player.maxPopulation;
                 const queueFull = queueLen >= 10;
                 const shouldDisable = !canAfford || queueFull || building.buildProgress < 100;
+                btn.setAttribute('data-building', building.id);
+                btn._buildingId = building.id;
                 
                 if (shouldDisable) {
                     btn.classList.add('disabled');
                 } else {
                     btn.classList.remove('disabled');
                 }
-                btn.title = `${unitNames[uType]} (비용: ${cost}, 인구: ${pop})`;
             });
             
             // Queue icons
@@ -5067,6 +5113,29 @@ document.getElementById('skillBtn8').addEventListener('click', () => {
     }
 });
 
+const productionButtons = document.getElementById('productionButtons');
+if (productionButtons) {
+    productionButtons.addEventListener('pointerdown', (event) => {
+        const btn = getClosestProductionButton(event.target);
+        if (!btn) return;
+        event.preventDefault();
+        event.stopPropagation();
+        suspendSelectionInfoRefresh(300);
+        if (btn.classList.contains('disabled') || !socket) return;
+        socket.emit('buildUnit', {
+            buildingId: getProductionButtonBuildingId(btn),
+            unitType: btn.getAttribute('data-type')
+        });
+    });
+
+    productionButtons.addEventListener('click', (event) => {
+        const btn = getClosestProductionButton(event.target);
+        if (!btn) return;
+        event.preventDefault();
+        event.stopPropagation();
+    });
+}
+
 function updateRankings() {
     const roomId = gameState.selectedRoom || localStorage.getItem('selectedRoom') || 'server1';
     const query = new URLSearchParams({ roomId });
@@ -5529,7 +5598,7 @@ function connectToGame() {
         }
         
         updateHUD();
-        if (gameState.selection.size > 0 || gameState.inspectedUnitId) {
+        if ((gameState.selection.size > 0 || gameState.inspectedUnitId) && nowMs >= selectionInfoSuspendUntil) {
             updateSelectionInfo(); // Refresh production progress bar etc.
         }
     });

@@ -730,6 +730,7 @@ function buildClientBuildingsPayload() {
       buildProgress: building.buildProgress,
       slbmCount: building.slbmCount ?? 0,
       producing: building.producing ?? null,
+      productionQueue: building.productionQueue ?? [],
       missileProducing: building.missileProducing ?? null,
       missileQueue: building.missileQueue ?? [],
       attackTargetId: building.attackTargetId ?? null,

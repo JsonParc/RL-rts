@@ -656,22 +656,75 @@ body {
 }
 
 /* Production buttons in skill panel */
+.production-button-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 6px;
+}
+
 .prod-btn {
-    width: 44px;
-    height: 44px;
+    width: 100%;
+    min-height: 44px;
     background: var(--ui-button-bg);
     border: 1px solid var(--ui-border);
     color: #fff;
     border-radius: 4px;
     cursor: pointer;
-    font-size: 18px;
-    line-height: 1;
-    padding: 2px;
-    transition: background 0.15s ease;
+    font-size: 12px;
+    line-height: 1.2;
+    padding: 0;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+    text-align: left;
+    overflow: hidden;
+}
+
+.prod-btn-row {
+    display: flex;
+    align-items: stretch;
+}
+
+.prod-btn-row:active:not(.disabled) {
+    transform: translateY(1px);
+}
+
+.prod-btn-main {
+    width: 92px;
+    min-width: 92px;
+    padding: 8px 10px;
+    border-right: 1px solid var(--ui-border-soft);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.prod-btn-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: #f3f6f8;
+    line-height: 1.05;
+    word-break: keep-all;
+}
+
+.prod-btn-cost {
+    font-size: 10px;
+    color: #adb8c2;
+}
+
+.prod-btn-desc {
+    flex: 1;
+    padding: 8px 12px;
+    color: var(--ui-accent-muted);
+    display: flex;
+    align-items: center;
+    line-height: 1.35;
 }
 
 .prod-btn:hover:not(.disabled) {
     background: var(--ui-button-hover);
+    border-color: var(--ui-accent-strong);
 }
 
 .prod-btn.disabled {
@@ -680,6 +733,12 @@ body {
     color: #666;
     cursor: not-allowed;
     opacity: 0.6;
+}
+
+.prod-btn.disabled .prod-btn-name,
+.prod-btn.disabled .prod-btn-cost,
+.prod-btn.disabled .prod-btn-desc {
+    color: #7a8188;
 }
 
 .build-btn small, .unit-btn small {
