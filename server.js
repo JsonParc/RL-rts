@@ -32,9 +32,8 @@ const AIRSTRIKE_PASS_INTERVAL_MS = 667;
 const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
 const RECON_AIRCRAFT_BUILD_TIME_MS = 18000;
 const RECON_AIRCRAFT_LOITER_MS = 8000;
-const RECON_AIRCRAFT_TARGET_THRESHOLD = 120;
+const RECON_AIRCRAFT_TARGET_THRESHOLD = 8;
 const RECON_AIRCRAFT_DOCK_RADIUS = 90;
-const RECON_AIRCRAFT_ORBIT_RADIUS = 160;
 const RED_ZONE_SELECTION_INTERVAL_MS = 10 * 60 * 1000;
 const RED_ZONE_WARNING_DURATION_MS = 30 * 1000;
 const RED_ZONE_COUNTDOWN_START_MS = 10 * 1000;
@@ -1277,8 +1276,8 @@ function assignMoveTarget(unit, targetX, targetY) {
   if (!unit) return false;
   const clampedTarget = clampToMapBounds(targetX, targetY);
 
-  if (unit.type === 'worker' || isAirUnitType(unit)) {
-    // Workers and aircraft can move anywhere (land + water)
+  if (unit.type === 'worker') {
+    // Workers can move anywhere (land + water) and still use pathfinding.
     const path = findPath(unit.x, unit.y, clampedTarget.x, clampedTarget.y, 'worker');
     if (path && path.length > 1) {
       unit.pathWaypoints = path.slice(1); // skip current position
@@ -1290,6 +1289,14 @@ function assignMoveTarget(unit, targetX, targetY) {
       unit.targetX = clampedTarget.x;
       unit.targetY = clampedTarget.y;
     }
+    return true;
+  }
+
+  if (isAirUnitType(unit)) {
+    // Air units ignore terrain and collisions, so they move directly.
+    unit.pathWaypoints = null;
+    unit.targetX = clampedTarget.x;
+    unit.targetY = clampedTarget.y;
     return true;
   }
 
@@ -2410,23 +2417,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  function getReconAircraftLaunchTarget(targetX, targetY, launchIndex, totalCount) {
-    if (totalCount <= 1) {
-      return clampToMapBounds(targetX, targetY);
-    }
-
-    const angle = (Math.PI * 2 * launchIndex) / totalCount;
-    const radius = totalCount === 2 ? RECON_AIRCRAFT_ORBIT_RADIUS * 0.7 : RECON_AIRCRAFT_ORBIT_RADIUS;
-    return clampToMapBounds(
-      targetX + Math.cos(angle) * radius,
-      targetY + Math.sin(angle) * radius
-    );
+  function getReconAircraftLaunchTarget(targetX, targetY) {
+    return clampToMapBounds(targetX, targetY);
   }
 
-  function spawnReconAircraftFromCarrier(carrier, targetX, targetY, reconStock, launchIndex, totalCount, now) {
+  function spawnReconAircraftFromCarrier(carrier, targetX, targetY, reconStock, launchIndex, now) {
     const reconConfig = getUnitDefinition('recon_aircraft');
     const reconId = createUniqueEntityId(700 + launchIndex);
-    const assignedTarget = getReconAircraftLaunchTarget(targetX, targetY, launchIndex, totalCount);
+    const assignedTarget = getReconAircraftLaunchTarget(targetX, targetY);
     const spawnPos = findNonOverlappingPosition(
       carrier.x + (Math.random() - 0.5) * 50,
       carrier.y + (Math.random() - 0.5) * 50,
@@ -2461,7 +2459,6 @@ io.on('connection', (socket) => {
       scoutBaseTargetY: targetY,
       scoutState: 'outbound',
       scoutLoiterUntil: null,
-      scoutOrbitAngle: Math.random() * Math.PI * 2,
       scoutNextOrbitAt: now,
       holdPosition: true
     };
@@ -2485,8 +2482,7 @@ io.on('connection', (socket) => {
     const reconStock = carrier.reconAircraft.pop();
     const deployedCount = carrier.reconAircraftDeployed.length;
     const launchIndex = deployedCount % RECON_AIRCRAFT_MAX_PER_CARRIER;
-    const activeCount = Math.min(RECON_AIRCRAFT_MAX_PER_CARRIER, deployedCount + 1);
-    spawnReconAircraftFromCarrier(carrier, clamped.x, clamped.y, reconStock, launchIndex, activeCount, now);
+    spawnReconAircraftFromCarrier(carrier, clamped.x, clamped.y, reconStock, launchIndex, now);
   });
   
   // Carrier: deploy aircraft
@@ -4056,11 +4052,14 @@ function updateGame(deltaTime) {
         assignMoveTarget(recon, recon.scoutTargetX, recon.scoutTargetY);
       }
       if (distToAssignedTarget <= RECON_AIRCRAFT_TARGET_THRESHOLD) {
+        recon.x = recon.scoutTargetX;
+        recon.y = recon.scoutTargetY;
         recon.scoutState = 'loiter';
         recon.scoutLoiterUntil = now + RECON_AIRCRAFT_LOITER_MS;
         recon.scoutNextOrbitAt = now;
         recon.targetX = null;
         recon.targetY = null;
+        recon.pathWaypoints = null;
       }
       return;
     }
@@ -4069,27 +4068,21 @@ function updateGame(deltaTime) {
       if (!Number.isFinite(recon.scoutLoiterUntil) || now >= recon.scoutLoiterUntil) {
         recon.scoutState = 'returning';
         recon.scoutNextOrbitAt = now;
-        assignMoveTarget(recon, carrier.x + (Math.random() - 0.5) * 40, carrier.y + (Math.random() - 0.5) * 40);
+        assignMoveTarget(recon, carrier.x, carrier.y);
         return;
       }
 
-      const needNewOrbitPoint =
-        !Number.isFinite(recon.targetX) ||
-        !Number.isFinite(recon.targetY) ||
-        now >= (recon.scoutNextOrbitAt || 0) ||
-        distToAssignedTarget <= RECON_AIRCRAFT_TARGET_THRESHOLD * 0.65;
-
-      if (needNewOrbitPoint) {
-        recon.scoutOrbitAngle = (recon.scoutOrbitAngle || 0) + (Math.PI / 2) + (Math.random() * 0.8);
-        const orbitTarget = clampToMapBounds(
-          baseTargetX + Math.cos(recon.scoutOrbitAngle) * RECON_AIRCRAFT_ORBIT_RADIUS,
-          baseTargetY + Math.sin(recon.scoutOrbitAngle) * RECON_AIRCRAFT_ORBIT_RADIUS
-        );
-        recon.scoutTargetX = orbitTarget.x;
-        recon.scoutTargetY = orbitTarget.y;
-        recon.scoutNextOrbitAt = now + 900 + Math.floor(Math.random() * 500);
-        assignMoveTarget(recon, orbitTarget.x, orbitTarget.y);
+      if (
+        distToAssignedTarget > RECON_AIRCRAFT_TARGET_THRESHOLD &&
+        (!Number.isFinite(recon.targetX) || !Number.isFinite(recon.targetY))
+      ) {
+        assignMoveTarget(recon, baseTargetX, baseTargetY);
+        return;
       }
+
+      recon.targetX = null;
+      recon.targetY = null;
+      recon.pathWaypoints = null;
       return;
     }
 
@@ -4107,7 +4100,7 @@ function updateGame(deltaTime) {
         now >= (recon.scoutNextOrbitAt || 0)
       ) {
         recon.scoutNextOrbitAt = now + 600;
-        assignMoveTarget(recon, carrier.x + (Math.random() - 0.5) * 40, carrier.y + (Math.random() - 0.5) * 40);
+        assignMoveTarget(recon, carrier.x, carrier.y);
       }
     }
   });
