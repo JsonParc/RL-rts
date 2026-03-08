@@ -64,6 +64,34 @@ const ASSAULT_SHIP_COST = 500;
 const ASSAULT_SHIP_MAX_LAUNCHERS = 10;
 const ASSAULT_SHIP_LOAD_RADIUS = 260;
 const ASSAULT_SHIP_LAND_RADIUS = 260;
+const PLAYER_BASE_POPULATION_CAP = 10;
+const HEADQUARTERS_POPULATION_BONUS = 20;
+const PLAYER_MAX_POPULATION_CAP = 250;
+const BUILDING_POPULATION_BONUSES = Object.freeze({
+  headquarters: HEADQUARTERS_POPULATION_BONUS,
+  naval_academy: 10,
+  shipyard: 5,
+  power_plant: 3
+});
+const STARTING_MAX_POPULATION = Math.min(
+  PLAYER_MAX_POPULATION_CAP,
+  PLAYER_BASE_POPULATION_CAP + HEADQUARTERS_POPULATION_BONUS
+);
+const UNIT_COMBAT_POWER_VALUES = Object.freeze({
+  destroyer: 150,
+  cruiser: 100,
+  battleship: 200,
+  carrier: 180,
+  submarine: 200,
+  frigate: 30,
+  assaultship: 100,
+  missile_launcher: 100,
+  slbm: 200
+});
+const GENERAL_BUILDING_COMBAT_POWER = 120;
+const ADVANCED_BUILDING_COMBAT_POWER = 150;
+const GENERAL_BUILDING_TYPES = new Set(['headquarters', 'power_plant', 'shipyard']);
+const ADVANCED_BUILDING_TYPES = new Set(['defense_tower', 'naval_academy', 'missile_silo', 'carbase', 'research_lab']);
 const BATTLESHIP_AEGIS_TURRET_COUNT = 3;
 const BATTLESHIP_AEGIS_DAMAGE = 10;
 const BATTLESHIP_AEGIS_RANGE_MULTIPLIER = 1.5;
@@ -303,6 +331,95 @@ function getUnitPopulationCost(unit) {
   return basePop + getLoadedAssaultShipCargo(unit).reduce((sum, storedUnit) => (
     sum + getStoredAssaultShipUnitPopulationCost(storedUnit)
   ), 0);
+}
+
+function clampPlayerMaxPopulation(value) {
+  if (!Number.isFinite(value)) return PLAYER_BASE_POPULATION_CAP;
+  return Math.max(PLAYER_BASE_POPULATION_CAP, Math.min(PLAYER_MAX_POPULATION_CAP, Math.floor(value)));
+}
+
+function getBuildingPopulationBonus(buildingType) {
+  return BUILDING_POPULATION_BONUSES[buildingType] || 0;
+}
+
+function normalizeCombatPowerBuildingType(buildingType) {
+  return buildingType === 'research_lab' ? 'missile_silo' : buildingType;
+}
+
+function getUnitCombatPowerValue(unitOrType) {
+  const unitType = typeof unitOrType === 'string' ? unitOrType : unitOrType?.type;
+  return UNIT_COMBAT_POWER_VALUES[unitType] || 0;
+}
+
+function getBuildingCombatPowerValue(buildingOrType) {
+  const buildingType = normalizeCombatPowerBuildingType(
+    typeof buildingOrType === 'string' ? buildingOrType : buildingOrType?.type
+  );
+  if (GENERAL_BUILDING_TYPES.has(buildingType)) return GENERAL_BUILDING_COMBAT_POWER;
+  if (ADVANCED_BUILDING_TYPES.has(buildingType)) return ADVANCED_BUILDING_COMBAT_POWER;
+  return 0;
+}
+
+function getCombatPowerRewardForTarget(target, targetType) {
+  if (targetType === 'slbm') return getUnitCombatPowerValue('slbm');
+  if (targetType === 'building') return getBuildingCombatPowerValue(target);
+  return getUnitCombatPowerValue(target);
+}
+
+function getPlayerScoreFromKills(player) {
+  if (!player) return 0;
+  return Number.isFinite(player.scoreFromKills) ? Math.max(0, Math.floor(player.scoreFromKills)) : 0;
+}
+
+function awardCombatScore(playerOrUserId, amount) {
+  if (!Number.isFinite(amount) || amount <= 0) return;
+  const player = typeof playerOrUserId === 'object'
+    ? playerOrUserId
+    : gameState.players.get(playerOrUserId);
+  if (!player) return;
+  player.scoreFromKills = getPlayerScoreFromKills(player) + Math.floor(amount);
+  player.score = calculatePlayerScore(player);
+}
+
+function recalculateAllPlayerCombatPowerAndScores() {
+  const combatPowerByUserId = new Map();
+  gameState.players.forEach((_, userId) => {
+    combatPowerByUserId.set(userId, 0);
+  });
+
+  gameState.units.forEach(unit => {
+    if (!unit || unit.hp <= 0) return;
+    const userId = unit.userId;
+    if (userId == null) return;
+    combatPowerByUserId.set(
+      userId,
+      (combatPowerByUserId.get(userId) || 0) + getUnitCombatPowerValue(unit)
+    );
+  });
+
+  gameState.buildings.forEach(building => {
+    if (!building || building.hp <= 0 || building.buildProgress < 100) return;
+    const userId = building.userId;
+    if (userId == null) return;
+    combatPowerByUserId.set(
+      userId,
+      (combatPowerByUserId.get(userId) || 0) + getBuildingCombatPowerValue(building)
+    );
+  });
+
+  gameState.activeSlbms.forEach(slbm => {
+    if (!slbm || slbm.userId == null) return;
+    combatPowerByUserId.set(
+      slbm.userId,
+      (combatPowerByUserId.get(slbm.userId) || 0) + getUnitCombatPowerValue('slbm')
+    );
+  });
+
+  gameState.players.forEach(player => {
+    const missileCombatPower = Math.max(0, Math.floor(player.missiles || 0)) * getUnitCombatPowerValue('slbm');
+    player.combatPower = (combatPowerByUserId.get(player.userId) || 0) + missileCombatPower;
+    player.score = calculatePlayerScore(player);
+  });
 }
 
 function getCompletedOwnedBuildingCount(userId, type) {
@@ -614,21 +731,21 @@ function destroyCombatTargetByUnit(attackerUnit, target, targetType) {
   if (targetType === 'slbm') {
     emitSlbmDestroyedEvent({ id: target.id, x: target.currentX, y: target.currentY, userId: target.userId });
     gameState.activeSlbms.delete(target.id);
-    if (attacker) attacker.combatPower += 30;
+    awardCombatScore(attacker, getCombatPowerRewardForTarget(target, 'slbm'));
     registerUnitKill(attackerUnit);
     return;
   }
 
   if (targetType === 'unit') {
     destroyUnitFromGame(target);
-    if (attacker) attacker.combatPower += 10;
+    awardCombatScore(attacker, getCombatPowerRewardForTarget(target, 'unit'));
     registerUnitKill(attackerUnit);
     return;
   }
 
   emitBuildingDestroyedEvent(target);
   gameState.buildings.delete(target.id);
-  if (attacker) attacker.combatPower += 20;
+  awardCombatScore(attacker, getCombatPowerRewardForTarget(target, 'building'));
   checkPlayerDefeat(target.userId, attackerUnit.userId);
 }
 
@@ -859,7 +976,7 @@ const UNIT_DEFINITIONS = {
   },
   carrier: {
     cost: 800,
-    pop: 6,
+    pop: 12,
     hp: 900,
     damage: 0,
     speed: 8,
@@ -871,7 +988,7 @@ const UNIT_DEFINITIONS = {
   },
   assaultship: {
     cost: ASSAULT_SHIP_COST,
-    pop: 5,
+    pop: 10,
     hp: 2000,
     damage: 0,
     speed: 7,
@@ -883,7 +1000,7 @@ const UNIT_DEFINITIONS = {
   },
   submarine: {
     cost: 900,
-    pop: 4,
+    pop: 8,
     hp: 260,
     damage: 110,
     speed: 8,
@@ -931,7 +1048,7 @@ const UNIT_DEFINITIONS = {
   },
   missile_launcher: {
     cost: MISSILE_LAUNCHER_COST,
-    pop: 2,
+    pop: 4,
     hp: 260,
     damage: 0,
     speed: 6,
@@ -2076,11 +2193,10 @@ function annihilateRoom(roomId, message = ROOM_ANNIHILATION_MESSAGE) {
 function calculatePlayerScore(player) {
   if (!player) return 0;
 
-  const resources = Number.isFinite(player.resources) ? player.resources : 0;
-  const population = Number.isFinite(player.population) ? player.population : 0;
   const combatPower = Number.isFinite(player.combatPower) ? player.combatPower : 0;
+  const scoreFromKills = getPlayerScoreFromKills(player);
 
-  return Math.floor(resources + population * 100 + combatPower * 50);
+  return Math.floor(combatPower + scoreFromKills);
 }
 
 // Initialize map
@@ -3167,9 +3283,10 @@ app.post('/api/reset', async (req, res) => {
       if (player) {
         player.resources = 1000;
         player.population = 0;
-        player.maxPopulation = 10;
+        player.maxPopulation = STARTING_MAX_POPULATION;
         player.combatPower = 0;
         player.score = 0;
+        player.scoreFromKills = 0;
         player.baseX = roomFinalX;
         player.baseY = roomFinalY;
         player.hasBase = true;
@@ -3206,10 +3323,10 @@ app.post('/api/reset', async (req, res) => {
     const basePosForPersistence = persistedBasePos || { x: finalX, y: finalY };
     try {
       db.prepare(`UPDATE player_data SET 
-        resources = 1000, population = 0, max_population = 10,
+        resources = 1000, population = 0, max_population = ?,
         combat_power = 0, score = 0, base_x = ?, base_y = ?,
         has_base = 1, researched_slbm = 0, missiles = 0
-        WHERE user_id = ?`).run(basePosForPersistence.x, basePosForPersistence.y, userId);
+        WHERE user_id = ?`).run(STARTING_MAX_POPULATION, basePosForPersistence.x, basePosForPersistence.y, userId);
     } catch(e) { /* no-op for temp users */ }
     
     console.log(`Reset game data for user ${userId} - new base at (${basePosForPersistence.x.toFixed(0)}, ${basePosForPersistence.y.toFixed(0)})`);
@@ -3438,20 +3555,22 @@ function spawnPlayerBase(userId) {
     player.baseY = startPos.y;
     player.hasBase = true;
     player.population = 4; // 4 workers
+    player.maxPopulation = STARTING_MAX_POPULATION;
+    player.scoreFromKills = getPlayerScoreFromKills(player);
   }
   
   // Update database (skip for AI players)
   const isAI = player && player.isAI;
   if (!isAI) {
     try {
-      db.prepare('UPDATE player_data SET base_x = ?, base_y = ?, has_base = 1, population = 4 WHERE user_id = ?').run(startPos.x, startPos.y, userId);
+      db.prepare('UPDATE player_data SET base_x = ?, base_y = ?, has_base = 1, population = 4, max_population = ? WHERE user_id = ?').run(startPos.x, startPos.y, STARTING_MAX_POPULATION, userId);
     } catch(e) { /* no-op: temp user has no DB row */ }
   }
   
   return startPos;
 }
 
-// Admin spawn for "JsonParc" - all buildings + all units + 100k energy + 300 pop
+// Admin spawn for "JsonParc" - all buildings + all units + 100k energy + 250 pop
 function spawnAdminBase(userId) {
   // First do normal spawn to get base position
   const startPos = spawnPlayerBase(userId);
@@ -3460,7 +3579,7 @@ function spawnAdminBase(userId) {
 
   // Set admin resources
   player.resources = 100000;
-  player.maxPopulation = 300;
+  player.maxPopulation = PLAYER_MAX_POPULATION_CAP;
   player.researchedSLBM = true;
   player.missiles = 10;
 
@@ -3584,16 +3703,17 @@ function checkPlayerDefeat(userId, attackerId = null, attackerNameOverride = nul
     defeatedPlayer.resources = 1000;
     defeatedPlayer.combatPower = 0;
     defeatedPlayer.score = 0;
-    defeatedPlayer.maxPopulation = 10;
+    defeatedPlayer.scoreFromKills = 0;
+    defeatedPlayer.maxPopulation = STARTING_MAX_POPULATION;
     defeatedPlayer.researchedSLBM = false;
     defeatedPlayer.missiles = 0;
 
     try {
       db.prepare(`UPDATE player_data SET 
         has_base = 0, population = 0, resources = 1000, 
-        combat_power = 0, score = 0, max_population = 10,
+        combat_power = 0, score = 0, max_population = ?,
         researched_slbm = 0, missiles = 0
-        WHERE user_id = ?`).run(userId);
+        WHERE user_id = ?`).run(STARTING_MAX_POPULATION, userId);
     } catch(e) { /* no-op for temp users */ }
 
     // Respawn base at new location (findStartPosition avoids existing bases)
@@ -3653,9 +3773,10 @@ io.on('connection', (socket) => {
       username: socket.username,
       resources: 1000,
       population: 0,
-      maxPopulation: 10,
+      maxPopulation: STARTING_MAX_POPULATION,
       combatPower: 0,
       score: 0,
+      scoreFromKills: 0,
       baseX: 0,
       baseY: 0,
       hasBase: false,
@@ -3685,6 +3806,7 @@ io.on('connection', (socket) => {
     }
     
     console.log(`Player ${socket.username} spawned fresh`);
+    recalculateAllPlayerCombatPowerAndScores();
     
     // Send initial game state
     const player = gameState.players.get(socket.userId);
@@ -4495,9 +4617,10 @@ function loadPlayerData(userId) {
         username: user.username,
         resources: playerData.resources,
         population: playerData.population,
-        maxPopulation: playerData.max_population,
-        combatPower: playerData.combat_power,
-        score: playerData.score,
+        maxPopulation: clampPlayerMaxPopulation(playerData.max_population),
+        combatPower: 0,
+        score: 0,
+        scoreFromKills: Math.max(0, Math.floor(playerData.score || 0)),
         baseX: playerData.base_x,
         baseY: playerData.base_y,
         hasBase: playerData.has_base === 1,
@@ -4583,12 +4706,6 @@ function loadPlayerData(userId) {
     const buildings = db.prepare('SELECT * FROM buildings WHERE user_id = ?').all(userId);
     console.log(`Loaded ${buildings.length} buildings for user ${userId}`);
     
-    // Calculate population bonus from completed buildings
-    const populationBonuses = {
-      'naval_academy': 10,
-      'shipyard': 5,
-      'power_plant': 3
-    };
     let totalPopBonus = 0;
     let headquartersPos = null;
     let hasCompletedSilo = false;
@@ -4647,8 +4764,8 @@ function loadPlayerData(userId) {
       }
       
       // Add population bonus for completed buildings
-      if (isComplete && populationBonuses[normalizedType]) {
-        totalPopBonus += populationBonuses[normalizedType];
+      if (isComplete) {
+        totalPopBonus += getBuildingPopulationBonus(normalizedType);
       }
       if (isComplete && normalizedType === 'missile_silo') {
         hasCompletedSilo = true;
@@ -4658,8 +4775,7 @@ function loadPlayerData(userId) {
     // Apply total population bonus to player and fix baseX/baseY
     const player = gameState.players.get(userId);
     if (player) {
-      // Start with base 10 + bonuses from buildings
-      player.maxPopulation = 10 + totalPopBonus;
+      player.maxPopulation = clampPlayerMaxPopulation(PLAYER_BASE_POPULATION_CAP + totalPopBonus);
       if (hasCompletedSilo) player.researchedSLBM = true;
       console.log(`Player ${userId} maxPopulation set to ${player.maxPopulation}`);
       
@@ -4671,6 +4787,7 @@ function loadPlayerData(userId) {
           .run(headquartersPos.x, headquartersPos.y, userId);
       }
     }
+    recalculateAllPlayerCombatPowerAndScores();
   } catch (error) {
     console.error('Error loading player data:', error);
     throw error;
@@ -4688,7 +4805,7 @@ function savePlayerData(userId) {
     missiles = ?, last_active = CURRENT_TIMESTAMP 
     WHERE user_id = ?`).run(
     player.resources, player.population, player.maxPopulation,
-    player.combatPower, player.score, player.hasBase ? 1 : 0, 
+    player.combatPower, getPlayerScoreFromKills(player), player.hasBase ? 1 : 0, 
     player.researchedSLBM ? 1 : 0, player.missiles || 0, userId
   );
   
@@ -4978,7 +5095,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
         destroyUnitFromGame(target);
       }
       if (firingSub) registerUnitKill(firingSub);
-      if (firingPlayer) firingPlayer.combatPower += 10;
+      awardCombatScore(firingPlayer, getCombatPowerRewardForTarget(target, 'unit'));
     }
   });
 
@@ -4991,7 +5108,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
     target.lastDamageTime = now;
     if (target.hp <= 0) {
       emitBuildingDestroyedEvent(target);
-      if (firingPlayer) firingPlayer.combatPower += 20;
+      awardCombatScore(firingPlayer, getCombatPowerRewardForTarget(target, 'building'));
       gameState.buildings.delete(target.id);
       checkPlayerDefeat(target.userId, slbm.userId);
     }
@@ -5414,14 +5531,9 @@ function updateGame(deltaTime) {
         // Increase population limit when certain buildings are completed
         const player = gameState.players.get(building.userId);
         if (player && !building.populationBonusApplied) {
-          const populationBonuses = {
-            'naval_academy': 10,
-            'shipyard': 5,
-            'power_plant': 3
-          };
-          const bonus = populationBonuses[building.type] || 0;
+          const bonus = getBuildingPopulationBonus(building.type);
           if (bonus > 0) {
-            player.maxPopulation += bonus;
+            player.maxPopulation = clampPlayerMaxPopulation(player.maxPopulation + bonus);
             building.populationBonusApplied = true;
           }
           if (building.type === 'missile_silo' && !player.researchedSLBM) {
@@ -5445,11 +5557,6 @@ function updateGame(deltaTime) {
         building.lastEnergyTime = now;
       }
     }
-  });
-  
-  gameState.players.forEach(player => {
-    // Update score
-    player.score = calculatePlayerScore(player);
   });
   
   // Process building production queues
@@ -5602,7 +5709,7 @@ function updateGame(deltaTime) {
           emitUnitDestroyedEvent(target);
         }
         const mineOwner = gameState.players.get(mine.userId);
-        if (mineOwner) mineOwner.combatPower += 10;
+        awardCombatScore(mineOwner, getCombatPowerRewardForTarget(target, 'unit'));
         gameState.units.delete(targetId);
         // Mine also consumed
         emitUnitDestroyedEvent(mine);
@@ -5643,7 +5750,7 @@ function updateGame(deltaTime) {
               destroyUnitFromGame(target);
             }
             const strikeOwner = gameState.players.get(strike.userId);
-            if (strikeOwner) strikeOwner.combatPower += 10;
+            awardCombatScore(strikeOwner, getCombatPowerRewardForTarget(target, 'unit'));
             registerCarrierKill(strike.carrierId, strike.userId);
           }
         }
@@ -5656,6 +5763,7 @@ function updateGame(deltaTime) {
           target.lastDamageTime = now;
           if (target.hp <= 0) {
             emitBuildingDestroyedEvent(target);
+            awardCombatScore(strike.userId, getCombatPowerRewardForTarget(target, 'building'));
             gameState.buildings.delete(target.id);
             checkPlayerDefeat(target.userId, strike.userId);
           }
@@ -6103,7 +6211,7 @@ function updateGame(deltaTime) {
             gameState.units.delete(nearestTarget.id);
             building.attackTargetId = null;
             building.attackTargetType = null;
-            if (attacker) attacker.combatPower += 10;
+            awardCombatScore(attacker, getCombatPowerRewardForTarget(nearestTarget, 'unit'));
           }
         }
       }
@@ -6133,6 +6241,7 @@ function updateGame(deltaTime) {
           emitSlbmDamagedEvent({ id: slbm.id, hp: slbm.hp, maxHp: slbm.maxHp, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
           if (slbm.hp <= 0) {
             emitSlbmDestroyedEvent({ id: slbm.id, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
+            awardCombatScore(building.userId, getCombatPowerRewardForTarget(slbm, 'slbm'));
             gameState.activeSlbms.delete(slbm.id);
           }
         }
@@ -6536,6 +6645,7 @@ function updateGame(deltaTime) {
   });
 
   resolveActiveSlbmImpacts(now);
+  recalculateAllPlayerCombatPowerAndScores();
 }
 
 // Ranking endpoint
@@ -6567,7 +6677,7 @@ app.get('/api/rankings', (req, res) => {
     .sort((a, b) => (b.score || 0) - (a.score || 0));
 
   const rankings = scoredPlayers
-    .slice(0, 10)
+    .slice(0, 5)
     .map(player => ({
       ...player,
       isSelf: requestedUserId != null && player.userId === requestedUserId
@@ -6604,12 +6714,14 @@ const AI_CONFIG = {
   maxPriorityTargets: 12,
   // Combat power scoring per unit type
   combatPower: {
-    frigate: 5,
-    destroyer: 10,
-    cruiser: 15,
-    battleship: 50,
-    carrier: 40,
-    submarine: 100
+    frigate: 30,
+    destroyer: 150,
+    cruiser: 100,
+    battleship: 200,
+    carrier: 180,
+    submarine: 200,
+    assaultship: 100,
+    missile_launcher: 100
   },
   // Island expansion threshold
   expansionBuildingThreshold: 10
@@ -6652,9 +6764,10 @@ function spawnAIPlayer(aiIndex) {
     username: aiName,
     resources: 1000,
     population: 0,
-    maxPopulation: 10,
+    maxPopulation: STARTING_MAX_POPULATION,
     combatPower: 0,
     score: 0,
+    scoreFromKills: 0,
     baseX: startPos.x,
     baseY: startPos.y,
     hasBase: true,
@@ -7003,7 +7116,7 @@ function updateAI() {
         }
       }
       
-      if (hasNavalAcademy && player.population + 4 <= player.maxPopulation) {
+      if (hasNavalAcademy && player.population + getUnitDefinition('submarine').pop <= player.maxPopulation) {
         const roll = Math.random();
         if (roll < 0.35 && player.resources >= 600) {
           buildUnitForAI(playerId, navalAcademyId, 'battleship');

@@ -76,6 +76,9 @@ const FOG_VISIBLE_WINDOW_MS = 1000;
 const FOG_BASE_FILL_STYLE = 'rgba(0,0,0,0.5)';
 const MINIMAP_UPDATE_INTERVAL = 500;
 const VIEWPORT_SYNC_INTERVAL_MS = 150;
+const PLAYER_BASE_POPULATION_CAP = 10;
+const HEADQUARTERS_POPULATION_BONUS = 20;
+const STARTING_MAX_POPULATION = PLAYER_BASE_POPULATION_CAP + HEADQUARTERS_POPULATION_BONUS;
 const SECRET_CLICK_STREAK_RESET_MS = 900;
 const SECRET_RANKING_CLICK_TARGET = 10;
 const SECRET_MINIMAP_CLICK_TARGET = 22;
@@ -269,7 +272,7 @@ const WORKER_BUILD_CATEGORIES = Object.freeze({
     general: Object.freeze({
         label: '일반 건축물',
         items: Object.freeze([
-            { type: 'headquarters', name: '본부 건물', cost: 800, desc: '일꾼 생산' },
+            { type: 'headquarters', name: '본부 건물', cost: 800, desc: '일꾼 생산, 인구+20' },
             { type: 'power_plant', name: '발전소', cost: 150, desc: '인구+3' },
             { type: 'shipyard', name: '조선소', cost: 200, desc: '인구+5' }
         ])
@@ -3150,7 +3153,7 @@ function updateSelectionInfo() {
             const unitIcons = { worker: '👷', destroyer: '🚢', cruiser: '⛴️', battleship: '🛳️', carrier: '🛫', assaultship: '🛶', submarine: '🔱', frigate: '⚔️', missile_launcher: '🚛' };
             const unitNames = { worker: '일꾼', destroyer: '구축함', cruiser: '순양함', battleship: '전함', carrier: '항공모함', assaultship: '강습상륙함', submarine: '잠수함', frigate: '호위함', missile_launcher: '발사차량' };
             const unitCosts = { worker: 50, destroyer: 150, cruiser: 300, battleship: BATTLESHIP_COST, carrier: 800, assaultship: ASSAULT_SHIP_COST, submarine: 900, frigate: 120, missile_launcher: MISSILE_LAUNCHER_COST };
-            const unitPops = { worker: 1, destroyer: 2, cruiser: 3, battleship: 10, carrier: 6, assaultship: 5, submarine: 4, frigate: 1, missile_launcher: 2 };
+            const unitPops = { worker: 1, destroyer: 2, cruiser: 3, battleship: 10, carrier: 12, assaultship: 10, submarine: 8, frigate: 1, missile_launcher: 4 };
             
             // Production buttons
             const btnContainer = document.getElementById('productionButtons');
@@ -6263,7 +6266,7 @@ function connectToGame() {
             if (player) {
                 player.resources = 1000;
                 player.population = 0;
-                player.maxPopulation = 10;
+                player.maxPopulation = STARTING_MAX_POPULATION;
                 player.combatPower = 0;
                 player.score = 0;
                 player.researchedSLBM = false;
