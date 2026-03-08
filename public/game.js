@@ -4,6 +4,7 @@ let rankingInterval = null;
 let slbmTargetingMode = false;
 let mineTargetingMode = false;
 let airstrikeTargetingMode = false;
+let reconTargetingMode = false;
 let attackMode = false;
 let slbmMissiles = []; // Active SLBM missiles for visualization
 
@@ -39,12 +40,16 @@ const MINIMAP_UPDATE_INTERVAL = 500;
 const SECRET_CLICK_STREAK_RESET_MS = 900;
 const SECRET_RANKING_CLICK_TARGET = 10;
 const SECRET_MINIMAP_CLICK_TARGET = 22;
+const SECRET_WORKER_PORTRAIT_CLICK_TARGET = 29;
+const SECRET_WORKER_PORTRAIT_CLICK_RESET_MS = 2500;
 const TEMPORARY_FULL_MAP_REVEAL_MS = 5000;
 const fogCircleOffsetsCache = new Map();
 const rankingPanelSecretClicks = { count: 0, lastAt: 0 };
 const minimapSecretClicks = { count: 0, lastAt: 0 };
+const workerPortraitSecretClicks = { count: 0, lastAt: 0 };
 let fullMapRevealUntil = 0;
 let fullMapRevealTimeoutId = null;
+let lastSeenRedZoneActivationAt = 0;
 
 // --- Fog Offscreen Canvas ---
 // fogLayerCanvas is a gridSize횞gridSize pixel canvas drawn once per fog update
@@ -99,6 +104,10 @@ let frigateImageLoaded = false;
 let fighterImage = null;
 let fighterImageLoaded = false;
 
+// Recon aircraft image
+let reconAircraftImage = null;
+let reconAircraftImageLoaded = false;
+
 // Cruiser Aegis image
 let cruiserAegisImage = null;
 let cruiserAegisImageLoaded = false;
@@ -145,7 +154,19 @@ const POWER_PLANT_SIZE_SCALE = COASTAL_BUILDING_SIZE_SCALE * 0.7;
 const FIXED_BUILDING_IMAGE_MAX_DIMENSION = 200;
 const DEFENSE_TOWER_CANNON_START = Object.freeze({ x: 5, y: 8 });
 const DEFENSE_TOWER_CANNON_MUZZLE = Object.freeze({ x: 21, y: 12 });
+const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
+    DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y,
+    DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x
+);
 const AIRSTRIKE_TARGET_RADIUS = 400;
+const RECON_AIRCRAFT_COST = 150;
+const RECON_AIRCRAFT_BUILD_TIME_MS = 18000;
+const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
+const RECON_AIRCRAFT_VISION_RADIUS = 2600;
+const RED_ZONE_MINIMAP_PENDING_COLOR = 'rgba(124, 124, 124, 0.68)';
+const RED_ZONE_MINIMAP_AFTERSHOCK_COLOR = 'rgba(96, 96, 96, 0.48)';
+const RED_ZONE_MINIMAP_BUILDING_WARNING_COLOR = '#8c8c8c';
+const RED_ZONE_MINIMAP_BUILDING_BLINK_MS = 500;
 const DESTROYER_VISION_RADIUS = 1000;
 const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
@@ -255,6 +276,20 @@ function loadFighterImage() {
     }
 }
 
+function loadReconAircraftImage() {
+    if (!reconAircraftImage) {
+        reconAircraftImage = new Image();
+        reconAircraftImage.onload = () => {
+            reconAircraftImageLoaded = true;
+            console.log('Recon aircraft image loaded');
+        };
+        reconAircraftImage.onerror = () => {
+            console.warn('Failed to load jcg.png');
+        };
+        reconAircraftImage.src = '/assets/images/units/jcg.png';
+    }
+}
+
 function loadCruiserAegisImage() {
     if (!cruiserAegisImage) {
         cruiserAegisImage = new Image();
@@ -304,6 +339,7 @@ loadCruiserImage();
 loadCarrierImage();
 loadFrigateImage();
 loadFighterImage();
+loadReconAircraftImage();
 loadCruiserAegisImage();
 loadDestroyerImage();
 loadAirstrikeImage();
@@ -451,7 +487,8 @@ function getDefenseTowerVisualMetrics() {
         cannonPivotLocalX: -(baseSize.width / 2) + (DEFENSE_TOWER_CANNON_START.x * scaleX),
         cannonPivotLocalY: -(baseSize.height / 2) + (DEFENSE_TOWER_CANNON_START.y * scaleY),
         cannonAnchorX: DEFENSE_TOWER_CANNON_START.x / cannonOriginalWidth,
-        cannonAnchorY: DEFENSE_TOWER_CANNON_START.y / cannonOriginalHeight
+        cannonAnchorY: DEFENSE_TOWER_CANNON_START.y / cannonOriginalHeight,
+        cannonBaseAngle: DEFENSE_TOWER_CANNON_BASE_ANGLE
     };
 }
 
@@ -689,6 +726,7 @@ let gameState = {
     players: new Map(),
     units: new Map(),
     buildings: new Map(),
+    redZones: [],
     fogOfWar: new Map(), // gridKey -> {lastSeen, explored}
     camera: { x: 0, y: 0, zoom: 1 },
     selection: new Set(),
@@ -704,8 +742,8 @@ function resetSecretClickStreak(streak) {
     streak.lastAt = 0;
 }
 
-function registerSecretRapidClick(streak, requiredClicks, now = Date.now()) {
-    if ((now - streak.lastAt) > SECRET_CLICK_STREAK_RESET_MS) {
+function registerSecretRapidClick(streak, requiredClicks, now = Date.now(), resetMs = SECRET_CLICK_STREAK_RESET_MS) {
+    if ((now - streak.lastAt) > resetMs) {
         streak.count = 0;
     }
     streak.lastAt = now;
@@ -720,6 +758,51 @@ function registerSecretRapidClick(streak, requiredClicks, now = Date.now()) {
 function invalidateFogAndMinimap() {
     fogDirty = true;
     minimapDirty = true;
+}
+
+function applyRedZoneSync(redZones) {
+    gameState.redZones = Array.isArray(redZones)
+        ? redZones.map(zone => ({
+            ...zone,
+            landCells: Array.isArray(zone.landCells) ? zone.landCells : [],
+            landCellKeys: new Set(
+                (Array.isArray(zone.landCells) ? zone.landCells : [])
+                    .filter(cell => Array.isArray(cell) && cell.length >= 2)
+                    .map(cell => `${cell[0]}:${cell[1]}`)
+            )
+        }))
+        : [];
+    const pendingActivationAt = gameState.redZones
+        .filter(zone => !zone.detonatedAt && Number.isFinite(zone.selectedAt))
+        .reduce((latest, zone) => Math.max(latest, zone.selectedAt), 0);
+    if (pendingActivationAt > lastSeenRedZoneActivationAt) {
+        lastSeenRedZoneActivationAt = pendingActivationAt;
+        showKillLogMessage('레드존 활성화까지 30초 남았습니다', 'red-zone');
+    }
+    minimapDirty = true;
+}
+
+function isWorldPointInsideRedZone(zone, x, y) {
+    if (!gameState.map || !zone || !(zone.landCellKeys instanceof Set) || zone.landCellKeys.size === 0) return false;
+    const cellSize = gameState.map.cellSize || 50;
+    const gridX = Math.floor(x / cellSize);
+    const gridY = Math.floor(y / cellSize);
+    return zone.landCellKeys.has(`${gridX}:${gridY}`);
+}
+
+function isOwnBuildingInPendingRedZone(building) {
+    if (!building || building.userId !== gameState.userId || !Array.isArray(gameState.redZones)) return false;
+    return gameState.redZones.some(zone => !zone.detonatedAt && isWorldPointInsideRedZone(zone, building.x, building.y));
+}
+
+function hasBlinkingRedZoneBuildings() {
+    if (!Array.isArray(gameState.redZones) || !gameState.redZones.some(zone => !zone.detonatedAt)) return false;
+    for (const building of gameState.buildings.values()) {
+        if (isOwnBuildingInPendingRedZone(building)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function hasTemporaryFullMapReveal() {
@@ -811,6 +894,19 @@ const canvas = document.getElementById('gameCanvas');
 const minimap = document.getElementById('minimap');
 const minimapCtx = minimap.getContext('2d');
 
+function getReconInstructionsElement() {
+    let element = document.getElementById('reconInstructions');
+    if (element) return element;
+
+    element = document.createElement('div');
+    element.id = 'reconInstructions';
+    element.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%, -50%);background:rgba(120,135,148,0.92);padding:20px;border-radius:10px;color:white;display:none;font-size:18px;text-align:center;z-index:20;';
+    element.innerHTML = '<strong>정찰기 출격 위치 지정</strong><br>클릭하여 정찰 목적지 설정<br><small>ESC로 취소</small>';
+    const parent = canvas.parentElement || document.body;
+    parent.appendChild(element);
+    return element;
+}
+
 // PixiJS Application & Layer System
 let pixiApp = null;
 let worldContainer = null;
@@ -852,6 +948,7 @@ function getUnitImage(unitOrType) {
         case 'carrier': return carrierImageLoaded ? carrierImage : null;
         case 'frigate': return frigateImageLoaded ? frigateImage : null;
         case 'aircraft': return fighterImageLoaded ? fighterImage : null;
+        case 'recon_aircraft': return reconAircraftImageLoaded ? reconAircraftImage : null;
         case 'destroyer': return destroyerImageLoaded ? destroyerImage : null;
         default: return null;
     }
@@ -1125,6 +1222,7 @@ function getUnitTypeName(type) {
         'carrier': '항공모함',
         'submarine': '잠수함',
         'aircraft': '함재기',
+        'recon_aircraft': '정찰기',
         'frigate': '호위함'
     };
     return names[type] || type;
@@ -1209,7 +1307,7 @@ canvas.addEventListener('mousedown', (e) => {
             // In attack mode, left-click does attack-move to position
             const selectedUnits = Array.from(gameState.selection)
                 .map(id => gameState.units.get(id))
-                .filter(u => u && u.userId === gameState.userId && u.type !== 'worker');
+                .filter(canReceiveManualAttackOrders);
             
             if (selectedUnits.length > 0) {
                 // Find target at click position (enemy unit or building)
@@ -1307,6 +1405,13 @@ canvas.addEventListener('mousedown', (e) => {
             airstrikeTargetingMode = false;
             canvas.style.cursor = 'crosshair';
             document.getElementById('airstrikeInstructions').style.display = 'none';
+        } else if (reconTargetingMode) {
+            const targetPoint = clampWorldPointToMap(worldX, worldY);
+            launchSelectedReconAircraft(targetPoint);
+            reconTargetingMode = false;
+            canvas.style.cursor = 'crosshair';
+            const reconInstructions = document.getElementById('reconInstructions');
+            if (reconInstructions) reconInstructions.style.display = 'none';
         } else if (mineTargetingMode) {
             const targetPoint = clampWorldPointToMap(worldX, worldY);
             const selectedDestroyers = Array.from(gameState.selection)
@@ -1394,7 +1499,7 @@ canvas.addEventListener('mouseup', (e) => {
         if (gameState.selection.size > 0) {
             const selectedUnits = Array.from(gameState.selection)
                 .map(id => gameState.units.get(id))
-                .filter(u => u && u.userId === gameState.userId);
+                .filter(canReceiveManualOrders);
             
             if (selectedUnits.length > 0) {
                 const unitIds = selectedUnits.map(u => u.id);
@@ -1512,10 +1617,13 @@ function cancelActiveModes() {
     slbmTargetingMode = false;
     mineTargetingMode = false;
     airstrikeTargetingMode = false;
+    reconTargetingMode = false;
     setAttackMode(false);
     document.getElementById('slbmInstructions').style.display = 'none';
     document.getElementById('airstrikeInstructions').style.display = 'none';
     document.getElementById('mineInstructions').style.display = 'none';
+    const reconInstructions = document.getElementById('reconInstructions');
+    if (reconInstructions) reconInstructions.style.display = 'none';
 }
 
 window.addEventListener('keydown', (e) => {
@@ -1530,7 +1638,7 @@ window.addEventListener('keydown', (e) => {
     if ((e.key === 'a' || e.key === 'A') && gameState.selection.size > 0) {
         const selectedUnits = Array.from(gameState.selection)
             .map(id => gameState.units.get(id))
-            .filter(u => u && u.userId === gameState.userId && u.type !== 'worker');
+            .filter(canReceiveManualAttackOrders);
         
         if (selectedUnits.length > 0) {
             setAttackMode(true);
@@ -1548,7 +1656,7 @@ window.addEventListener('keydown', (e) => {
     if ((e.key === 'h' || e.key === 'H') && !e.repeat) {
         const selectedUnits = Array.from(gameState.selection)
             .map(id => gameState.units.get(id))
-            .filter(u => u && u.userId === gameState.userId);
+            .filter(canReceiveManualOrders);
         if (selectedUnits.length > 0 && socket) {
             cancelActiveModes();
             attackTarget = null;
@@ -1605,8 +1713,63 @@ function updateCamera(deltaMs) {
     }
 }
 
+function isAirUnitType(unitOrType) {
+    const type = typeof unitOrType === 'string' ? unitOrType : unitOrType?.type;
+    return type === 'aircraft' || type === 'recon_aircraft';
+}
+
+function getSelectedOwnedUnits() {
+    return Array.from(gameState.selection)
+        .map(id => gameState.units.get(id))
+        .filter(unit => unit && unit.userId === gameState.userId);
+}
+
+function getSelectedOwnedCarriers() {
+    return getSelectedOwnedUnits().filter(unit => unit.type === 'carrier');
+}
+
+function canReceiveManualOrders(unit) {
+    return !!unit && unit.userId === gameState.userId && unit.type !== 'recon_aircraft';
+}
+
+function canReceiveManualAttackOrders(unit) {
+    return canReceiveManualOrders(unit) && unit.type !== 'worker';
+}
+
+function hasOnlyOwnedCarriersSelected() {
+    const selectedUnits = Array.from(gameState.selection)
+        .map(id => gameState.units.get(id))
+        .filter(Boolean);
+    return selectedUnits.length > 0 && selectedUnits.every(unit => unit.userId === gameState.userId && unit.type === 'carrier');
+}
+
+function getReadyReconCarriers() {
+    return getSelectedOwnedCarriers().filter(carrier => ((carrier.reconAircraft || []).length > 0));
+}
+
+function launchSelectedReconAircraft(targetPoint) {
+    if (!socket) return 0;
+    const readyCarriers = getReadyReconCarriers();
+    readyCarriers.forEach(carrier => {
+        socket.emit('launchReconAircraft', {
+            unitId: carrier.id,
+            targetX: targetPoint.x,
+            targetY: targetPoint.y
+        });
+    });
+    return readyCarriers.length;
+}
+
 function getUnitSelectionBaseSize(unit) {
-    return unit.type === 'worker' ? 40 : (unit.type === 'mine' ? 40 : (unit.type === 'aircraft' ? 20 : (unit.type === 'frigate' ? 35 : (unit.type === 'destroyer' ? 45 : 60))));
+    return unit.type === 'worker'
+        ? 40
+        : (unit.type === 'mine'
+            ? 40
+            : (unit.type === 'recon_aircraft'
+                ? 60
+                : (unit.type === 'aircraft'
+                    ? 20
+                    : (unit.type === 'frigate' ? 35 : (unit.type === 'destroyer' ? 45 : 60)))));
 }
 
 function getUnitDisplayPosition(unit) {
@@ -1636,7 +1799,7 @@ function isPointInsideUnitHitbox(unit, worldX, worldY) {
         return Math.sqrt(dx * dx + dy * dy) <= baseSize;
     }
 
-    const heightMult = (unit.type === 'aircraft') ? 2.5 : (unit.type === 'battleship' ? BATTLESHIP_BASE_HEIGHT_MULTIPLIER : 6.6);
+    const heightMult = isAirUnitType(unit) ? 2.5 : (unit.type === 'battleship' ? BATTLESHIP_BASE_HEIGHT_MULTIPLIER : 6.6);
     const img = getUnitImage(unit);
     const aspectRatio = (img && img.width && img.height) ? (img.width / img.height) : 0.25;
     const semiMajor = (baseSize * heightMult) / 2;
@@ -1679,6 +1842,25 @@ function getInspectedUnit() {
         gameState.inspectedUnitId = null;
         return null;
     }
+    return unit;
+}
+
+function getPortraitSecretWorkerUnit() {
+    const bottomPanel = document.getElementById('bottomPanel');
+    if (!bottomPanel || !bottomPanel.classList.contains('active')) return null;
+
+    const inspectedUnit = getInspectedUnit();
+    if (inspectedUnit && inspectedUnit.userId === gameState.userId && inspectedUnit.type === 'worker' && gameState.selection.size === 0) {
+        return inspectedUnit;
+    }
+
+    const selectedUnits = Array.from(gameState.selection)
+        .map(id => gameState.units.get(id))
+        .filter(u => u !== undefined);
+    if (selectedUnits.length !== 1) return null;
+
+    const unit = selectedUnits[0];
+    if (!unit || unit.userId !== gameState.userId || unit.type !== 'worker') return null;
     return unit;
 }
 
@@ -1785,7 +1967,7 @@ function renderSingleUnitPanel(unit, options = {}) {
 
     let displayDamage = unit.damage || 0;
     if (unit.type === 'carrier') {
-        displayDamage = '함재기';
+        displayDamage = '함재기 / 정찰기';
     } else if (unit.type === 'cruiser' && unit.aegisMode) {
         displayDamage = '25 (이지스)';
     } else if (unit.aimedShot) {
@@ -1897,8 +2079,13 @@ function renderSingleUnitPanel(unit, options = {}) {
         const deployedCount = (unit.aircraftDeployed || []).length;
         const acQueue = unit.aircraftQueue || [];
         const totalAc = acCount + deployedCount + acQueue.length;
+        const reconCount = (unit.reconAircraft || []).length;
+        const reconDeployedCount = (unit.reconAircraftDeployed || []).length;
+        const reconQueue = unit.reconAircraftQueue || [];
+        const totalRecon = reconCount + reconDeployedCount + reconQueue.length;
         const player = gameState.players.get(gameState.userId);
         const queueFull = acQueue.length >= 10 || totalAc >= 10;
+        const reconQueueFull = reconQueue.length >= RECON_AIRCRAFT_MAX_PER_CARRIER || totalRecon >= RECON_AIRCRAFT_MAX_PER_CARRIER;
 
         const slot3 = document.getElementById('skillSlot3');
         slot3.style.display = 'flex';
@@ -1926,6 +2113,21 @@ function renderSingleUnitPanel(unit, options = {}) {
             document.getElementById('skillBtn4').className = 'skill-btn disabled';
             document.getElementById('skillDesc4').textContent = `함재기 10기 필요 (현재: ${acCount}기)`;
         }
+
+        const slot7 = document.getElementById('skillSlot7');
+        slot7.style.display = 'flex';
+        const reconProgress = unit.producingReconAircraft
+            ? Math.floor(Math.min(1, (Date.now() - unit.producingReconAircraft.startTime) / unit.producingReconAircraft.buildTime) * 100)
+            : null;
+        document.getElementById('skillBtn7').textContent = '🛩️ 정찰기 제작';
+        document.getElementById('skillBtn7').className = 'skill-btn' + ((!player || player.resources < RECON_AIRCRAFT_COST || reconQueueFull) ? ' disabled' : '');
+        document.getElementById('skillDesc7').textContent = `에너지 ${RECON_AIRCRAFT_COST} / ${Math.round(RECON_AIRCRAFT_BUILD_TIME_MS / 1000)}초 (보유: ${reconCount} / 출격: ${reconDeployedCount} / 최대 ${RECON_AIRCRAFT_MAX_PER_CARRIER}) [대기열: ${reconQueue.length}]${reconProgress !== null ? ` | 제작 중 ${reconProgress}%` : ''}`;
+
+        const slot8 = document.getElementById('skillSlot8');
+        slot8.style.display = 'flex';
+        document.getElementById('skillBtn8').textContent = '🛩️ 정찰기 출격';
+        document.getElementById('skillBtn8').className = 'skill-btn' + (reconCount <= 0 ? ' disabled' : '');
+        document.getElementById('skillDesc8').textContent = `지정 위치로 정찰기 1기 출격 후 정찰하고 항모로 복귀 (보유: ${reconCount} / 비행 중: ${reconDeployedCount} / 동시 운영 최대 ${RECON_AIRCRAFT_MAX_PER_CARRIER})`;
 
         if (unit.producingAircraft || acQueue.length > 0) {
             const acBar = document.getElementById('aircraftProgressBar');
@@ -2226,7 +2428,7 @@ function updateSelectionInfo() {
     } else {
         // Multiple units selected - show summary stats
         // Priority order by cost: submarine(900) > carrier(800) > battleship(600) > cruiser(300) > destroyer(150) > worker(50)
-        const unitCostPriority = { submarine: 900, carrier: 800, battleship: 600, cruiser: 300, destroyer: 150, frigate: 120, worker: 50, aircraft: 100 };
+        const unitCostPriority = { submarine: 900, carrier: 800, battleship: 600, cruiser: 300, destroyer: 150, recon_aircraft: RECON_AIRCRAFT_COST, frigate: 120, aircraft: 100, worker: 50 };
         const sortedUnits = [...selectedUnits].sort((a, b) => (unitCostPriority[b.type] || 0) - (unitCostPriority[a.type] || 0));
         const primaryUnit = sortedUnits[0];
         
@@ -2287,10 +2489,18 @@ function updateSelectionInfo() {
                 const acCount = (firstCarrier.aircraft || []).length;
                 const deployedCount = (firstCarrier.aircraftDeployed || []).length;
                 const acQueueLen = (firstCarrier.aircraftQueue || []).length;
+                const anyCarrierCanBuildAircraft = carriers.some(carrier => {
+                    const stored = (carrier.aircraft || []).length;
+                    const deployed = (carrier.aircraftDeployed || []).length;
+                    const queue = (carrier.aircraftQueue || []).length;
+                    return queue < 10 && (stored + deployed + queue) < 10;
+                });
+                const player = gameState.players.get(gameState.userId);
                 
                 const slot3 = document.getElementById('skillSlot3');
                 slot3.style.display = 'flex';
                 document.getElementById('skillBtn3').textContent = '✈️ 함재기 제작';
+                document.getElementById('skillBtn3').className = 'skill-btn' + ((!player || player.resources < 100 || !anyCarrierCanBuildAircraft) ? ' disabled' : '');
                 document.getElementById('skillDesc3').textContent = `에너지 100 / 15초 (보유: ${acCount} / 발진: ${deployedCount} / 최대 10) [대기열: ${acQueueLen}]`;
                 
                 const slot4 = document.getElementById('skillSlot4');
@@ -2304,11 +2514,36 @@ function updateSelectionInfo() {
                     document.getElementById('skillBtn4').className = 'skill-btn disabled';
                 }
                 document.getElementById('skillDesc4').textContent = `함재기 10기 소모하여 범위 폭격 3회`;
+
+                const carriersOnly = carriers.length === selectedUnits.length;
+                if (carriersOnly) {
+                    const totalReconReady = carriers.reduce((sum, carrier) => sum + ((carrier.reconAircraft || []).length), 0);
+                    const totalReconDeployed = carriers.reduce((sum, carrier) => sum + ((carrier.reconAircraftDeployed || []).length), 0);
+                    const totalReconQueue = carriers.reduce((sum, carrier) => sum + ((carrier.reconAircraftQueue || []).length), 0);
+                    const anyCarrierCanBuildRecon = carriers.some(carrier => {
+                        const stored = (carrier.reconAircraft || []).length;
+                        const deployed = (carrier.reconAircraftDeployed || []).length;
+                        const queue = (carrier.reconAircraftQueue || []).length;
+                        return queue < RECON_AIRCRAFT_MAX_PER_CARRIER && (stored + deployed + queue) < RECON_AIRCRAFT_MAX_PER_CARRIER;
+                    });
+
+                    const slot7 = document.getElementById('skillSlot7');
+                    slot7.style.display = 'flex';
+                    document.getElementById('skillBtn7').textContent = '🛩️ 정찰기 제작';
+                    document.getElementById('skillBtn7').className = 'skill-btn' + ((!player || player.resources < RECON_AIRCRAFT_COST || !anyCarrierCanBuildRecon) ? ' disabled' : '');
+                    document.getElementById('skillDesc7').textContent = `선택 항모 정찰기: 보유 ${totalReconReady} / 출격 ${totalReconDeployed} / 대기열 ${totalReconQueue} / 항모당 최대 ${RECON_AIRCRAFT_MAX_PER_CARRIER}`;
+
+                    const slot8 = document.getElementById('skillSlot8');
+                    slot8.style.display = 'flex';
+                    document.getElementById('skillBtn8').textContent = '🛩️ 정찰기 출격';
+                    document.getElementById('skillBtn8').className = 'skill-btn' + (totalReconReady <= 0 ? ' disabled' : '');
+                    document.getElementById('skillDesc8').textContent = `선택된 각 항모에서 정찰기 1기씩 출격, 항모당 최대 ${RECON_AIRCRAFT_MAX_PER_CARRIER}기 동시 운영`;
+                }
             }
         }
         
         // Destroyer skills if destroyers are among selected
-        if (hasTypes.has('destroyer')) {
+        if (hasTypes.has('destroyer') && !hasOnlyOwnedCarriersSelected()) {
             const slot7 = document.getElementById('skillSlot7');
             slot7.style.display = 'flex';
             document.getElementById('skillBtn7').textContent = '🔍 탐색';
@@ -2379,6 +2614,7 @@ function render() {
 
     // Overlay (selection box, SLBM targeting) – drawn in world space
     overlayGfx.clear();
+    drawGlobalRedZoneExplosions();
     if (gameState.selectionBox) {
         const box = gameState.selectionBox;
         overlayGfx.lineStyle(2 / gameState.camera.zoom, 0x4fc3f7, 1);
@@ -2404,6 +2640,16 @@ function render() {
         overlayGfx.lineTo(mouse.worldX + 80, mouse.worldY);
         overlayGfx.moveTo(mouse.worldX, mouse.worldY - 80);
         overlayGfx.lineTo(mouse.worldX, mouse.worldY + 80);
+    }
+    if (reconTargetingMode) {
+        overlayGfx.lineStyle(3 / gameState.camera.zoom, 0x9ba7b3, 1);
+        overlayGfx.beginFill(0x9ba7b3, 0.08);
+        overlayGfx.drawCircle(mouse.worldX, mouse.worldY, RECON_AIRCRAFT_VISION_RADIUS);
+        overlayGfx.endFill();
+        overlayGfx.moveTo(mouse.worldX - 70, mouse.worldY);
+        overlayGfx.lineTo(mouse.worldX + 70, mouse.worldY);
+        overlayGfx.moveTo(mouse.worldX, mouse.worldY - 70);
+        overlayGfx.lineTo(mouse.worldX, mouse.worldY + 70);
     }
     if (mineTargetingMode) {
         const selectedDestroyer = Array.from(gameState.selection)
@@ -2880,10 +3126,11 @@ function syncBuildingLayer() {
                         building.turretAngle = 0;
                     }
                     if (aimTarget) {
-                        building.turretAngle = Math.atan2(
+                        const desiredAimAngle = Math.atan2(
                             aimTarget.y - (building.y + metrics.cannonPivotLocalY),
                             aimTarget.x - (building.x + metrics.cannonPivotLocalX)
                         );
+                        building.turretAngle = desiredAimAngle - metrics.cannonBaseAngle;
                     }
                     entry.cannonSprite.rotation = building.turretAngle;
                 }
@@ -2963,7 +3210,15 @@ function syncUnitLayer() {
 
         activeIds.add(unitId);
         const isSelected = gameState.selection.has(unitId);
-        const size = unit.type === 'worker' ? 40 : (unit.type === 'mine' ? 40 : (unit.type === 'aircraft' ? 20 : (unit.type === 'frigate' ? 35 : (unit.type === 'destroyer' ? 45 : 60))));
+        const size = unit.type === 'worker'
+            ? 40
+            : (unit.type === 'mine'
+                ? 40
+                : (unit.type === 'recon_aircraft'
+                    ? 60
+                    : (unit.type === 'aircraft'
+                        ? 20
+                        : (unit.type === 'frigate' ? 35 : (unit.type === 'destroyer' ? 45 : 60)))));
         const angle = unit.displayAngle !== undefined ? unit.displayAngle : 0;
 
         // Get or create sprite entry
@@ -3132,7 +3387,7 @@ function createUnitSpriteEntry(unit, size) {
             container.addChild(gfxShape);
         }
     } else {
-        // Image-based units: submarine, cruiser, carrier, frigate, aircraft
+        // Image-based units: submarine, cruiser, carrier, frigate, aircraft, recon_aircraft
         const img = getUnitImage(unit);
         if (img) {
             const tex = getOrCreateTexture(img);
@@ -3141,8 +3396,8 @@ function createUnitSpriteEntry(unit, size) {
                 const origW = img.width;
                 const origH = img.height;
                 const aspectRatio = origW / origH;
-                // Aircraft uses smaller scale than ships
-                const heightMult = (unit.type === 'aircraft') ? 2.5 : 6.6;
+                // Air units use smaller scale than ships
+                const heightMult = isAirUnitType(unit) ? 2.5 : 6.6;
                 const baseHeight = size * heightMult;
                 const baseWidth = baseHeight * aspectRatio;
                 mainSprite.anchor.set(0.5);
@@ -3157,7 +3412,7 @@ function createUnitSpriteEntry(unit, size) {
             const c = colorToHex(getPlayerColor(unit.userId));
             gfxShape = new PIXI.Graphics();
             gfxShape.beginFill(c);
-            if (unit.type === 'aircraft') {
+            if (isAirUnitType(unit)) {
                 gfxShape.moveTo(size, 0); gfxShape.lineTo(-size*0.6, size*0.7);
                 gfxShape.lineTo(-size*0.3, 0); gfxShape.lineTo(-size*0.6, -size*0.7);
                 gfxShape.closePath();
@@ -3210,7 +3465,7 @@ function drawUnitOverlays(gfx) {
                 gfx.drawCircle(posX, posY, size + 5);
                 gfx.lineStyle(0);
             } else {
-                const heightMult = (unit.type === 'aircraft') ? 2.5 : (unit.type === 'battleship' ? BATTLESHIP_BASE_HEIGHT_MULTIPLIER : 6.6);
+                const heightMult = isAirUnitType(unit) ? 2.5 : (unit.type === 'battleship' ? BATTLESHIP_BASE_HEIGHT_MULTIPLIER : 6.6);
                 const img = getUnitImage(unit);
                 const aspectRatio = (img && img.width && img.height) ? (img.width / img.height) : 0.25;
                 const semiMajor = (size * heightMult) / 2 + 5; // along heading (ship length)
@@ -3533,58 +3788,79 @@ function syncEffectsLayer() {
     // --- Explosion effects ---
     explosionEffects = explosionEffects.filter(exp => now - exp.startTime < exp.duration);
     explosionEffects.forEach(exp => {
+        if (exp.style === 'red-zone') return;
         if (!isPositionVisible(exp.x, exp.y)) return;
-        const elapsed = now - exp.startTime;
-        const progress = elapsed / exp.duration;
-
-        // Search pulse: expanding cyan ring
-        if (exp.isSearchPulse) {
-            const ringRadius = exp.maxRadius * progress;
-            const alpha = Math.max(0, 0.6 - progress * 0.6);
-            effectsGfx.lineStyle(4, exp.color || 0x00bcd4, alpha);
-            effectsGfx.drawCircle(exp.x, exp.y, ringRadius);
-            effectsGfx.lineStyle(0);
-            return;
-        }
-
-        if (progress < 0.3) {
-            const flashAlpha = 1 - (progress / 0.3);
-            const flashRadius = (exp.maxRadius || 30) + progress * 60;
-            effectsGfx.beginFill(0xffc832, flashAlpha * 0.8);
-            effectsGfx.drawCircle(exp.x, exp.y, flashRadius);
-            effectsGfx.endFill();
-            effectsGfx.beginFill(0xffffff, flashAlpha * 0.6);
-            effectsGfx.drawCircle(exp.x, exp.y, flashRadius * 0.4);
-            effectsGfx.endFill();
-        }
-        if (progress > 0.1) {
-            const ringAlpha = Math.max(0, 0.4 - progress * 0.4);
-            const ringRadius = 20 + progress * 80;
-            effectsGfx.lineStyle(6, 0x646464, ringAlpha);
-            effectsGfx.drawCircle(exp.x, exp.y, ringRadius);
-            effectsGfx.lineStyle(0);
-        }
-        if (exp.debris) {
-            exp.debris.forEach(d => {
-                const alpha = Math.max(0, 1 - progress);
-                const px = exp.x + d.dx * progress;
-                const py = exp.y + d.dy * progress + (progress * progress * 40);
-                let debrisColor;
-                if (d.color.startsWith('#')) {
-                    debrisColor = parseInt(d.color.slice(1), 16);
-                } else {
-                    debrisColor = 0xff6600;
-                }
-                effectsGfx.beginFill(debrisColor, alpha);
-                effectsGfx.drawRect(px - d.size / 2, py - d.size / 2, d.size, d.size * 0.6);
-                effectsGfx.endFill();
-            });
-        }
+        drawExplosionEffect(effectsGfx, exp, now);
     });
 
     // --- Active airstrikes (flying airstrike.png sprites) ---
     // Managed via airstrikeLayer PIXI sprites, updated in syncAirstrikeSprites
     syncAirstrikeSprites(now, viewport);
+}
+
+function drawExplosionEffect(gfx, exp, now) {
+    const elapsed = now - exp.startTime;
+    if (elapsed < 0) return;
+    const progress = elapsed / exp.duration;
+    const isRedZoneExplosion = exp.style === 'red-zone';
+
+    // Search pulse: expanding cyan ring
+    if (exp.isSearchPulse) {
+        const ringRadius = exp.maxRadius * progress;
+        const alpha = Math.max(0, 0.6 - progress * 0.6);
+        gfx.lineStyle(4, exp.color || 0x00bcd4, alpha);
+        gfx.drawCircle(exp.x, exp.y, ringRadius);
+        gfx.lineStyle(0);
+        return;
+    }
+
+    if (progress < 0.3) {
+        const flashAlpha = 1 - (progress / 0.3);
+        const flashRadius = (exp.maxRadius || 30) + progress * (isRedZoneExplosion ? 85 : 60);
+        gfx.beginFill(isRedZoneExplosion ? 0xbfc3c7 : 0xffc832, flashAlpha * (isRedZoneExplosion ? 0.62 : 0.8));
+        gfx.drawCircle(exp.x, exp.y, flashRadius);
+        gfx.endFill();
+        gfx.beginFill(isRedZoneExplosion ? 0xf2f4f5 : 0xffffff, flashAlpha * (isRedZoneExplosion ? 0.42 : 0.6));
+        gfx.drawCircle(exp.x, exp.y, flashRadius * 0.4);
+        gfx.endFill();
+    }
+    if (progress > 0.1) {
+        const ringAlpha = Math.max(0, 0.4 - progress * 0.4);
+        const ringRadius = (isRedZoneExplosion ? 36 : 20) + progress * (isRedZoneExplosion ? 120 : 80);
+        gfx.lineStyle(isRedZoneExplosion ? 8 : 6, isRedZoneExplosion ? 0x7b7f84 : 0x646464, ringAlpha);
+        gfx.drawCircle(exp.x, exp.y, ringRadius);
+        gfx.lineStyle(0);
+    }
+    if (exp.debris) {
+        exp.debris.forEach(d => {
+            const alpha = Math.max(0, 1 - progress);
+            const px = exp.x + d.dx * progress;
+            const py = exp.y + d.dy * progress + (progress * progress * 40);
+            let debrisColor;
+            if (d.color.startsWith('#')) {
+                debrisColor = parseInt(d.color.slice(1), 16);
+            } else {
+                debrisColor = 0xff6600;
+            }
+            gfx.beginFill(debrisColor, alpha);
+            gfx.drawRect(px - d.size / 2, py - d.size / 2, d.size, d.size * 0.6);
+            gfx.endFill();
+        });
+    }
+}
+
+function drawGlobalRedZoneExplosions() {
+    const now = Date.now();
+    const viewport = getViewportBounds(500);
+    explosionEffects.forEach(exp => {
+        if (exp.style !== 'red-zone') return;
+        const radius = (exp.maxRadius || 30) + 220;
+        if (exp.x < viewport.left - radius || exp.x > viewport.right + radius ||
+            exp.y < viewport.top - radius || exp.y > viewport.bottom + radius) {
+            return;
+        }
+        drawExplosionEffect(overlayGfx, exp, now);
+    });
 }
 
 function renderMinimap() {
@@ -3627,7 +3903,8 @@ function renderMinimap() {
             carrier: 2000,
             submarine: 800,
             frigate: 900,
-            aircraft: 1000
+            aircraft: 1000,
+            recon_aircraft: RECON_AIRCRAFT_VISION_RADIUS
         };
         const visibleCircles = [];
 
@@ -3689,6 +3966,28 @@ function renderMinimap() {
             }
         }
     }
+
+    if (Array.isArray(gameState.redZones) && gameState.redZones.length > 0) {
+        const minimapCellWidth = map.cellSize * scaleX;
+        const minimapCellHeight = map.cellSize * scaleY;
+        gameState.redZones.forEach(zone => {
+            const zoneColor = zone.detonatedAt
+                ? RED_ZONE_MINIMAP_AFTERSHOCK_COLOR
+                : RED_ZONE_MINIMAP_PENDING_COLOR;
+            minimapCtx.fillStyle = zoneColor;
+            const landCells = Array.isArray(zone.landCells) ? zone.landCells : [];
+            for (let i = 0; i < landCells.length; i++) {
+                const cell = landCells[i];
+                if (!Array.isArray(cell) || cell.length < 2) continue;
+                minimapCtx.fillRect(
+                    cell[0] * map.cellSize * scaleX,
+                    cell[1] * map.cellSize * scaleY,
+                    minimapCellWidth,
+                    minimapCellHeight
+                );
+            }
+        });
+    }
     
     // Draw SLBM impact zones (darkened areas)
     slbmMissiles.forEach(missile => {
@@ -3729,9 +4028,12 @@ function renderMinimap() {
     });
     
     // Draw buildings
+    const isRedZoneBuildingBlinkOn = Math.floor(now / RED_ZONE_MINIMAP_BUILDING_BLINK_MS) % 2 === 0;
     gameState.buildings.forEach(building => {
         if (building.userId == gameState.userId) {
-            minimapCtx.fillStyle = '#ffff00';
+            minimapCtx.fillStyle = isOwnBuildingInPendingRedZone(building) && !isRedZoneBuildingBlinkOn
+                ? RED_ZONE_MINIMAP_BUILDING_WARNING_COLOR
+                : '#ffff00';
             minimapCtx.fillRect(building.x * scaleX - 3, building.y * scaleY - 3, 7, 7);
         } else if (revealAll) {
             minimapCtx.fillStyle = '#ff0000';
@@ -3869,6 +4171,14 @@ function renderMinimap() {
         minimapCtx.strokeRect(0, 0, minimap.width, minimap.height);
         minimapCtx.setLineDash([]);
     }
+    // Draw recon targeting indicator
+    if (reconTargetingMode) {
+        minimapCtx.strokeStyle = '#9ba7b3';
+        minimapCtx.lineWidth = 2;
+        minimapCtx.setLineDash([5, 5]);
+        minimapCtx.strokeRect(0, 0, minimap.width, minimap.height);
+        minimapCtx.setLineDash([]);
+    }
     // Draw mine targeting indicator
     if (mineTargetingMode) {
         minimapCtx.strokeStyle = '#555555';
@@ -3940,6 +4250,16 @@ minimap.addEventListener('click', (e) => {
         document.getElementById('airstrikeInstructions').style.display = 'none';
         return;
     }
+
+    // Handle recon targeting mode
+    if (reconTargetingMode) {
+        launchSelectedReconAircraft(target);
+        reconTargetingMode = false;
+        canvas.style.cursor = 'crosshair';
+        const reconInstructions = document.getElementById('reconInstructions');
+        if (reconInstructions) reconInstructions.style.display = 'none';
+        return;
+    }
     
     // Handle mine targeting mode
     if (mineTargetingMode) {
@@ -3974,7 +4294,7 @@ minimap.addEventListener('contextmenu', (e) => {
     
     const selectedUnits = Array.from(gameState.selection)
         .map(id => gameState.units.get(id))
-        .filter(u => u && u.userId === gameState.userId);
+        .filter(canReceiveManualOrders);
     
     if (selectedUnits.length > 0) {
         const unitIds = selectedUnits.map(u => u.id);
@@ -4097,12 +4417,15 @@ function showKillLog(attackerName, defeatedName) {
     }, 3000);
 }
 
-function showKillLogMessage(messageText) {
+function showKillLogMessage(messageText, variant = '') {
     const container = document.getElementById('killLogContainer');
     if (!container) return;
 
     const message = document.createElement('div');
     message.className = 'kill-log-message';
+    if (variant) {
+        message.classList.add(`kill-log-message--${variant}`);
+    }
     message.textContent = messageText;
 
     container.appendChild(message);
@@ -4112,6 +4435,32 @@ function showKillLogMessage(messageText) {
             message.parentNode.removeChild(message);
         }
     }, 3000);
+}
+
+function createRedZoneExplosionEffect(x, y, startTime) {
+    const debris = [];
+    const debrisCount = 12 + Math.floor(Math.random() * 7);
+    for (let i = 0; i < debrisCount; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 35 + Math.random() * 120;
+        debris.push({
+            dx: Math.cos(angle) * speed,
+            dy: Math.sin(angle) * speed,
+            size: 4 + Math.random() * 7,
+            color: Math.random() > 0.6 ? '#b5b5b5' : (Math.random() > 0.5 ? '#7a7a7a' : '#5c5c5c'),
+            rotation: Math.random() * Math.PI * 2
+        });
+    }
+
+    return {
+        x,
+        y,
+        startTime,
+        duration: 900,
+        maxRadius: 58 + Math.random() * 34,
+        style: 'red-zone',
+        debris
+    };
 }
 
 // UI Updates
@@ -4205,6 +4554,16 @@ document.getElementById('skillBtn6').addEventListener('click', () => {
 
 // Destroyer: search skill (skillBtn7)
 document.getElementById('skillBtn7').addEventListener('click', () => {
+    if (hasOnlyOwnedCarriersSelected()) {
+        const selectedCarriers = getSelectedOwnedCarriers();
+        if (selectedCarriers.length > 0 && socket) {
+            selectedCarriers.forEach(carrier => {
+                socket.emit('produceReconAircraft', { unitId: carrier.id });
+            });
+        }
+        return;
+    }
+
     const selectedDestroyers = Array.from(gameState.selection)
         .map(id => gameState.units.get(id))
         .filter(u => u && u.userId === gameState.userId && u.type === 'destroyer');
@@ -4216,6 +4575,15 @@ document.getElementById('skillBtn7').addEventListener('click', () => {
 
 // Destroyer: mine laying (skillBtn8)
 document.getElementById('skillBtn8').addEventListener('click', () => {
+    if (hasOnlyOwnedCarriersSelected()) {
+        if (getReadyReconCarriers().length > 0) {
+            cancelActiveModes();
+            reconTargetingMode = true;
+            getReconInstructionsElement().style.display = 'block';
+        }
+        return;
+    }
+
     const selectedDestroyers = Array.from(gameState.selection)
         .map(id => gameState.units.get(id))
         .filter(u => u && u.userId === gameState.userId && u.type === 'destroyer');
@@ -4259,6 +4627,26 @@ if (rankingsPanel) {
         if (!socket || !gameState.userId) return;
         if (registerSecretRapidClick(rankingPanelSecretClicks, SECRET_RANKING_CLICK_TARGET)) {
             socket.emit('resetAllAiFactions');
+        }
+    });
+}
+
+const portraitPlaceholder = document.getElementById('portraitPlaceholder');
+if (portraitPlaceholder) {
+    portraitPlaceholder.addEventListener('click', () => {
+        if (!socket || !gameState.userId) return;
+        const workerUnit = getPortraitSecretWorkerUnit();
+        if (!workerUnit) {
+            resetSecretClickStreak(workerPortraitSecretClicks);
+            return;
+        }
+        if (registerSecretRapidClick(
+            workerPortraitSecretClicks,
+            SECRET_WORKER_PORTRAIT_CLICK_TARGET,
+            Date.now(),
+            SECRET_WORKER_PORTRAIT_CLICK_RESET_MS
+        )) {
+            socket.emit('triggerRedZoneNow');
         }
     });
 }
@@ -4344,11 +4732,14 @@ function logout() {
     isLoggingIn = false;
     resetSecretClickStreak(rankingPanelSecretClicks);
     resetSecretClickStreak(minimapSecretClicks);
+    resetSecretClickStreak(workerPortraitSecretClicks);
     clearTemporaryFullMapReveal();
+    lastSeenRedZoneActivationAt = 0;
     slbmMissiles = [];
     stopSlbmFlightSound(true);
     attackProjectiles = [];
     gameState.activeAirstrikes = [];
+    gameState.redZones = [];
     localStorage.removeItem('token');
     stopUpdate();
     stopBackgroundLoops();
@@ -4476,7 +4867,9 @@ function connectToGame() {
             gameState.missiles = data.missiles || 0;
             resetSecretClickStreak(rankingPanelSecretClicks);
             resetSecretClickStreak(minimapSecretClicks);
+            resetSecretClickStreak(workerPortraitSecretClicks);
             clearTemporaryFullMapReveal();
+            lastSeenRedZoneActivationAt = 0;
             
             console.log('Map loaded:', gameState.map ? 'yes' : 'no');
             console.log('Map size:', gameState.map ? `${gameState.map.width}x${gameState.map.height}` : 'no map');
@@ -4503,6 +4896,7 @@ function connectToGame() {
             stopSlbmFlightSound(true);
             attackProjectiles = [];
             gameState.activeAirstrikes = [];
+            applyRedZoneSync(data.redZones);
             fogDirty = true;
             minimapDirty = true;
             lastServerUpdateTime = 0;
@@ -4635,14 +5029,50 @@ function connectToGame() {
 
     socket.on('systemKillLog', (data) => {
         if (data && typeof data.message === 'string' && data.message) {
-            showKillLogMessage(data.message);
+            showKillLogMessage(data.message, data.variant || '');
         }
+    });
+
+    socket.on('redZoneSync', (data) => {
+        applyRedZoneSync(data && data.redZones);
+    });
+
+    socket.on('redZoneAlert', (data) => {
+        if (!data || typeof data.message !== 'string' || !data.message) {
+            return;
+        }
+        if (data.targetUserId != null && data.targetUserId !== gameState.userId) {
+            return;
+        }
+        showKillLogMessage(data.message, 'red-zone');
+    });
+
+    socket.on('redZoneDetonation', (data) => {
+        const now = Date.now();
+        const burstPoints = Array.isArray(data?.burstPoints) ? data.burstPoints : [];
+        burstPoints.forEach(point => {
+            if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+            explosionEffects.push(createRedZoneExplosionEffect(point.x, point.y, now + (point.delayMs || 0)));
+        });
+        const zone = Array.isArray(gameState.redZones)
+            ? gameState.redZones.find(entry => entry.id === data?.id)
+            : null;
+        if (zone) {
+            zone.detonatedAt = now;
+        }
+        fogDirty = true;
+        minimapDirty = true;
+        playSoundBomb();
     });
     
     socket.on('playerDefeated', (data) => {
+        const isRedZoneDefeat = data && data.defeatReason === 'red_zone';
         // Show kill log message on screen
-        if (data.defeatedName && data.attackerName) {
+        if (!isRedZoneDefeat && data.defeatedName && data.attackerName) {
             showKillLog(data.attackerName, data.defeatedName);
+        }
+        if (isRedZoneDefeat && data.userId === gameState.userId) {
+            showKillLogMessage('의도적인 설계에 의해 처치되었습니다', 'red-zone');
         }
 
         updateRankings();
@@ -5010,7 +5440,7 @@ function startBackgroundLoops() {
 
     if (!minimapIntervalId) {
         minimapIntervalId = setInterval(() => {
-            if (gameState.map && minimapDirty) {
+            if (gameState.map && (minimapDirty || hasBlinkingRedZoneBuildings())) {
                 renderMinimap();
                 minimapDirty = false;
             }
@@ -5058,7 +5488,8 @@ function updateFogOfWar(force = false) {
         'cruiser': 1200,
         'battleship': 3200,
         'carrier': 2000,
-        'submarine': 800
+        'submarine': 800,
+        'recon_aircraft': RECON_AIRCRAFT_VISION_RADIUS
     };
     
     // Only update for own units (use == for type coercion).

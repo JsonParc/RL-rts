@@ -22,12 +22,29 @@ const db = new Database(DB_PATH);
 const COMBAT_SPATIAL_CELL_SIZE = 700;
 const COLLISION_SPATIAL_CELL_SIZE = 400;
 const NETWORK_UPDATE_BASE_MS = 100;
+const SLBM_DAMAGE_RADIUS = 800;
 const AIRSTRIKE_DAMAGE_RADIUS = 400;
 const AIRSTRIKE_VISUAL_RADIUS = 400;
 const AIRSTRIKE_PASS_COUNT = 3;
 const AIRSTRIKE_TOTAL_DAMAGE = 720;
 const AIRSTRIKE_DAMAGE_PER_PASS = AIRSTRIKE_TOTAL_DAMAGE / AIRSTRIKE_PASS_COUNT;
 const AIRSTRIKE_PASS_INTERVAL_MS = 667;
+const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
+const RECON_AIRCRAFT_BUILD_TIME_MS = 18000;
+const RECON_AIRCRAFT_LOITER_MS = 8000;
+const RECON_AIRCRAFT_TARGET_THRESHOLD = 120;
+const RECON_AIRCRAFT_DOCK_RADIUS = 90;
+const RECON_AIRCRAFT_ORBIT_RADIUS = 160;
+const RED_ZONE_SELECTION_INTERVAL_MS = 10 * 60 * 1000;
+const RED_ZONE_WARNING_DURATION_MS = 30 * 1000;
+const RED_ZONE_COUNTDOWN_START_MS = 10 * 1000;
+const RED_ZONE_POST_BLAST_VISUAL_MS = 5000;
+const RED_ZONE_BLAST_DAMAGE = 999;
+const RED_ZONE_BLAST_RADIUS = SLBM_DAMAGE_RADIUS;
+const RED_ZONE_ISLAND_COUNT = 5;
+const RED_ZONE_MAX_BURSTS = 32;
+const RED_ZONE_MIN_BURSTS = 10;
+const RED_ZONE_BURST_DELAY_STEP_MS = 100;
 const BUILDING_BASE_DISPLAY_HEIGHT = 60 * 6.6;
 const COASTAL_BUILDING_SIZE_SCALE = 0.6;
 const POWER_PLANT_SIZE_SCALE = COASTAL_BUILDING_SIZE_SCALE * 0.7;
@@ -44,6 +61,10 @@ const SEARCH_REVEAL_DURATION_MS = 10000;
 const SHIP_HEIGHT_MULT = 6.6;
 const SHIP_ASPECT_RATIO = 0.25;
 const NAVAL_UNIT_TYPES = new Set(['destroyer', 'cruiser', 'battleship', 'carrier', 'submarine', 'frigate']);
+const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
+  DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y,
+  DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x
+);
 let nextAirstrikeId = 1;
 
 function readPngDimensions(filePath) {
@@ -89,13 +110,15 @@ function getDefenseTowerMuzzleWorldPosition(centerX, centerY, targetX, targetY) 
   const scale = DEFENSE_TOWER_IMAGE_METRICS.scale;
   const pivotX = centerX - (DEFENSE_TOWER_IMAGE_METRICS.width / 2) + (DEFENSE_TOWER_CANNON_START.x * scale);
   const pivotY = centerY - (DEFENSE_TOWER_IMAGE_METRICS.height / 2) + (DEFENSE_TOWER_CANNON_START.y * scale);
-  const angle = Math.atan2(targetY - pivotY, targetX - pivotX);
+  const aimAngle = Math.atan2(targetY - pivotY, targetX - pivotX);
+  const angle = aimAngle - DEFENSE_TOWER_CANNON_BASE_ANGLE;
   const muzzleLocalX = (DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x) * scale;
   const muzzleLocalY = (DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y) * scale;
   const cosAngle = Math.cos(angle);
   const sinAngle = Math.sin(angle);
   return {
     angle,
+    aimAngle,
     pivotX,
     pivotY,
     originX: pivotX + (muzzleLocalX * cosAngle) - (muzzleLocalY * sinAngle),
@@ -113,9 +136,22 @@ function getBuildingCollisionSize(type) {
 function getUnitAreaHitRadius(unit) {
   if (!unit) return 0;
   if (unit.type === 'worker' || unit.type === 'mine') return 20;
-  const baseSize = unit.type === 'frigate' ? 35 : (unit.type === 'aircraft' ? 25 : 60);
-  const heightMult = unit.type === 'aircraft' ? 2.5 : SHIP_HEIGHT_MULT;
+  const baseSize = unit.type === 'frigate'
+    ? 35
+    : (unit.type === 'recon_aircraft'
+      ? 75
+      : (unit.type === 'aircraft' ? 25 : 60));
+  const heightMult = isAirUnitType(unit) ? 2.5 : SHIP_HEIGHT_MULT;
   return (baseSize * heightMult) / 2;
+}
+
+function isAirUnitType(unitOrType) {
+  const type = typeof unitOrType === 'string' ? unitOrType : unitOrType?.type;
+  return type === 'aircraft' || type === 'recon_aircraft';
+}
+
+function canAcceptPlayerOrders(unit) {
+  return !!unit && unit.type !== 'recon_aircraft';
 }
 
 function targetIntersectsDamageCircle(centerX, centerY, damageRadius, targetX, targetY, targetRadius) {
@@ -127,6 +163,10 @@ function targetIntersectsDamageCircle(centerX, centerY, damageRadius, targetX, t
 
 function hasValidSlbmPosition(slbm) {
   return !!(slbm && Number.isFinite(slbm.currentX) && Number.isFinite(slbm.currentY));
+}
+
+function createUniqueEntityId(offset = 0) {
+  return (Date.now() * 1000) + Math.floor(Math.random() * 1000) + offset;
 }
 
 const UNIT_DEFINITIONS = {
@@ -225,6 +265,18 @@ const UNIT_DEFINITIONS = {
     attackCooldownMs: 250,
     visionRadius: 1000,
     buildTime: 0
+  },
+  recon_aircraft: {
+    cost: 150,
+    pop: 0,
+    hp: 180,
+    damage: 0,
+    speed: 10,
+    size: 75,
+    attackRange: 0,
+    attackCooldownMs: 99999,
+    visionRadius: 2600,
+    buildTime: RECON_AIRCRAFT_BUILD_TIME_MS
   },
   mine: {
     cost: 0,
@@ -515,6 +567,10 @@ function buildClientUnitsPayload() {
       aircraftDeployed: unit.aircraftDeployed ?? null,
       aircraftQueue: unit.aircraftQueue ?? [],
       producingAircraft: unit.producingAircraft ?? null,
+      reconAircraft: unit.reconAircraft ?? null,
+      reconAircraftDeployed: unit.reconAircraftDeployed ?? null,
+      reconAircraftQueue: unit.reconAircraftQueue ?? [],
+      producingReconAircraft: unit.producingReconAircraft ?? null,
       attackMove: !!unit.attackMove,
       attackTargetId: unit.attackTargetId ?? null,
       attackTargetType: unit.attackTargetType ?? null,
@@ -554,6 +610,22 @@ function buildClientBuildingsPayload() {
     });
   });
   return buildings;
+}
+
+function buildClientRedZonePayload() {
+  if (!gameState || !Array.isArray(gameState.activeRedZones)) return [];
+  return gameState.activeRedZones.map(zone => ({
+    id: zone.id,
+    islandId: zone.islandId,
+    centerX: zone.centerX,
+    centerY: zone.centerY,
+    landCells: zone.landCells,
+    blastRadius: zone.blastRadius,
+    selectedAt: zone.selectedAt,
+    bombardmentAt: zone.bombardmentAt,
+    detonatedAt: zone.detonatedAt ?? null,
+    endsAt: zone.endsAt
+  }));
 }
 
 // Initialize database
@@ -669,12 +741,16 @@ function createRoomState() {
     buildings: new Map(),
     activeSlbms: new Map(),
     activeAirstrikes: new Map(),
+    activeRedZones: [],
     nextSlbmId: 1,
     map: null,
     landCellsSnapshot: null,
     lastUpdate: Date.now(),
     fogOfWar: new Map(),
-    aiRespawnTimers: new Map()
+    aiRespawnTimers: new Map(),
+    nextRedZoneId: 1,
+    nextRedZoneRollAt: Date.now() + RED_ZONE_SELECTION_INTERVAL_MS,
+    lastRedZoneCountdownSecond: null
   };
 }
 
@@ -1201,7 +1277,7 @@ function assignMoveTarget(unit, targetX, targetY) {
   if (!unit) return false;
   const clampedTarget = clampToMapBounds(targetX, targetY);
 
-  if (unit.type === 'worker' || unit.type === 'aircraft') {
+  if (unit.type === 'worker' || isAirUnitType(unit)) {
     // Workers and aircraft can move anywhere (land + water)
     const path = findPath(unit.x, unit.y, clampedTarget.x, clampedTarget.y, 'worker');
     if (path && path.length > 1) {
@@ -1928,7 +2004,7 @@ function spawnAdminBase(userId) {
 }
 
 // Check for player defeat (all buildings destroyed)
-function checkPlayerDefeat(userId, attackerId = null) {
+function checkPlayerDefeat(userId, attackerId = null, attackerNameOverride = null, defeatReason = null) {
   let hasBuildings = false;
   gameState.buildings.forEach(building => {
     if (building.userId === userId) {
@@ -1945,7 +2021,9 @@ function checkPlayerDefeat(userId, attackerId = null) {
     }
     const attackerPlayer = attackerId ? gameState.players.get(attackerId) : null;
     const defeatedName = defeatedPlayer ? defeatedPlayer.username : `Player ${userId}`;
-    const attackerName = attackerPlayer ? attackerPlayer.username : '알 수 없음';
+    const attackerName = attackerPlayer
+      ? attackerPlayer.username
+      : (attackerNameOverride || '알 수 없음');
 
     if (defeatedPlayer.isAI) {
       roomEmit('playerDefeated', {
@@ -1955,6 +2033,7 @@ function checkPlayerDefeat(userId, attackerId = null) {
         attackerName,
         attackerId: attackerId || null,
         isAI: true,
+        defeatReason,
         respawnDelayMs: AI_CONFIG.respawnDelayMs
       });
       removePlayerFromCurrentRoom(userId, { emitPlayerLeft: true });
@@ -1991,7 +2070,8 @@ function checkPlayerDefeat(userId, attackerId = null) {
       respawned: true, 
       defeatedName, 
       attackerName,
-      attackerId: attackerId || null
+      attackerId: attackerId || null,
+      defeatReason
     });
 
     console.log(`${defeatedName} was defeated by ${attackerName} and respawned`);
@@ -2060,6 +2140,9 @@ io.on('connection', (socket) => {
 
     if (wasRoomIdle) {
       gameState.lastUpdate = Date.now();
+      gameState.activeRedZones = [];
+      gameState.lastRedZoneCountdownSecond = null;
+      gameState.nextRedZoneRollAt = Date.now() + RED_ZONE_SELECTION_INTERVAL_MS;
       const spawnedAiCount = initializeAIPlayers();
       syncSlbmId();
       console.log(`Room ${socket.roomId} activated by ${socket.username}; spawned ${spawnedAiCount} AI player(s)`);
@@ -2075,7 +2158,8 @@ io.on('connection', (socket) => {
       players: buildClientPlayersPayload(),
       units: buildClientUnitsPayload(),
       buildings: buildClientBuildingsPayload(),
-      missiles: player ? (player.missiles || 0) : 0
+      missiles: player ? (player.missiles || 0) : 0,
+      redZones: buildClientRedZonePayload()
     };
     
     console.log(`Sending init data: ${initData.players.length} players, ${initData.units.length} units, ${initData.buildings.length} buildings`);
@@ -2096,7 +2180,7 @@ io.on('connection', (socket) => {
     const { unitIds, targetX, targetY } = data;
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
-      if (unit && unit.userId === socket.userId) {
+      if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
         if (assignMoveTarget(unit, targetX, targetY)) {
           unit.holdPosition = false;
           unit.attackMove = false;
@@ -2112,7 +2196,7 @@ io.on('connection', (socket) => {
     const { unitIds, targetId, targetType } = data;
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
-      if (unit && unit.userId === socket.userId) {
+      if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
         unit.holdPosition = false;
         unit.attackMove = false;
         unit.attackTargetId = targetId;
@@ -2293,6 +2377,117 @@ io.on('connection', (socket) => {
       }
     }
   });
+
+  socket.on('produceReconAircraft', (data) => {
+    switchRoom(socket.roomId);
+    const { unitId } = data;
+    const carrier = gameState.units.get(unitId);
+    const player = gameState.players.get(socket.userId);
+    if (!carrier || carrier.userId !== socket.userId || carrier.type !== 'carrier' || !player) return;
+    if (!carrier.reconAircraft) carrier.reconAircraft = [];
+    if (!carrier.reconAircraftDeployed) carrier.reconAircraftDeployed = [];
+    if (!carrier.reconAircraftQueue) carrier.reconAircraftQueue = [];
+    const totalRecon = carrier.reconAircraft.length + carrier.reconAircraftDeployed.length + carrier.reconAircraftQueue.length;
+    if (totalRecon >= RECON_AIRCRAFT_MAX_PER_CARRIER) return;
+    if (carrier.reconAircraftQueue.length >= RECON_AIRCRAFT_MAX_PER_CARRIER) return;
+    const reconConfig = getUnitDefinition('recon_aircraft');
+    if (player.resources >= reconConfig.cost) {
+      player.resources -= reconConfig.cost;
+      carrier.reconAircraftQueue.push({
+        type: 'recon_aircraft',
+        buildTime: RECON_AIRCRAFT_BUILD_TIME_MS,
+        userId: socket.userId
+      });
+      if (!carrier.producingReconAircraft) {
+        const next = carrier.reconAircraftQueue[0];
+        carrier.producingReconAircraft = {
+          type: next.type,
+          startTime: Date.now(),
+          buildTime: next.buildTime,
+          userId: next.userId
+        };
+      }
+    }
+  });
+
+  function getReconAircraftLaunchTarget(targetX, targetY, launchIndex, totalCount) {
+    if (totalCount <= 1) {
+      return clampToMapBounds(targetX, targetY);
+    }
+
+    const angle = (Math.PI * 2 * launchIndex) / totalCount;
+    const radius = totalCount === 2 ? RECON_AIRCRAFT_ORBIT_RADIUS * 0.7 : RECON_AIRCRAFT_ORBIT_RADIUS;
+    return clampToMapBounds(
+      targetX + Math.cos(angle) * radius,
+      targetY + Math.sin(angle) * radius
+    );
+  }
+
+  function spawnReconAircraftFromCarrier(carrier, targetX, targetY, reconStock, launchIndex, totalCount, now) {
+    const reconConfig = getUnitDefinition('recon_aircraft');
+    const reconId = createUniqueEntityId(700 + launchIndex);
+    const assignedTarget = getReconAircraftLaunchTarget(targetX, targetY, launchIndex, totalCount);
+    const spawnPos = findNonOverlappingPosition(
+      carrier.x + (Math.random() - 0.5) * 50,
+      carrier.y + (Math.random() - 0.5) * 50,
+      reconConfig.size
+    );
+    const reconAircraft = {
+      id: reconId,
+      userId: carrier.userId,
+      type: 'recon_aircraft',
+      x: spawnPos.x,
+      y: spawnPos.y,
+      hp: Math.max(1, Math.min(reconConfig.hp, reconStock?.hp ?? reconConfig.hp)),
+      maxHp: reconConfig.hp,
+      damage: 0,
+      speed: reconConfig.speed,
+      size: reconConfig.size,
+      attackRange: 0,
+      attackCooldownMs: reconConfig.attackCooldownMs,
+      visionRadius: reconConfig.visionRadius,
+      targetX: null,
+      targetY: null,
+      gatheringResourceId: null,
+      buildingType: null,
+      buildTargetX: null,
+      buildTargetY: null,
+      isDetected: true,
+      kills: 0,
+      sourceCarrierId: carrier.id,
+      scoutTargetX: assignedTarget.x,
+      scoutTargetY: assignedTarget.y,
+      scoutBaseTargetX: targetX,
+      scoutBaseTargetY: targetY,
+      scoutState: 'outbound',
+      scoutLoiterUntil: null,
+      scoutOrbitAngle: Math.random() * Math.PI * 2,
+      scoutNextOrbitAt: now,
+      holdPosition: true
+    };
+    assignMoveTarget(reconAircraft, assignedTarget.x, assignedTarget.y);
+    gameState.units.set(reconId, reconAircraft);
+    carrier.reconAircraftDeployed.push(reconId);
+    roomEmit('unitCreated', reconAircraft);
+  }
+
+  socket.on('launchReconAircraft', (data) => {
+    switchRoom(socket.roomId);
+    const { unitId, targetX, targetY } = data;
+    const carrier = gameState.units.get(unitId);
+    if (!carrier || carrier.userId !== socket.userId || carrier.type !== 'carrier') return;
+    if (!carrier.reconAircraft) carrier.reconAircraft = [];
+    if (!carrier.reconAircraftDeployed) carrier.reconAircraftDeployed = [];
+    if (carrier.reconAircraft.length <= 0) return;
+
+    const clamped = clampToMapBounds(targetX, targetY);
+    const now = Date.now();
+    const reconStock = carrier.reconAircraft.pop();
+    const deployedCount = carrier.reconAircraftDeployed.length;
+    const launchIndex = deployedCount % RECON_AIRCRAFT_MAX_PER_CARRIER;
+    const activeCount = Math.min(RECON_AIRCRAFT_MAX_PER_CARRIER, deployedCount + 1);
+    spawnReconAircraftFromCarrier(carrier, clamped.x, clamped.y, reconStock, launchIndex, activeCount, now);
+  });
   
   // Carrier: deploy aircraft
   socket.on('deployAircraft', (data) => {
@@ -2325,7 +2520,7 @@ io.on('connection', (socket) => {
     const { unitIds, targetX, targetY } = data;
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
-      if (unit && unit.userId === socket.userId) {
+      if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
         if (assignMoveTarget(unit, targetX, targetY)) {
           unit.holdPosition = false;
           unit.attackMove = true; // Flag for attack-move behavior
@@ -2340,7 +2535,7 @@ io.on('connection', (socket) => {
     if (!Array.isArray(unitIds)) return;
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
-      if (!unit || unit.userId !== socket.userId) return;
+      if (!unit || unit.userId !== socket.userId || !canAcceptPlayerOrders(unit)) return;
       unit.holdPosition = true;
       unit.attackMove = false;
       unit.attackTargetId = null;
@@ -2531,6 +2726,12 @@ io.on('connection', (socket) => {
   socket.on('resetAllAiFactions', () => {
     switchRoom(socket.roomId);
     resetAllAiFactionsInCurrentRoom();
+  });
+
+  socket.on('triggerRedZoneNow', () => {
+    switchRoom(socket.roomId);
+    if (!gameState || !gameState.map) return;
+    rollNewRedZones(Date.now());
   });
 
   socket.on('disconnect', () => {
@@ -2873,7 +3074,7 @@ function buildBuilding(userId, type, x, y) {
       }
     }
   });
-  
+
   if (!workerNearby && type !== 'headquarters') {
     return; // Workers must be nearby to build
   }
@@ -3038,46 +3239,80 @@ function updateFogOfWar() {
 }
 
 // Apply SLBM impact damage
-function applySlbmDamage(slbm) {
-  const damageRadius = 800;
+function applySlbmDamage(slbm, now = Date.now()) {
+  const damageRadius = SLBM_DAMAGE_RADIUS;
   const firingPlayer = gameState.players.get(slbm.userId);
   const firingSub = gameState.units.get(slbm.firingSubId);
-  
+
   gameState.units.forEach(target => {
-    const dx = target.x - slbm.targetX;
-    const dy = target.y - slbm.targetY;
-    if (Math.sqrt(dx * dx + dy * dy) <= damageRadius) {
-      target.hp = Math.max(0, target.hp - 500);
-      target.lastDamageTime = Date.now();
-      if (target.hp <= 0) {
-        const targetOwner = gameState.players.get(target.userId);
-        if (targetOwner) {
-          const popCost = getUnitDefinition(target.type).pop;
-          targetOwner.population = Math.max(0, targetOwner.population - popCost);
-        }
-        if (isNavalUnitType(target.type)) {
-          roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
-        }
-        if (firingSub) firingSub.kills = (firingSub.kills || 0) + 1;
-        if (firingPlayer) firingPlayer.combatPower += 10;
-        gameState.units.delete(target.id);
+    const targetRadius = getUnitAreaHitRadius(target);
+    if (!targetIntersectsDamageCircle(slbm.targetX, slbm.targetY, damageRadius, target.x, target.y, targetRadius)) {
+      return;
+    }
+    target.hp = Math.max(0, target.hp - 500);
+    target.lastDamageTime = now;
+    if (target.hp <= 0) {
+      const targetOwner = gameState.players.get(target.userId);
+      if (targetOwner) {
+        const popCost = getUnitDefinition(target.type).pop;
+        targetOwner.population = Math.max(0, targetOwner.population - popCost);
       }
+      if (isNavalUnitType(target.type) || target.type === 'mine') {
+        roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+      }
+      if (firingSub) firingSub.kills = (firingSub.kills || 0) + 1;
+      if (firingPlayer) firingPlayer.combatPower += 10;
+      gameState.units.delete(target.id);
     }
   });
-  
+
   gameState.buildings.forEach(target => {
-    const dx = target.x - slbm.targetX;
-    const dy = target.y - slbm.targetY;
-    if (Math.sqrt(dx * dx + dy * dy) <= damageRadius) {
-      target.hp = Math.max(0, target.hp - 800);
-      target.lastDamageTime = Date.now();
-      if (target.hp <= 0) {
-        roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
-        if (firingPlayer) firingPlayer.combatPower += 20;
-        gameState.buildings.delete(target.id);
-        checkPlayerDefeat(target.userId, slbm.userId);
-      }
+    const targetRadius = getBuildingCollisionSize(target.type) / 2;
+    if (!targetIntersectsDamageCircle(slbm.targetX, slbm.targetY, damageRadius, target.x, target.y, targetRadius)) {
+      return;
     }
+    target.hp = Math.max(0, target.hp - 800);
+    target.lastDamageTime = now;
+    if (target.hp <= 0) {
+      roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+      if (firingPlayer) firingPlayer.combatPower += 20;
+      gameState.buildings.delete(target.id);
+      checkPlayerDefeat(target.userId, slbm.userId);
+    }
+  });
+}
+
+function resolveActiveSlbmImpacts(now) {
+  gameState.activeSlbms.forEach((slbm, slbmId) => {
+    if (slbm.hp <= 0) {
+      roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
+      gameState.activeSlbms.delete(slbmId);
+      return;
+    }
+    if (!slbm.hasReachedTarget) return;
+
+    applySlbmDamage(slbm, now);
+    roomEmit('slbmImpact', { id: slbmId, x: slbm.targetX, y: slbm.targetY });
+
+    const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
+    const impactVisionRadius = 2000;
+    const gridX = Math.floor(slbm.targetX / cellSize);
+    const gridY = Math.floor(slbm.targetY / cellSize);
+    const gridRadius = Math.ceil(impactVisionRadius / cellSize);
+    gameState.players.forEach((player, playerId) => {
+      const playerFog = gameState.fogOfWar.get(playerId);
+      if (!playerFog) return;
+      for (let dx = -gridRadius; dx <= gridRadius; dx++) {
+        for (let dy = -gridRadius; dy <= gridRadius; dy++) {
+          if (dx * dx + dy * dy <= gridRadius * gridRadius) {
+            const key = `${gridX + dx}_${gridY + dy}`;
+            playerFog.set(key, { lastSeen: now, explored: true });
+          }
+        }
+      }
+    });
+
+    gameState.activeSlbms.delete(slbmId);
   });
 }
 
@@ -3119,7 +3354,7 @@ function updateGame(deltaTime) {
         const nextY = unit.y + ((dy / distance) * moveStep);
         const clampedNext = clampToMapBounds(nextX, nextY);
 
-        if (unit.type === 'worker' || unit.type === 'aircraft') {
+        if (unit.type === 'worker' || isAirUnitType(unit)) {
           // Workers and aircraft can fly over any terrain
           unit.x = clampedNext.x;
           unit.y = clampedNext.y;
@@ -3462,7 +3697,7 @@ function updateGame(deltaTime) {
     if (mine.type !== 'mine' || mine.hp <= 0) return;
     const mineRange = mine.attackRange || 80; // Blast radius = 2x visual radius (visual radius = size/2 = 20, range = 80)
     gameState.units.forEach((target, targetId) => {
-      if (target.userId === mine.userId || target.type === 'mine' || target.type === 'aircraft' || target.hp <= 0) return;
+      if (target.userId === mine.userId || target.type === 'mine' || isAirUnitType(target) || target.hp <= 0) return;
       const dx = target.x - mine.x;
       const dy = target.y - mine.y;
       if (Math.sqrt(dx * dx + dy * dy) <= mineRange) {
@@ -3556,6 +3791,8 @@ function updateGame(deltaTime) {
     }
   });
 
+  updateRedZones(now);
+
   // Carrier airstrike readiness tracking
   gameState.units.forEach(unit => {
     if (unit.type !== 'carrier') return;
@@ -3628,6 +3865,9 @@ function updateGame(deltaTime) {
     if (!unit.aircraft) unit.aircraft = [];
     if (!unit.aircraftDeployed) unit.aircraftDeployed = [];
     if (!unit.aircraftQueue) unit.aircraftQueue = [];
+    if (!unit.reconAircraft) unit.reconAircraft = [];
+    if (!unit.reconAircraftDeployed) unit.reconAircraftDeployed = [];
+    if (!unit.reconAircraftQueue) unit.reconAircraftQueue = [];
     
     // Aircraft production queue processing
     if (unit.producingAircraft) {
@@ -3648,7 +3888,25 @@ function updateGame(deltaTime) {
         }
       }
     }
-    
+
+    if (unit.producingReconAircraft) {
+      const elapsed = now - unit.producingReconAircraft.startTime;
+      if (elapsed >= unit.producingReconAircraft.buildTime) {
+        unit.reconAircraft.push({ hp: getUnitDefinition('recon_aircraft').hp });
+        unit.reconAircraftQueue.shift();
+        unit.producingReconAircraft = null;
+        if (unit.reconAircraftQueue.length > 0) {
+          const next = unit.reconAircraftQueue[0];
+          unit.producingReconAircraft = {
+            type: next.type,
+            startTime: Date.now(),
+            buildTime: next.buildTime,
+            userId: next.userId
+          };
+        }
+      }
+    }
+     
     // Auto-deploy aircraft when enemies are nearby
     let enemyNearCarrier = false;
     gameState.units.forEach(enemy => {
@@ -3711,8 +3969,9 @@ function updateGame(deltaTime) {
       unit.deployAircraft = false;
     }
     
-    // Clean up destroyed aircraft references
+    // Clean up destroyed carrier aircraft references
     unit.aircraftDeployed = unit.aircraftDeployed.filter(id => gameState.units.has(id));
+    unit.reconAircraftDeployed = unit.reconAircraftDeployed.filter(id => gameState.units.has(id));
   });
   
   // Aircraft behavior - patrol near carrier, attack enemies, return when no enemies
@@ -3767,6 +4026,89 @@ function updateGame(deltaTime) {
     // If aircraft is too far from carrier and has no player-assigned target, bring it back
     if (distToCarrier > maxRange + 100 && !ac.attackTargetId) {
       assignMoveTarget(ac, carrier.x + (Math.random() - 0.5) * 100, carrier.y + (Math.random() - 0.5) * 100);
+    }
+  });
+
+  gameState.units.forEach((recon) => {
+    if (recon.type !== 'recon_aircraft' || !recon.sourceCarrierId) return;
+
+    const carrier = gameState.units.get(recon.sourceCarrierId);
+    if (!carrier || carrier.type !== 'carrier') {
+      gameState.units.delete(recon.id);
+      return;
+    }
+
+    const baseTargetX = Number.isFinite(recon.scoutBaseTargetX) ? recon.scoutBaseTargetX : recon.scoutTargetX;
+    const baseTargetY = Number.isFinite(recon.scoutBaseTargetY) ? recon.scoutBaseTargetY : recon.scoutTargetY;
+    const targetDx = (recon.scoutTargetX ?? carrier.x) - recon.x;
+    const targetDy = (recon.scoutTargetY ?? carrier.y) - recon.y;
+    const distToAssignedTarget = Math.sqrt((targetDx * targetDx) + (targetDy * targetDy));
+    const carrierDx = carrier.x - recon.x;
+    const carrierDy = carrier.y - recon.y;
+    const distToCarrier = Math.sqrt((carrierDx * carrierDx) + (carrierDy * carrierDy));
+
+    if (!recon.scoutState) {
+      recon.scoutState = 'outbound';
+    }
+
+    if (recon.scoutState === 'outbound') {
+      if (!Number.isFinite(recon.targetX) || !Number.isFinite(recon.targetY)) {
+        assignMoveTarget(recon, recon.scoutTargetX, recon.scoutTargetY);
+      }
+      if (distToAssignedTarget <= RECON_AIRCRAFT_TARGET_THRESHOLD) {
+        recon.scoutState = 'loiter';
+        recon.scoutLoiterUntil = now + RECON_AIRCRAFT_LOITER_MS;
+        recon.scoutNextOrbitAt = now;
+        recon.targetX = null;
+        recon.targetY = null;
+      }
+      return;
+    }
+
+    if (recon.scoutState === 'loiter') {
+      if (!Number.isFinite(recon.scoutLoiterUntil) || now >= recon.scoutLoiterUntil) {
+        recon.scoutState = 'returning';
+        recon.scoutNextOrbitAt = now;
+        assignMoveTarget(recon, carrier.x + (Math.random() - 0.5) * 40, carrier.y + (Math.random() - 0.5) * 40);
+        return;
+      }
+
+      const needNewOrbitPoint =
+        !Number.isFinite(recon.targetX) ||
+        !Number.isFinite(recon.targetY) ||
+        now >= (recon.scoutNextOrbitAt || 0) ||
+        distToAssignedTarget <= RECON_AIRCRAFT_TARGET_THRESHOLD * 0.65;
+
+      if (needNewOrbitPoint) {
+        recon.scoutOrbitAngle = (recon.scoutOrbitAngle || 0) + (Math.PI / 2) + (Math.random() * 0.8);
+        const orbitTarget = clampToMapBounds(
+          baseTargetX + Math.cos(recon.scoutOrbitAngle) * RECON_AIRCRAFT_ORBIT_RADIUS,
+          baseTargetY + Math.sin(recon.scoutOrbitAngle) * RECON_AIRCRAFT_ORBIT_RADIUS
+        );
+        recon.scoutTargetX = orbitTarget.x;
+        recon.scoutTargetY = orbitTarget.y;
+        recon.scoutNextOrbitAt = now + 900 + Math.floor(Math.random() * 500);
+        assignMoveTarget(recon, orbitTarget.x, orbitTarget.y);
+      }
+      return;
+    }
+
+    if (recon.scoutState === 'returning') {
+      if (distToCarrier <= RECON_AIRCRAFT_DOCK_RADIUS) {
+        gameState.units.delete(recon.id);
+        carrier.reconAircraftDeployed = carrier.reconAircraftDeployed.filter(id => id !== recon.id);
+        carrier.reconAircraft.push({ hp: Math.max(1, Math.min(recon.maxHp || getUnitDefinition('recon_aircraft').hp, recon.hp)) });
+        return;
+      }
+
+      if (
+        !Number.isFinite(recon.targetX) ||
+        !Number.isFinite(recon.targetY) ||
+        now >= (recon.scoutNextOrbitAt || 0)
+      ) {
+        recon.scoutNextOrbitAt = now + 600;
+        assignMoveTarget(recon, carrier.x + (Math.random() - 0.5) * 40, carrier.y + (Math.random() - 0.5) * 40);
+      }
     }
   });
 
@@ -3910,8 +4252,12 @@ function updateGame(deltaTime) {
       const r = (unit.type === 'worker' ? 40 : 40) * 0.5;
       return { semiMajor: r, semiMinor: r, angle: 0 };
     }
-    const sz = unit.type === 'frigate' ? 35 : (unit.type === 'aircraft' ? 25 : 60);
-    const hm = unit.type === 'aircraft' ? 2.5 : SHIP_HEIGHT_MULT;
+    const sz = unit.type === 'frigate'
+      ? 35
+      : (unit.type === 'recon_aircraft'
+        ? 75
+        : (unit.type === 'aircraft' ? 25 : 60));
+    const hm = isAirUnitType(unit) ? 2.5 : SHIP_HEIGHT_MULT;
     const semiMajor = (sz * hm) / 2;
     const semiMinor = semiMajor * SHIP_ASPECT_RATIO;
     return { semiMajor, semiMinor, angle: unit.angle || 0 };
@@ -3929,7 +4275,7 @@ function updateGame(deltaTime) {
   const collisionSpatialMap = new Map();
   for (let i = 0; i < unitArray.length; i++) {
     const unit = unitArray[i];
-    if (unit.type === 'aircraft') continue;
+    if (isAirUnitType(unit)) continue;
     if (unit.type === 'mine') continue;
     const cellX = Math.floor(unit.x / COLLISION_SPATIAL_CELL_SIZE);
     const cellY = Math.floor(unit.y / COLLISION_SPATIAL_CELL_SIZE);
@@ -3944,7 +4290,7 @@ function updateGame(deltaTime) {
 
   for (let i = 0; i < unitArray.length; i++) {
     const a = unitArray[i];
-    if (a.type === 'aircraft') continue;
+    if (isAirUnitType(a)) continue;
     const cellX = Math.floor(a.x / COLLISION_SPATIAL_CELL_SIZE);
     const cellY = Math.floor(a.y / COLLISION_SPATIAL_CELL_SIZE);
 
@@ -3958,7 +4304,7 @@ function updateGame(deltaTime) {
           const j = bucket[k];
           if (j <= i) continue;
           const b = unitArray[j];
-          if (!b || b.type === 'aircraft') continue;
+          if (!b || isAirUnitType(b)) continue;
 
           const dx = b.x - a.x;
           const dy = b.y - a.y;
@@ -4039,6 +4385,7 @@ function updateGame(deltaTime) {
   gameState.units.forEach((unit, unitId) => {
     // Skip workers for auto-attack
     if (unit.type === 'worker') return;
+    if (unit.type === 'recon_aircraft') return;
     // Carrier has no direct attack (uses aircraft instead)
     if (unit.type === 'carrier') return;
     // Mines don't auto-attack (they detonate on proximity, handled separately)
@@ -4135,7 +4482,7 @@ function updateGame(deltaTime) {
         }
       }
     }
-    
+
     // 3) Process attack on target
     if (target) {
       // SLBM targets use currentX/currentY instead of x/y
@@ -4292,6 +4639,8 @@ function updateGame(deltaTime) {
       // attackMove naturally clears when unit reaches its move target
     }
   });
+
+  resolveActiveSlbmImpacts(now);
 }
 
 // Ranking endpoint
@@ -4515,39 +4864,6 @@ function clearActiveWeaponsForUser(userId) {
   strikeIdsToDelete.forEach(strikeId => {
     gameState.activeAirstrikes.delete(strikeId);
     roomEmit('airstrikeCancelled', { id: strikeId });
-  });
-
-  // Resolve SLBM destruction/impact after all interceptors acted this tick.
-  gameState.activeSlbms.forEach((slbm, slbmId) => {
-    if (slbm.hp <= 0) {
-      roomEmit('slbmDestroyed', { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
-      gameState.activeSlbms.delete(slbmId);
-      return;
-    }
-    if (!slbm.hasReachedTarget) return;
-
-    applySlbmDamage(slbm);
-    roomEmit('slbmImpact', { id: slbmId, x: slbm.targetX, y: slbm.targetY });
-
-    const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
-    const impactVisionRadius = 2000;
-    const gridX = Math.floor(slbm.targetX / cellSize);
-    const gridY = Math.floor(slbm.targetY / cellSize);
-    const gridRadius = Math.ceil(impactVisionRadius / cellSize);
-    gameState.players.forEach((player, playerId) => {
-      const playerFog = gameState.fogOfWar.get(playerId);
-      if (!playerFog) return;
-      for (let dx = -gridRadius; dx <= gridRadius; dx++) {
-        for (let dy = -gridRadius; dy <= gridRadius; dy++) {
-          if (dx * dx + dy * dy <= gridRadius * gridRadius) {
-            const key = `${gridX + dx}_${gridY + dy}`;
-            playerFog.set(key, { lastSeen: now, explored: true });
-          }
-        }
-      }
-    });
-
-    gameState.activeSlbms.delete(slbmId);
   });
 }
 
@@ -5445,6 +5761,302 @@ function updateAI() {
   });
 }
 
+function emitRedZoneSync() {
+  roomEmit('redZoneSync', {
+    redZones: buildClientRedZonePayload()
+  });
+}
+
+function getWorldCellCenter(gridX, gridY, cellSize = (gameState && gameState.map ? (gameState.map.cellSize || 50) : 50)) {
+  return {
+    x: gridX * cellSize + (cellSize / 2),
+    y: gridY * cellSize + (cellSize / 2)
+  };
+}
+
+function islandContainsWorldPoint(island, x, y) {
+  if (!gameState || !gameState.map || !island || !island.cellKeys) return false;
+  const cellSize = gameState.map.cellSize || 50;
+  const gridSize = gameState.map.gridSize || 0;
+  const gridX = Math.floor(x / cellSize);
+  const gridY = Math.floor(y / cellSize);
+  if (gridX < 0 || gridY < 0 || gridX >= gridSize || gridY >= gridSize) return false;
+  return island.cellKeys.has((gridY * gridSize) + gridX);
+}
+
+function buildIslandBurstPoints(island) {
+  if (!gameState || !gameState.map || !island || !Array.isArray(island.landCells) || island.landCells.length === 0) {
+    return [{ x: island?.x || 0, y: island?.y || 0, delayMs: 0 }];
+  }
+
+  const cellSize = gameState.map.cellSize || 50;
+  const sourceCells = island.landCells;
+  const sampleStep = sourceCells.length > 1600 ? Math.ceil(sourceCells.length / 1600) : 1;
+  const candidates = [];
+  for (let i = 0; i < sourceCells.length; i += sampleStep) {
+    const [gx, gy] = sourceCells[i];
+    candidates.push(getWorldCellCenter(gx, gy, cellSize));
+  }
+  if (candidates.length === 0) {
+    candidates.push({ x: island.x, y: island.y });
+  }
+
+  const desiredCount = Math.max(
+    RED_ZONE_MIN_BURSTS,
+    Math.min(RED_ZONE_MAX_BURSTS, Math.round(island.size / 100))
+  );
+
+  let centerIndex = 0;
+  let centerDistSq = Infinity;
+  for (let i = 0; i < candidates.length; i++) {
+    const dx = candidates[i].x - island.x;
+    const dy = candidates[i].y - island.y;
+    const distSq = (dx * dx) + (dy * dy);
+    if (distSq < centerDistSq) {
+      centerDistSq = distSq;
+      centerIndex = i;
+    }
+  }
+
+  const selected = [candidates.splice(centerIndex, 1)[0]];
+  while (selected.length < desiredCount && candidates.length > 0) {
+    let bestIndex = 0;
+    let bestScore = -1;
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      let nearestSelectedSq = Infinity;
+      for (let j = 0; j < selected.length; j++) {
+        const dx = candidate.x - selected[j].x;
+        const dy = candidate.y - selected[j].y;
+        const distSq = (dx * dx) + (dy * dy);
+        if (distSq < nearestSelectedSq) {
+          nearestSelectedSq = distSq;
+        }
+      }
+      if (nearestSelectedSq > bestScore) {
+        bestScore = nearestSelectedSq;
+        bestIndex = i;
+      }
+    }
+    selected.push(candidates.splice(bestIndex, 1)[0]);
+  }
+
+  return selected.map((point, index) => ({
+    x: point.x,
+    y: point.y,
+    delayMs: index * RED_ZONE_BURST_DELAY_STEP_MS
+  }));
+}
+
+function getHumanUsersOnRedZoneIslands(zones) {
+  const affected = new Map();
+  if (!Array.isArray(zones) || zones.length === 0) return affected;
+
+  zones.forEach(zone => {
+    const zoneUsers = new Set();
+    gameState.buildings.forEach(building => {
+      if (zoneUsers.has(building.userId)) return;
+      const owner = gameState.players.get(building.userId);
+      if (!owner || owner.isAI || owner.online === false) return;
+      if (!islandContainsWorldPoint(zone, building.x, building.y)) return;
+      zoneUsers.add(building.userId);
+    });
+    gameState.units.forEach(unit => {
+      if (zoneUsers.has(unit.userId)) return;
+      const owner = gameState.players.get(unit.userId);
+      if (!owner || owner.isAI || owner.online === false) return;
+      if (!islandContainsWorldPoint(zone, unit.x, unit.y)) return;
+      zoneUsers.add(unit.userId);
+    });
+    zoneUsers.forEach(userId => {
+      affected.set(userId, (affected.get(userId) || 0) + 1);
+    });
+  });
+
+  return affected;
+}
+
+function buildRedZoneAlertMessage(zoneCount, secondsLeft) {
+  const zoneText = zoneCount > 1
+    ? `회색 표시된 ${zoneCount}개 섬이`
+    : '회색 표시된 섬이';
+  return `레드존 경보: ${zoneText} ${secondsLeft}초 후 폭격`;
+}
+
+function emitRedZoneActivationAlert() {
+  roomEmit('systemKillLog', {
+    message: '레드존 활성화까지 30초 남았습니다',
+    variant: 'red-zone'
+  });
+}
+
+function emitRedZoneCountdownAlerts(affectedUsers, secondsLeft) {
+  affectedUsers.forEach((zoneCount, userId) => {
+    roomEmit('redZoneAlert', {
+      targetUserId: userId,
+      zoneCount,
+      secondsLeft,
+      message: buildRedZoneAlertMessage(zoneCount, secondsLeft)
+    });
+  });
+}
+
+function createRedZoneEntry(island, now) {
+  return {
+    id: `rz-${gameState.nextRedZoneId++}`,
+    islandId: island.id,
+    centerX: island.x,
+    centerY: island.y,
+    landCells: island.landCells,
+    cellKeys: island.cellKeys,
+    burstPoints: island.burstPoints || buildIslandBurstPoints(island),
+    blastRadius: RED_ZONE_BLAST_RADIUS,
+    selectedAt: now,
+    bombardmentAt: now + RED_ZONE_WARNING_DURATION_MS,
+    detonatedAt: null,
+    endsAt: now + RED_ZONE_WARNING_DURATION_MS + RED_ZONE_POST_BLAST_VISUAL_MS
+  };
+}
+
+function rollNewRedZones(now) {
+  const islands = getIslandCenters();
+  gameState.nextRedZoneRollAt = now + RED_ZONE_SELECTION_INTERVAL_MS;
+  gameState.lastRedZoneCountdownSecond = null;
+
+  if (!Array.isArray(islands) || islands.length === 0) {
+    gameState.activeRedZones = [];
+    emitRedZoneSync();
+    return;
+  }
+
+  const shuffled = islands.slice();
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const swapIndex = Math.floor(Math.random() * (i + 1));
+    const temp = shuffled[i];
+    shuffled[i] = shuffled[swapIndex];
+    shuffled[swapIndex] = temp;
+  }
+
+  const selected = shuffled.slice(0, Math.min(RED_ZONE_ISLAND_COUNT, shuffled.length));
+  gameState.activeRedZones = selected.map(island => createRedZoneEntry(island, now));
+  emitRedZoneSync();
+  emitRedZoneActivationAlert();
+}
+
+function isEntityHitByRedZone(zone, x, y, targetRadius = 0) {
+  if (islandContainsWorldPoint(zone, x, y)) return true;
+  const burstPoints = Array.isArray(zone.burstPoints) ? zone.burstPoints : [];
+  for (let i = 0; i < burstPoints.length; i++) {
+    const burst = burstPoints[i];
+    if (targetIntersectsDamageCircle(burst.x, burst.y, zone.blastRadius, x, y, targetRadius)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function applyRedZoneBombardment(zone, now) {
+  const destroyedUnits = [];
+  const destroyedBuildings = [];
+  const ownersToCheck = new Set();
+
+  gameState.units.forEach(target => {
+    const targetRadius = getUnitAreaHitRadius(target);
+    if (!isEntityHitByRedZone(zone, target.x, target.y, targetRadius)) return;
+    target.hp -= RED_ZONE_BLAST_DAMAGE;
+    target.lastDamageTime = now;
+    if (target.hp <= 0) {
+      destroyedUnits.push(target);
+    }
+  });
+
+  destroyedUnits.forEach(target => {
+    const targetOwner = gameState.players.get(target.userId);
+    if (targetOwner) {
+      const popCost = getUnitDefinition(target.type).pop;
+      targetOwner.population = Math.max(0, targetOwner.population - popCost);
+    }
+    if (isNavalUnitType(target.type) || target.type === 'mine') {
+      roomEmit('unitDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+    }
+    gameState.units.delete(target.id);
+  });
+
+  gameState.buildings.forEach(target => {
+    const targetRadius = getBuildingCollisionSize(target.type) / 2;
+    if (!isEntityHitByRedZone(zone, target.x, target.y, targetRadius)) return;
+    target.hp -= RED_ZONE_BLAST_DAMAGE;
+    target.lastDamageTime = now;
+    if (target.hp <= 0) {
+      destroyedBuildings.push(target);
+    }
+  });
+
+  destroyedBuildings.forEach(target => {
+    roomEmit('buildingDestroyed', { id: target.id, x: target.x, y: target.y, type: target.type });
+    gameState.buildings.delete(target.id);
+    ownersToCheck.add(target.userId);
+  });
+
+  ownersToCheck.forEach(userId => checkPlayerDefeat(userId, null, '레드존', 'red_zone'));
+
+  roomEmit('redZoneDetonation', {
+    id: zone.id,
+    islandId: zone.islandId,
+    centerX: zone.centerX,
+    centerY: zone.centerY,
+    blastRadius: zone.blastRadius,
+    burstPoints: zone.burstPoints || []
+  });
+
+  zone.detonatedAt = now;
+  zone.endsAt = Math.max(zone.endsAt, now + RED_ZONE_POST_BLAST_VISUAL_MS);
+}
+
+function updateRedZones(now) {
+  if (!Array.isArray(gameState.activeRedZones)) {
+    gameState.activeRedZones = [];
+  }
+  if (!Number.isFinite(gameState.nextRedZoneRollAt)) {
+    gameState.nextRedZoneRollAt = now + RED_ZONE_SELECTION_INTERVAL_MS;
+  }
+
+  if (now >= gameState.nextRedZoneRollAt) {
+    rollNewRedZones(now);
+  }
+
+  const pendingZones = gameState.activeRedZones.filter(zone => !zone.detonatedAt);
+  if (pendingZones.length === 0) {
+    gameState.lastRedZoneCountdownSecond = null;
+  } else {
+    const msUntilBombardment = Math.min(...pendingZones.map(zone => zone.bombardmentAt - now));
+    if (msUntilBombardment > 0 && msUntilBombardment <= RED_ZONE_COUNTDOWN_START_MS) {
+      const secondsLeft = Math.max(1, Math.ceil(msUntilBombardment / 1000));
+      if (secondsLeft !== gameState.lastRedZoneCountdownSecond) {
+        emitRedZoneCountdownAlerts(getHumanUsersOnRedZoneIslands(pendingZones), secondsLeft);
+        gameState.lastRedZoneCountdownSecond = secondsLeft;
+      }
+    }
+  }
+
+  let syncNeeded = false;
+  pendingZones.forEach(zone => {
+    if (now < zone.bombardmentAt) return;
+    applyRedZoneBombardment(zone, now);
+    syncNeeded = true;
+  });
+
+  const activeZonesBeforeCleanup = gameState.activeRedZones.length;
+  gameState.activeRedZones = gameState.activeRedZones.filter(zone => now < zone.endsAt);
+  if (gameState.activeRedZones.length !== activeZonesBeforeCleanup) {
+    syncNeeded = true;
+  }
+
+  if (syncNeeded) {
+    emitRedZoneSync();
+  }
+}
+
 // Get island centers by clustering land cells
 function getIslandCenters() {
   if (!gameState || !gameState.map || !gameState.map.landCells) return [];
@@ -5463,16 +6075,19 @@ function getIslandCenters() {
     const key = gy * gridSize + gx;
     if (visited.has(key)) continue;
     
-    const island = [];
+    const islandCells = [];
+    const islandKeys = new Set();
     const queue = [[gx, gy]];
     visited.add(key);
     
     while (queue.length > 0) {
       const [cx, cy] = queue.shift();
-      island.push([cx, cy]);
+      const cellKey = cy * gridSize + cx;
+      islandCells.push([cx, cy]);
+      islandKeys.add(cellKey);
       
       // Check 4-connected neighbors
-      const neighbors = [[cx-1,cy],[cx+1,cy],[cx,cy-1],[cx,cy+1]];
+      const neighbors = [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]];
       for (const [nx, ny] of neighbors) {
         if (nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize) {
           const nkey = ny * gridSize + nx;
@@ -5484,14 +6099,23 @@ function getIslandCenters() {
       }
     }
     
-    // Calculate island center
-    if (island.length > 10) { // Skip tiny islands
-      let sumX = 0, sumY = 0;
-      island.forEach(([ix, iy]) => {
+    if (islandCells.length > 10) {
+      let sumX = 0;
+      let sumY = 0;
+      islandCells.forEach(([ix, iy]) => {
         sumX += ix * cellSize + cellSize / 2;
         sumY += iy * cellSize + cellSize / 2;
       });
-      islands.push({ x: sumX / island.length, y: sumY / island.length, size: island.length });
+      const island = {
+        id: islands.length,
+        x: sumX / islandCells.length,
+        y: sumY / islandCells.length,
+        size: islandCells.length,
+        landCells: islandCells,
+        cellKeys: islandKeys
+      };
+      island.burstPoints = buildIslandBurstPoints(island);
+      islands.push(island);
     }
   }
   

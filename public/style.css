@@ -713,6 +713,13 @@ body {
     animation: killLogAppear 0.3s ease-out, killLogDisappear 0.5s ease-in 2.5s forwards;
 }
 
+.kill-log-message--red-zone {
+    background: linear-gradient(135deg, rgba(132, 132, 132, 0.92), rgba(78, 78, 78, 0.96));
+    border-color: #c7c7c7;
+    color: #f3f3f3;
+    box-shadow: 0 0 28px rgba(180, 180, 180, 0.38), 0 0 54px rgba(96, 96, 96, 0.26);
+}
+
 .kill-log-message .attacker {
     color: #ffcc00;
 }
