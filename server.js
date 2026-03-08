@@ -2396,11 +2396,62 @@ function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
   const centerY = movableUnits.reduce((sum, unit) => sum + unit.y, 0) / movableUnits.length;
   const targetDx = targetX - centerX;
   const targetDy = targetY - centerY;
-  const targetDist = Math.hypot(targetDx, targetDy) || 1;
-  const forwardX = targetDx / targetDist;
-  const forwardY = targetDy / targetDist;
+  const targetDist = Math.hypot(targetDx, targetDy);
+  let forwardX = 0;
+  let forwardY = -1;
+  if (targetDist > 0.001) {
+    forwardX = targetDx / targetDist;
+    forwardY = targetDy / targetDist;
+  } else {
+    const headingX = movableUnits.reduce((sum, unit) => sum + Math.cos(unit.angle || 0), 0);
+    const headingY = movableUnits.reduce((sum, unit) => sum + Math.sin(unit.angle || 0), 0);
+    const headingLength = Math.hypot(headingX, headingY);
+    if (headingLength > 0.001) {
+      forwardX = headingX / headingLength;
+      forwardY = headingY / headingLength;
+    }
+  }
   const sideX = -forwardY;
   const sideY = forwardX;
+  const preserveCurrentNavalOffsets = movableUnits.length > 1
+    && movableUnits.length <= 4
+    && movableUnits.every(unit => usesNavalContactCollision(unit));
+  const reservedTargets = [];
+
+  if (preserveCurrentNavalOffsets) {
+    const translatedFormation = movableUnits
+      .map(unit => {
+        const relX = unit.x - centerX;
+        const relY = unit.y - centerY;
+        return {
+          unit,
+          forwardOffset: (relX * forwardX) + (relY * forwardY),
+          lateralOffset: (relX * sideX) + (relY * sideY)
+        };
+      })
+      .sort((a, b) => {
+        if (Math.abs(a.lateralOffset - b.lateralOffset) > 1) return a.lateralOffset - b.lateralOffset;
+        return a.forwardOffset - b.forwardOffset;
+      });
+
+    translatedFormation.forEach(({ unit, forwardOffset, lateralOffset }) => {
+      const desiredX = targetX + (sideX * lateralOffset) + (forwardX * forwardOffset);
+      const desiredY = targetY + (sideY * lateralOffset) + (forwardY * forwardOffset);
+      const resolvedTarget = findAvailableFormationTarget(unit, desiredX, desiredY, reservedTargets);
+      if (resolvedTarget) {
+        const metrics = getUnitFormationMetrics(unit);
+        reservedTargets.push({
+          x: resolvedTarget.x,
+          y: resolvedTarget.y,
+          keepOutRadius: metrics.keepOutRadius
+        });
+        assignMoveTarget(unit, resolvedTarget.x, resolvedTarget.y);
+      } else {
+        assignMoveTarget(unit, desiredX, desiredY);
+      }
+    });
+    return;
+  }
 
   const formationUnits = [...movableUnits].sort((a, b) => {
     const aSide = ((a.x - centerX) * sideX) + ((a.y - centerY) * sideY);
@@ -2414,7 +2465,6 @@ function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
   const columns = Math.max(1, Math.ceil(Math.sqrt(formationUnits.length)));
   const lateralSpacing = formationUnits.reduce((max, unit) => Math.max(max, getUnitFormationMetrics(unit).lateralSpacing), 120);
   const rowSpacing = formationUnits.reduce((max, unit) => Math.max(max, getUnitFormationMetrics(unit).forwardSpacing), 140);
-  const reservedTargets = [];
 
   formationUnits.forEach((unit, index) => {
     const column = index % columns;
