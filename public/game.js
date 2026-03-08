@@ -1095,6 +1095,23 @@ function getMissileLauncherStateLabel(unit) {
     return '이동식';
 }
 
+function syncImageUnitSprite(entry, unit, size) {
+    if (!entry || !entry.mainSprite) return;
+    const img = getUnitImage(unit);
+    if (!img) return;
+    const tex = getOrCreateTexture(img);
+    if (!tex) return;
+    if (entry.lastImageSrc !== img.src) {
+        entry.mainSprite.texture = tex;
+        entry.lastImageSrc = img.src;
+    }
+    const aspectRatio = img.width / img.height;
+    const baseHeight = size * getUnitRenderHeightMultiplier(unit);
+    entry.mainSprite.width = baseHeight * aspectRatio;
+    entry.mainSprite.height = baseHeight;
+    entry.mainSprite.rotation = -Math.PI / 2;
+}
+
 function initPixiApp() {
     pixiApp = new PIXI.Application({
         view: canvas,
@@ -2338,26 +2355,24 @@ function renderSingleUnitPanel(unit, options = {}) {
         document.getElementById('skillDesc8').textContent = '클릭한 위치에 기뢰를 설치합니다';
     }
 
-    if (unit.type === 'missile_launcher') {
-        const slot3 = document.getElementById('skillSlot3');
-        slot3.style.display = 'flex';
-        const btn = document.getElementById('skillBtn3');
-        const desc = document.getElementById('skillDesc3');
+        if (unit.type === 'missile_launcher') {
+            const slot3 = document.getElementById('skillSlot3');
+            slot3.style.display = 'flex';
+            const btn = document.getElementById('skillBtn3');
+            const desc = document.getElementById('skillDesc3');
         if (unit.deployState === 'deployed') {
             btn.textContent = '🚛 배치 해제';
             btn.className = 'skill-btn skill-active';
             desc.textContent = `전함급 사거리 ${MISSILE_LAUNCHER_RANGE} / 40초마다 함선·SLBM 현재 체력 50% 단일 대미지`;
         } else if (unit.deployState === 'undeploying_stage1' || unit.deployState === 'undeploying_stage2') {
-            const remainMs = Math.max(0, (unit.deployStateEndsAt || Date.now()) - Date.now());
             btn.textContent = '🚛 배치 해제 중';
             btn.className = 'skill-btn skill-cooldown disabled';
-            desc.textContent = `${Math.ceil(remainMs / 1000)}초 후 이동 가능 | thaad2 -> thaad1 접는 중`;
+            desc.textContent = '미사일 발사대 해제중...';
         } else if (unit.deployState === 'deploying_stage1' || unit.deployState === 'deploying_stage2') {
-            const remainMs = Math.max(0, (unit.deployStateEndsAt || Date.now()) - Date.now());
             const stageText = unit.deployState === 'deploying_stage2' ? '전개 중' : '배치 중';
             btn.textContent = `🚛 ${stageText}`;
             btn.className = 'skill-btn skill-cooldown disabled';
-            desc.textContent = `${Math.ceil(remainMs / 1000)}초 후 가동 | thaad1 -> thaad2 전개 중`;
+            desc.textContent = '미사일 발사대 전개중...';
         } else {
             btn.textContent = '🚛 배치';
             btn.className = 'skill-btn';
@@ -3621,7 +3636,7 @@ function syncUnitLayer() {
 
         // If entry was created with fallback shape but image is now loaded, recreate
         if (!entry.mainSprite && unit.type !== 'worker' && unit.type !== 'battleship') {
-            const img = getUnitImage(unit.type);
+            const img = getUnitImage(unit);
             if (img) {
                 unitLayer.removeChild(entry.container);
                 entry.container.destroy({ children: true });
@@ -3640,6 +3655,8 @@ function syncUnitLayer() {
             unitSpriteMap.set(unitId, entry);
             unitLayer.addChild(entry.container);
         }
+
+        syncImageUnitSprite(entry, unit, size);
 
         // Update position and rotation
         entry.container.position.set(posX, posY);
@@ -3707,6 +3724,7 @@ function createUnitSpriteEntry(unit, size) {
     let mainSprite = null;
     const turretSprites = [];
     let lastColor = 0;
+    let lastImageSrc = null;
 
     if (unit.type === 'worker') {
         // Worker - circle via Graphics
@@ -3781,6 +3799,7 @@ function createUnitSpriteEntry(unit, size) {
             const tex = getOrCreateTexture(img);
             if (tex) {
                 mainSprite = new PIXI.Sprite(tex);
+                lastImageSrc = img.src;
                 const origW = img.width;
                 const origH = img.height;
                 const aspectRatio = origW / origH;
@@ -3811,7 +3830,15 @@ function createUnitSpriteEntry(unit, size) {
         }
     }
 
-    return { container, gfxShape, mainSprite, turretSprites, unitType: unit.type, lastColor };
+    return {
+        container,
+        gfxShape,
+        mainSprite,
+        turretSprites,
+        unitType: unit.type,
+        lastColor,
+        lastImageSrc
+    };
 }
 
 // Draw HP bars, selection circles, labels into effectsGfx (called from syncEffectsLayer)
