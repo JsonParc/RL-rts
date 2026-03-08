@@ -474,8 +474,20 @@ body {
     background: var(--ui-button-hover);
 }
 
+.skill-btn.disabled:hover {
+    background: rgba(80, 80, 80, 0.3);
+}
+
 .skill-btn:active {
     background: var(--ui-button-active);
+}
+
+.skill-btn.disabled {
+    border-color: #555;
+    background: rgba(80, 80, 80, 0.3);
+    color: #999;
+    cursor: not-allowed;
+    opacity: 0.72;
 }
 
 .skill-btn.skill-purple {
@@ -521,6 +533,46 @@ body {
     background: rgba(156, 39, 176, 0.08);
     border-color: rgba(156, 39, 176, 0.3);
     color: #c48dd0;
+}
+
+#workerBuildMenu {
+    position: absolute;
+    left: 620px;
+    right: 300px;
+    bottom: 190px;
+    display: none;
+    gap: 8px;
+    align-items: center;
+    z-index: 110;
+    pointer-events: auto;
+}
+
+#workerBuildMenu.active {
+    display: flex;
+}
+
+.worker-build-tab {
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--ui-border);
+    background: rgba(12, 18, 24, 0.88);
+    color: #b8c0c7;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.worker-build-tab:hover {
+    background: rgba(26, 38, 48, 0.94);
+    color: #e7edf2;
+}
+
+.worker-build-tab.active {
+    border-color: #ffb648;
+    background: rgba(255, 182, 72, 0.2);
+    color: #ffd382;
 }
 
 /* Build Menu */
