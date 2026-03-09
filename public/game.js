@@ -6108,7 +6108,6 @@ function connectToGame() {
             token: gameState.token,
             roomId: gameState.selectedRoom || localStorage.getItem('selectedRoom') || 'server1'
         },
-        transports: ['websocket'],
         reconnection: false // 자동 재연결 비활성화
     });
     
@@ -6119,6 +6118,7 @@ function connectToGame() {
     socket.on('connect_error', (error) => {
         console.error('Connection error:', error);
         isLoggingIn = false;
+        const isAuthFailure = typeof error?.message === 'string' && error.message.toLowerCase().includes('authentication');
         if (socket) {
             socket.removeAllListeners();
             socket.disconnect();
@@ -6126,8 +6126,12 @@ function connectToGame() {
         }
         document.getElementById('loginScreen').classList.add('active');
         document.getElementById('gameScreen').classList.remove('active');
-        document.getElementById('authError').textContent = '로그인 실패: 토큰이 유효하지 않거나 만료되었습니다.';
-        localStorage.removeItem('token');
+        document.getElementById('authError').textContent = isAuthFailure
+            ? '로그인 실패: 토큰이 유효하지 않거나 만료되었습니다.'
+            : '서버 연결 실패: 네트워크 또는 Render 소켓 연결 문제일 수 있습니다.';
+        if (isAuthFailure) {
+            localStorage.removeItem('token');
+        }
     });
     
     socket.on('disconnect', (reason) => {

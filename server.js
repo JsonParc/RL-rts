@@ -9,9 +9,7 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
-  transports: ['websocket']
-});
+const io = socketIo(server);
 
 const APP_NAME = 'MW Craft';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
@@ -2087,7 +2085,7 @@ try {
 app.use(express.json());
 app.use(express.static('public'));
 
-app.get('/healthz', (req, res) => {
+app.get(['/healthz', '/health'], (req, res) => {
   res.status(200).json({ ok: true, app: APP_NAME });
 });
 
