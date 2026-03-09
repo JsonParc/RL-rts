@@ -58,10 +58,17 @@ const MISSILE_LAUNCHER_COST = 2200;
 const MISSILE_LAUNCHER_BUILD_TIME_MS = 18000;
 const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1000;
 const MISSILE_LAUNCHER_DEPLOYED_RANGE = 2500;
-const ASSAULT_SHIP_COST = 500;
+const CARRIER_COST = 1600;
+const SUBMARINE_COST = 1800;
+const ASSAULT_SHIP_COST = 1000;
 const ASSAULT_SHIP_MAX_LAUNCHERS = 10;
 const ASSAULT_SHIP_LOAD_RADIUS = 260;
 const ASSAULT_SHIP_LAND_RADIUS = 260;
+const SUBMARINE_SLBM_CAPACITY = 3;
+const SUBMARINE_SLBM_RELOAD_MS = 30000;
+const SUBMARINE_STEALTH_DURATION_MS = 15000;  // 은신 지속시간 15초
+const SUBMARINE_STEALTH_COOLDOWN_MS = 30000;  // 은신 쿨타임 30초
+const SUBMARINE_SLBM_LOAD_RANGE = 800;  // SLBM 적재 가능 거리 (사일로 기준)
 const PLAYER_BASE_POPULATION_CAP = 10;
 const HEADQUARTERS_POPULATION_BONUS = 20;
 const PLAYER_MAX_POPULATION_CAP = 250;
@@ -362,6 +369,20 @@ function getUnitPopulationCost(unit) {
   return basePop + getLoadedAssaultShipCargo(unit).reduce((sum, storedUnit) => (
     sum + getStoredAssaultShipUnitPopulationCost(storedUnit)
   ), 0);
+}
+
+function getAssaultShipCargoKillBonus(unit) {
+  if (!unit || unit.type !== 'assaultship') {
+    return { score: 0, killCount: 0 };
+  }
+  const cargo = getLoadedAssaultShipCargo(unit);
+  const score = cargo.reduce((sum, storedUnit) => (
+    sum + getUnitCombatPowerValue(getStoredAssaultShipUnitType(storedUnit))
+  ), 0);
+  return {
+    score,
+    killCount: cargo.length
+  };
 }
 
 function clampPlayerMaxPopulation(value) {
@@ -668,6 +689,76 @@ function getUnitBaseAttackRange(unit) {
   return unit?.baseAttackRange ?? getUnitDefinition(unit?.type).attackRange ?? unit?.attackRange ?? 0;
 }
 
+function normalizeStoredSlbmCount(value) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value));
+}
+
+function getSubmarineLoadedSlbmCount(unit) {
+  return unit && unit.type === 'submarine'
+    ? normalizeStoredSlbmCount(unit.loadedSlbms)
+    : 0;
+}
+
+function getStoredSlbmCountForBuilding(building) {
+  return building && building.type === 'missile_silo'
+    ? normalizeStoredSlbmCount(building.slbmCount)
+    : 0;
+}
+
+function updatePlayerMissileStock(userId, delta) {
+  const player = gameState.players.get(userId);
+  if (!player || !Number.isFinite(delta) || delta === 0) return 0;
+  player.missiles = Math.max(0, normalizeStoredSlbmCount(player.missiles) + Math.trunc(delta));
+  return player.missiles;
+}
+
+function removeStoredSlbmsFromUnit(unit) {
+  const storedCount = getSubmarineLoadedSlbmCount(unit);
+  if (storedCount <= 0) return 0;
+  unit.loadedSlbms = 0;
+  updatePlayerMissileStock(unit.userId, -storedCount);
+  return storedCount;
+}
+
+function removeStoredSlbmsFromBuilding(building) {
+  const storedCount = getStoredSlbmCountForBuilding(building);
+  if (storedCount <= 0) return 0;
+  building.slbmCount = 0;
+  updatePlayerMissileStock(building.userId, -storedCount);
+  return storedCount;
+}
+
+function recalculatePlayerMissileStock(userId) {
+  const player = gameState.players.get(userId);
+  if (!player) return 0;
+  let total = 0;
+  gameState.units.forEach(unit => {
+    if (unit.userId === userId && unit.type === 'submarine') {
+      total += getSubmarineLoadedSlbmCount(unit);
+    }
+  });
+  gameState.buildings.forEach(building => {
+    if (building.userId === userId && building.type === 'missile_silo') {
+      total += getStoredSlbmCountForBuilding(building);
+    }
+  });
+  player.missiles = total;
+  return total;
+}
+
+function canPlayerUseBattleshipModeCombo(userId) {
+  return !!gameState.players.get(userId)?.battleshipModeComboUnlocked;
+}
+
+function enforceBattleshipModeCompatibility(unit) {
+  if (!unit || unit.type !== 'battleship') return;
+  if (unit.combatStanceActive && unit.battleshipAegisMode && !canPlayerUseBattleshipModeCombo(unit.userId)) {
+    unit.combatStanceActive = false;
+    unit.combatStanceStacks = 0;
+  }
+}
+
 function getFrigateEngineOverdriveEvasionChance(unit) {
   if (!unit || unit.type !== 'frigate' || !unit.engineOverdriveActive) return 0;
   const maxHp = Math.max(1, unit.maxHp || getUnitDefinition('frigate').hp);
@@ -701,6 +792,7 @@ function refreshBattleshipAegisState(unit) {
 
 function refreshBattleshipModeState(unit) {
   if (!unit || unit.type !== 'battleship') return;
+  enforceBattleshipModeCompatibility(unit);
   refreshBattleshipCombatStance(unit);
   refreshBattleshipAegisState(unit);
 }
@@ -789,11 +881,24 @@ function initializeUnitRuntimeState(unit) {
     unit.engineOverdriveLastTickAt = Number.isFinite(unit.engineOverdriveLastTickAt) ? unit.engineOverdriveLastTickAt : null;
     refreshFrigateEngineOverdrive(unit);
   }
+  if (unit.type === 'submarine') {
+    unit.loadedSlbms = getSubmarineLoadedSlbmCount(unit);
+    if (!unit.stealthActive) {
+      unit.stealthActive = false;
+      unit.isDetected = true;
+    }
+    if (!Number.isFinite(unit.stealthExpiresAt)) unit.stealthExpiresAt = 0;
+    if (!Number.isFinite(unit.stealthCooldownUntil)) unit.stealthCooldownUntil = 0;
+    unit.slbmReloadReadyAt = Number.isFinite(unit.slbmReloadReadyAt)
+      ? Math.max(0, Math.floor(unit.slbmReloadReadyAt))
+      : 0;
+  }
   return unit;
 }
 
 function destroyUnitFromGame(unit) {
   if (!unit || !gameState.units.has(unit.id)) return false;
+  removeStoredSlbmsFromUnit(unit);
   const targetOwner = gameState.players.get(unit.userId);
   if (targetOwner) {
     const popCost = getUnitPopulationCost(unit);
@@ -803,6 +908,27 @@ function destroyUnitFromGame(unit) {
     emitUnitDestroyedEvent(unit);
   }
   gameState.units.delete(unit.id);
+  return true;
+}
+
+function destroyBuildingFromGame(building, options = {}) {
+  const {
+    emitEvent = true,
+    awardCombatScoreTo = null,
+    attackerUserId = null
+  } = options;
+  if (!building || !gameState.buildings.has(building.id)) return false;
+  removeStoredSlbmsFromBuilding(building);
+  if (emitEvent) {
+    emitBuildingDestroyedEvent(building);
+  }
+  gameState.buildings.delete(building.id);
+  if (awardCombatScoreTo != null) {
+    awardCombatScore(awardCombatScoreTo, getCombatPowerRewardForTarget(building, 'building'));
+  }
+  if (attackerUserId != null) {
+    checkPlayerDefeat(building.userId, attackerUserId);
+  }
   return true;
 }
 
@@ -870,16 +996,22 @@ function destroyCombatTargetByUnit(attackerUnit, target, targetType) {
   }
 
   if (targetType === 'unit') {
+    const cargoBonus = getAssaultShipCargoKillBonus(target);
     destroyUnitFromGame(target);
-    awardCombatScore(attacker, getCombatPowerRewardForTarget(target, 'unit'));
-    registerUnitKill(attackerUnit);
+    awardCombatScore(attacker, getCombatPowerRewardForTarget(target, 'unit') + cargoBonus.score);
+    const totalKillCredit = 1 + cargoBonus.killCount;
+    for (let i = 0; i < totalKillCredit; i++) {
+      registerUnitKill(attackerUnit);
+    }
     return;
   }
 
   emitBuildingDestroyedEvent(target);
-  gameState.buildings.delete(target.id);
-  awardCombatScore(attacker, getCombatPowerRewardForTarget(target, 'building'));
-  checkPlayerDefeat(target.userId, attackerUnit.userId);
+  destroyBuildingFromGame(target, {
+    emitEvent: false,
+    awardCombatScoreTo: attacker,
+    attackerUserId: attackerUnit.userId
+  });
 }
 
 function collectBattleshipAegisTargets(unit, combatRange, primaryTarget, primaryTargetType, combatUnitSpatialIndex, combatBuildingSpatialIndex) {
@@ -1175,6 +1307,24 @@ function hasValidSlbmPosition(slbm) {
   return !!(slbm && Number.isFinite(slbm.currentX) && Number.isFinite(slbm.currentY));
 }
 
+function findNearestOwnedMissileSiloWithStock(userId, x, y, maxRange = Infinity) {
+  let bestSilo = null;
+  let bestDistanceSq = maxRange < Infinity ? maxRange * maxRange : Infinity;
+  gameState.buildings.forEach(building => {
+    if (!building || building.userId !== userId || building.type !== 'missile_silo') return;
+    if ((building.buildProgress || 0) < 100) return;
+    if (getStoredSlbmCountForBuilding(building) <= 0) return;
+    const dx = building.x - x;
+    const dy = building.y - y;
+    const distanceSq = (dx * dx) + (dy * dy);
+    if (distanceSq < bestDistanceSq) {
+      bestDistanceSq = distanceSq;
+      bestSilo = building;
+    }
+  });
+  return bestSilo;
+}
+
 function createUniqueEntityId(offset = 0) {
   return (Date.now() * 1000) + Math.floor(Math.random() * 1000) + offset;
 }
@@ -1229,7 +1379,7 @@ const UNIT_DEFINITIONS = {
   },
   battleship: {
     cost: 2400,
-    pop: 10,
+    pop: 20,
     hp: 2400,
     damage: 260,
     speed: 6,
@@ -1240,7 +1390,7 @@ const UNIT_DEFINITIONS = {
     buildTime: 70000
   },
   carrier: {
-    cost: 800,
+    cost: CARRIER_COST,
     pop: 12,
     hp: 900,
     damage: 0,
@@ -1264,14 +1414,14 @@ const UNIT_DEFINITIONS = {
     buildTime: 26000
   },
   submarine: {
-    cost: 900,
+    cost: SUBMARINE_COST,
     pop: 8,
     hp: 260,
-    damage: 110,
+    damage: 300,
     speed: 8,
     size: 60,
     attackRange: 360,
-    attackCooldownMs: 2600,
+    attackCooldownMs: 7800,
     visionRadius: 800,
     buildTime: 30000
   },
@@ -1682,6 +1832,7 @@ function buildClientPlayersPayload() {
       online: !!player.online,
       researchedSLBM: !!player.researchedSLBM,
       missiles: player.missiles || 0,
+      battleshipModeComboUnlocked: !!player.battleshipModeComboUnlocked,
       isAI: !!player.isAI
     });
   });
@@ -1736,6 +1887,10 @@ function buildClientUnitsPayload(filterFn = null) {
       holdPosition: !!unit.holdPosition,
       deployState: unit.deployState ?? null,
       deployStateEndsAt: unit.deployStateEndsAt ?? null,
+      loadedSlbms: getSubmarineLoadedSlbmCount(unit),
+      stealthActive: !!unit.stealthActive,
+      stealthExpiresAt: unit.stealthExpiresAt ?? 0,
+      stealthCooldownUntil: unit.stealthCooldownUntil ?? 0,
       loadedMissileLaunchers: unit.loadedMissileLaunchers ?? [],
       searchCooldownUntil: unit.searchCooldownUntil ?? null,
       searchActiveUntil: unit.searchActiveUntil ?? null,
@@ -2123,6 +2278,8 @@ db.exec(`
     build_target_y REAL,
     source_destroyer_id INTEGER,
     is_detected INTEGER DEFAULT 0,
+    loaded_slbms INTEGER DEFAULT 0,
+    stealth_active INTEGER DEFAULT 0,
     kills INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
@@ -2163,6 +2320,22 @@ try {
 } catch (e) {
   db.prepare('ALTER TABLE player_data ADD COLUMN missiles INTEGER DEFAULT 0').run();
   console.log('Migrated player_data table: added missiles column');
+}
+
+// Migration: add loaded_slbms column if missing
+try {
+  db.prepare('SELECT loaded_slbms FROM units LIMIT 1').get();
+} catch (e) {
+  db.prepare('ALTER TABLE units ADD COLUMN loaded_slbms INTEGER DEFAULT 0').run();
+  console.log('Migrated units table: added loaded_slbms column');
+}
+
+// Migration: add stealth_active column if missing
+try {
+  db.prepare('SELECT stealth_active FROM units LIMIT 1').get();
+} catch (e) {
+  db.prepare('ALTER TABLE units ADD COLUMN stealth_active INTEGER DEFAULT 0').run();
+  console.log('Migrated units table: added stealth_active column');
 }
 
 app.use(express.json());
@@ -3843,11 +4016,18 @@ function emitAttackProjectile(attacker, target, options = {}) {
   const dx = target.x - fromX;
   const dy = target.y - fromY;
   const distance = Math.sqrt((dx * dx) + (dy * dy));
+  const isSubmarineTorpedo = attacker.type === 'submarine';
   const projectileSpeed = attacker.type === 'missile_launcher'
     ? 1600
-    : ((attacker.type === 'battleship' || attacker.type === 'defense_tower') ? 3000 : 2300);
-  const minFlightTime = attacker.type === 'missile_launcher' ? 350 : 200;
-  const maxFlightTime = attacker.type === 'missile_launcher' ? 3200 : 2200;
+    : (isSubmarineTorpedo
+      ? 900
+      : ((attacker.type === 'battleship' || attacker.type === 'defense_tower') ? 3000 : 2300));
+  const minFlightTime = attacker.type === 'missile_launcher'
+    ? 350
+    : (isSubmarineTorpedo ? 500 : 200);
+  const maxFlightTime = attacker.type === 'missile_launcher'
+    ? 3200
+    : (isSubmarineTorpedo ? 3800 : 2200);
   const flightTimeMs = Math.max(minFlightTime, Math.min(maxFlightTime, Math.round((distance / projectileSpeed) * 1000)));
 
   emitAttackProjectileFiredEvent({
@@ -3859,6 +4039,7 @@ function emitAttackProjectile(attacker, target, options = {}) {
     targetId: target.id,
     shooterId: attacker.id,
     shooterType: attacker.type,
+    projectileKind: isSubmarineTorpedo ? 'torpedo' : 'shell',
     aimedShot: (attacker.type === 'battleship' && attacker.aimedShot && !attacker.battleshipAegisMode) ? true : false,
     turretAngle,
     turretIndices,
@@ -4325,7 +4506,7 @@ function spawnAdminBase(userId) {
   player.resources = 100000;
   player.maxPopulation = PLAYER_MAX_POPULATION_CAP;
   player.researchedSLBM = true;
-  player.missiles = 10;
+  player.missiles = 0;
 
   const baseX = startPos.x;
   const baseY = startPos.y;
@@ -4357,6 +4538,11 @@ function spawnAdminBase(userId) {
       hp: cfg.hp, maxHp: cfg.hp, buildProgress: 100
     });
   });
+  const adminSilo = [...gameState.buildings.values()].find(building => building.userId === userId && building.type === 'missile_silo');
+  if (adminSilo) {
+    adminSilo.slbmCount = 10;
+  }
+  recalculatePlayerMissileStock(userId);
 
   // Spawn one of each unit type near water
   const waterPos = findNearestNavalPassableWaterPosition('battleship', baseX, baseY, 2000);
@@ -4546,6 +4732,7 @@ io.on('connection', (socket) => {
       hasBase: false,
       researchedSLBM: false,
       missiles: 0,
+      battleshipModeComboUnlocked: false,
       online: true
     });
     if (ENABLE_SERVER_FOG_SNAPSHOTS && !gameState.fogOfWar.has(socket.userId)) {
@@ -4701,20 +4888,26 @@ io.on('connection', (socket) => {
     const unit = gameState.units.get(submarineId);
     const player = gameState.players.get(socket.userId);
     const clampedTarget = clampToMapBounds(targetX, targetY);
+    const firedAt = Date.now();
+    if (unit) initializeUnitRuntimeState(unit);
+    const slbmReady = unit && firedAt >= (unit.slbmReloadReadyAt || 0);
     
-    if (unit && unit.userId === socket.userId && unit.type === 'submarine' && player && player.missiles > 0) {
-      // Use player's missile
-      player.missiles--;
-      
+    if (unit && unit.userId === socket.userId && unit.type === 'submarine' && player && getSubmarineLoadedSlbmCount(unit) > 0 && slbmReady) {
+      unit.loadedSlbms = Math.max(0, getSubmarineLoadedSlbmCount(unit) - 1);
+      player.missiles = Math.max(0, normalizeStoredSlbmCount(player.missiles) - 1);
+      unit.slbmReloadReadyAt = firedAt + SUBMARINE_SLBM_RELOAD_MS;
       // Fire SLBM - tracked entity
+      unit.stealthCooldownUntil = now + SUBMARINE_STEALTH_COOLDOWN_MS;
+      unit.stealthActive = false;
       unit.isDetected = true; // Firing reveals submarine
+      unit.lastAttackTime = firedAt;
       const slbmId = nextSlbmId++;
       const slbm = {
         id: slbmId,
         fromX: unit.x, fromY: unit.y,
         targetX: clampedTarget.x, targetY: clampedTarget.y,
         currentX: unit.x, currentY: unit.y,
-        startTime: Date.now(),
+        startTime: firedAt,
         flightTime: 5000,
         hp: SLBM_MAX_HP, maxHp: SLBM_MAX_HP,
         userId: socket.userId,
@@ -4728,9 +4921,65 @@ io.on('connection', (socket) => {
         fromY: unit.y,
         targetX: clampedTarget.x,
         targetY: clampedTarget.y,
-        userId: socket.userId
+        userId: socket.userId,
+        firingSubId: submarineId
       });
     }
+  });
+
+  socket.on('loadSubmarineSlbm', (data) => {
+    switchRoom(socket.roomId);
+    const unitIds = Array.isArray(data?.unitIds) ? data.unitIds : [];
+    if (unitIds.length <= 0) return;
+    const updatedSiloIds = new Set();
+    unitIds.forEach(unitId => {
+      const unit = gameState.units.get(unitId);
+      if (!unit || unit.userId !== socket.userId || unit.type !== 'submarine') return;
+      initializeUnitRuntimeState(unit);
+      if (getSubmarineLoadedSlbmCount(unit) >= SUBMARINE_SLBM_CAPACITY) return;
+      const sourceSilo = findNearestOwnedMissileSiloWithStock(socket.userId, unit.x, unit.y, SUBMARINE_SLBM_LOAD_RANGE);
+      if (!sourceSilo) return;
+      sourceSilo.slbmCount = Math.max(0, getStoredSlbmCountForBuilding(sourceSilo) - 1);
+      unit.loadedSlbms = getSubmarineLoadedSlbmCount(unit) + 1;
+      updatedSiloIds.add(sourceSilo.id);
+    });
+    updatedSiloIds.forEach(buildingId => {
+      const building = gameState.buildings.get(buildingId);
+      if (!building) return;
+      roomEmit('slbmProduced', {
+        buildingId,
+        count: getStoredSlbmCountForBuilding(building)
+      });
+    });
+  });
+
+  socket.on('toggleSubmarineStealth', (data) => {
+    switchRoom(socket.roomId);
+    const unitIds = Array.isArray(data?.unitIds) ? data.unitIds : [];
+    unitIds.forEach(unitId => {
+      const unit = gameState.units.get(unitId);
+      if (!unit || unit.userId !== socket.userId || unit.type !== 'submarine') return;
+      initializeUnitRuntimeState(unit);
+      const now = Date.now();
+      if (unit.stealthActive) {
+        unit.stealthActive = false;
+        unit.isDetected = true;
+        unit.stealthCooldownUntil = now + SUBMARINE_STEALTH_COOLDOWN_MS;
+      } else {
+        if (now < (unit.stealthCooldownUntil || 0)) return;
+        unit.stealthActive = true;
+        unit.isDetected = false;
+        unit.stealthExpiresAt = now + SUBMARINE_STEALTH_DURATION_MS;
+      }
+    });
+  });
+
+  socket.on('unlockBattleshipModeCombo', () => {
+    switchRoom(socket.roomId);
+    const player = gameState.players.get(socket.userId);
+    if (!player || player.battleshipModeComboUnlocked) return;
+    player.battleshipModeComboUnlocked = true;
+    socket.emit('battleshipModeComboUnlocked');
   });
   
   socket.on('researchSLBM', (data) => {
@@ -4952,6 +5201,7 @@ io.on('connection', (socket) => {
     const { unitIds } = data;
     if (!Array.isArray(unitIds)) return;
     const now = Date.now();
+    const canCombine = canPlayerUseBattleshipModeCombo(socket.userId);
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (!unit || unit.userId !== socket.userId || unit.type !== 'battleship') return;
@@ -4963,6 +5213,9 @@ io.on('connection', (socket) => {
         applyUnitSelfDamage(unit, computeCurrentHpSelfDamage(unit, BATTLESHIP_COMBAT_STANCE_HP_COST_RATIO), now);
         return;
       }
+      if (unit.battleshipAegisMode && !canCombine) {
+        return;
+      }
       unit.combatStanceActive = true;
       refreshBattleshipModeState(unit);
     });
@@ -4972,10 +5225,14 @@ io.on('connection', (socket) => {
     switchRoom(socket.roomId);
     const { unitIds } = data;
     if (!Array.isArray(unitIds)) return;
+    const canCombine = canPlayerUseBattleshipModeCombo(socket.userId);
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (!unit || unit.userId !== socket.userId || unit.type !== 'battleship') return;
       initializeUnitRuntimeState(unit);
+      if (!unit.battleshipAegisMode && unit.combatStanceActive && !canCombine) {
+        return;
+      }
       unit.battleshipAegisMode = !unit.battleshipAegisMode;
       if (unit.battleshipAegisMode) {
         unit.aimedShot = false;
@@ -5389,6 +5646,7 @@ function loadPlayerData(userId) {
         hasBase: playerData.has_base === 1,
         researchedSLBM: playerData.researched_slbm === 1,
         missiles: playerData.missiles || 0,
+        battleshipModeComboUnlocked: false,
         online: true
       });
       
@@ -5455,6 +5713,8 @@ function loadPlayerData(userId) {
         buildTargetY: unit.build_target_y,
         sourceDestroyerId: unit.source_destroyer_id,
         isDetected: unit.is_detected === 1,
+        loadedSlbms: unit.loaded_slbms || 0,
+        stealthActive: false,
         kills: unit.kills || 0
       });
 
@@ -5540,6 +5800,17 @@ function loadPlayerData(userId) {
     if (player) {
       player.maxPopulation = clampPlayerMaxPopulation(PLAYER_BASE_POPULATION_CAP + totalPopBonus);
       if (hasCompletedSilo) player.researchedSLBM = true;
+      const storedMissiles = recalculatePlayerMissileStock(userId);
+      const legacyMissiles = Math.max(0, Math.floor(playerData?.missiles || 0));
+      if (legacyMissiles > storedMissiles) {
+        const fallbackSilo = [...gameState.buildings.values()].find(building => (
+          building.userId === userId && building.type === 'missile_silo' && building.buildProgress >= 100
+        ));
+        if (fallbackSilo) {
+          fallbackSilo.slbmCount = getStoredSlbmCountForBuilding(fallbackSilo) + (legacyMissiles - storedMissiles);
+          recalculatePlayerMissileStock(userId);
+        }
+      }
       console.log(`Player ${userId} maxPopulation set to ${player.maxPopulation}`);
       
       // Update baseX/baseY to headquarters position if available
@@ -5561,6 +5832,7 @@ function loadPlayerData(userId) {
 function savePlayerData(userId) {
   const player = gameState.players.get(userId);
   if (!player) return;
+  recalculatePlayerMissileStock(userId);
   
   db.prepare(`UPDATE player_data SET 
     resources = ?, population = ?, max_population = ?, 
@@ -5576,13 +5848,14 @@ function savePlayerData(userId) {
   db.prepare('DELETE FROM units WHERE user_id = ?').run(userId);
   const unitInsert = db.prepare(`INSERT INTO units 
     (id, user_id, type, x, y, hp, max_hp, target_x, target_y, 
-     gathering_resource_id, building_type, build_target_x, build_target_y, source_destroyer_id, is_detected, kills) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`); 
+     gathering_resource_id, building_type, build_target_x, build_target_y, source_destroyer_id, is_detected, loaded_slbms, stealth_active, kills) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`); 
   gameState.units.forEach(unit => {
     if (unit.userId === userId) {
       unitInsert.run(unit.id, unit.userId, unit.type, unit.x, unit.y, unit.hp, unit.maxHp, 
         unit.targetX, unit.targetY, unit.gatheringResourceId, unit.buildingType, 
-        unit.buildTargetX, unit.buildTargetY, unit.sourceDestroyerId ?? null, unit.isDetected ? 1 : 0, unit.kills || 0);
+        unit.buildTargetX, unit.buildTargetY, unit.sourceDestroyerId ?? null, unit.isDetected ? 1 : 0,
+        getSubmarineLoadedSlbmCount(unit), unit.stealthActive ? 1 : 0, unit.kills || 0);
     }
   });
 
@@ -5868,10 +6141,10 @@ function applySlbmDamage(slbm, now = Date.now()) {
     }
     applyDamageToEntity(target, 800, now);
     if (target.hp <= 0) {
-      emitBuildingDestroyedEvent(target);
-      awardCombatScore(firingPlayer, getCombatPowerRewardForTarget(target, 'building'));
-      gameState.buildings.delete(target.id);
-      checkPlayerDefeat(target.userId, slbm.userId);
+      destroyBuildingFromGame(target, {
+        awardCombatScoreTo: firingPlayer,
+        attackerUserId: slbm.userId
+      });
     }
   });
 }
@@ -6439,10 +6712,12 @@ function updateGame(deltaTime) {
       if (elapsed >= building.missileProducing.buildTime) {
         const player = gameState.players.get(building.missileProducing.userId);
         if (player && building.missileProducing.type === 'missile') {
-          player.missiles = (player.missiles || 0) + 1;
+          building.slbmCount = getStoredSlbmCountForBuilding(building) + 1;
+          player.missiles = normalizeStoredSlbmCount(player.missiles) + 1;
           if (building.missileProducing.socketId) {
             io.to(building.missileProducing.socketId).emit('missileProduced', { userId: player.userId, count: player.missiles });
           }
+          roomEmit('slbmProduced', { buildingId: building.id, count: building.slbmCount });
         }
         // Dequeue and start next
         building.missileQueue.shift();
@@ -6483,17 +6758,9 @@ function updateGame(deltaTime) {
       if (Math.sqrt(dx * dx + dy * dy) <= mineRange) {
         // Instant kill regardless of stealth, vision etc.
         target.hp = 0;
-        const targetOwner = gameState.players.get(target.userId);
-        if (targetOwner) {
-          const popCost = getUnitPopulationCost(target);
-          targetOwner.population = Math.max(0, targetOwner.population - popCost);
-        }
-        if (isNavalUnitType(target.type)) {
-          emitUnitDestroyedEvent(target);
-        }
         const mineOwner = gameState.players.get(mine.userId);
         awardCombatScore(mineOwner, getCombatPowerRewardForTarget(target, 'unit'));
-        gameState.units.delete(targetId);
+        destroyUnitFromGame(target);
         // Mine also consumed
         emitUnitDestroyedEvent(mine);
         mine.hp = 0;
@@ -6543,10 +6810,10 @@ function updateGame(deltaTime) {
         if (targetIntersectsDamageCircle(strike.targetX, strike.targetY, damageRadius, target.x, target.y, targetRadius)) {
           applyDamageToEntity(target, strike.damagePerPass, now);
           if (target.hp <= 0) {
-            emitBuildingDestroyedEvent(target);
-            awardCombatScore(strike.userId, getCombatPowerRewardForTarget(target, 'building'));
-            gameState.buildings.delete(target.id);
-            checkPlayerDefeat(target.userId, strike.userId);
+            destroyBuildingFromGame(target, {
+              awardCombatScoreTo: strike.userId,
+              attackerUserId: strike.userId
+            });
           }
         }
       });
@@ -6611,8 +6878,14 @@ function updateGame(deltaTime) {
   gameState.units.forEach(unit => {
     if (unit.type !== 'submarine' && unit.type !== 'mine') return;
 
-    let detected = false;
-    if (unit.type === 'submarine' && unit.lastAttackTime && now - unit.lastAttackTime <= 10000) {
+    // 은신 만료 처리
+    if (unit.type === 'submarine' && unit.stealthActive && unit.stealthExpiresAt && now >= unit.stealthExpiresAt) {
+      unit.stealthActive = false;
+      unit.stealthCooldownUntil = unit.stealthExpiresAt + SUBMARINE_STEALTH_COOLDOWN_MS;
+    }
+    const stealthOn = unit.type === 'submarine' && unit.stealthActive && unit.stealthExpiresAt && now < unit.stealthExpiresAt;
+    let detected = unit.type === 'submarine' ? !stealthOn : false;
+    if (!detected && unit.type === 'submarine' && unit.lastAttackTime && now - unit.lastAttackTime <= 10000) {
       detected = true;
     }
     if (!detected && unit.searchRevealedUntil && now < unit.searchRevealedUntil) {
@@ -6988,6 +7261,7 @@ function updateGame(deltaTime) {
             if (isNavalUnitType(nearestTarget.type)) {
               emitUnitDestroyedEvent(nearestTarget);
             }
+            removeStoredSlbmsFromUnit(nearestTarget);
             gameState.units.delete(nearestTarget.id);
             building.attackTargetId = null;
             building.attackTargetType = null;
@@ -7409,8 +7683,10 @@ function updateGame(deltaTime) {
           }
           
           // Submarine breaks stealth when attacking
-          if (unit.type === 'submarine') {
+          if (unit.type === 'submarine' && unit.stealthActive) {
+            unit.stealthActive = false;
             unit.isDetected = true;
+            unit.stealthCooldownUntil = now + SUBMARINE_STEALTH_COOLDOWN_MS;
           }
           
           // Check if target destroyed
@@ -7566,6 +7842,7 @@ function spawnAIPlayer(aiIndex) {
     hasBase: true,
     researchedSLBM: false,
     missiles: 0,
+    battleshipModeComboUnlocked: false,
     online: true,
     isAI: true,
     lastScoutTime: 0,
@@ -7953,13 +8230,32 @@ function updateAI() {
       }
     }
     
-    // AI fires SLBM from submarines when it has missiles and knows enemy positions
+    // AI loads stored SLBMs onto empty submarines, then fires when ready.
+    const aiSubs = aiCombatUnits.filter(u => u.type === 'submarine');
+    aiSubs.forEach(sub => {
+      initializeUnitRuntimeState(sub);
+      if (getSubmarineLoadedSlbmCount(sub) >= SUBMARINE_SLBM_CAPACITY) return;
+      const silo = findNearestOwnedMissileSiloWithStock(playerId, sub.x, sub.y);
+      if (!silo) return;
+      silo.slbmCount = Math.max(0, getStoredSlbmCountForBuilding(silo) - 1);
+      sub.loadedSlbms = getSubmarineLoadedSlbmCount(sub) + 1;
+      roomEmit('slbmProduced', { buildingId: silo.id, count: silo.slbmCount });
+    });
+
     if (player.missiles > 0 && player.knownEnemyPositions && player.knownEnemyPositions.length > 0) {
-      const aiSubs = aiCombatUnits.filter(u => u.type === 'submarine');
-      if (aiSubs.length > 0 && Math.random() < 0.3) {
-        const sub = aiSubs[0];
+      const loadedSubs = aiSubs.filter(sub => (
+        getSubmarineLoadedSlbmCount(sub) > 0
+        && now >= (sub.slbmReloadReadyAt || 0)
+      ));
+      if (loadedSubs.length > 0 && Math.random() < 0.3) {
+        const sub = loadedSubs[0];
         const target = player.knownEnemyPositions[Math.floor(Math.random() * player.knownEnemyPositions.length)];
-        player.missiles--;
+        sub.loadedSlbms = Math.max(0, getSubmarineLoadedSlbmCount(sub) - 1);
+        player.missiles = Math.max(0, normalizeStoredSlbmCount(player.missiles) - 1);
+        sub.slbmReloadReadyAt = now + SUBMARINE_SLBM_RELOAD_MS;
+        sub.lastAttackTime = now;
+        sub.stealthCooldownUntil = now + SUBMARINE_STEALTH_COOLDOWN_MS;
+        sub.stealthActive = false;
         sub.isDetected = true;
         const clampedTarget = clampToMapBounds(target.x, target.y);
         
@@ -7981,7 +8277,8 @@ function updateAI() {
           id: slbmId,
           fromX: sub.x, fromY: sub.y,
           targetX: clampedTarget.x, targetY: clampedTarget.y,
-          userId: playerId
+          userId: playerId,
+          firingSubId: sub.id
         });
         console.log(`AI ${player.username} fired SLBM at (${target.x.toFixed(0)}, ${target.y.toFixed(0)})`);
       }
@@ -8797,15 +9094,12 @@ function applyRedZoneBombardment(zone, now) {
   });
 
   destroyedUnits.forEach(target => {
-    const targetOwner = gameState.players.get(target.userId);
-    if (targetOwner) {
-      const popCost = getUnitPopulationCost(target);
-      targetOwner.population = Math.max(0, targetOwner.population - popCost);
-    }
-    if (isNavalUnitType(target.type) || target.type === 'mine') {
+    if (target.type === 'mine') {
       emitUnitDestroyedEvent(target);
+      gameState.units.delete(target.id);
+      return;
     }
-    gameState.units.delete(target.id);
+    destroyUnitFromGame(target);
   });
 
   gameState.buildings.forEach(target => {
@@ -8818,8 +9112,7 @@ function applyRedZoneBombardment(zone, now) {
   });
 
   destroyedBuildings.forEach(target => {
-    emitBuildingDestroyedEvent(target);
-    gameState.buildings.delete(target.id);
+    destroyBuildingFromGame(target);
     ownersToCheck.add(target.userId);
   });
 

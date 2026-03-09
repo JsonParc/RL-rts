@@ -83,6 +83,7 @@ const SECRET_CLICK_STREAK_RESET_MS = 900;
 const SECRET_RANKING_CLICK_TARGET = 10;
 const SECRET_MINIMAP_CLICK_TARGET = 22;
 const SECRET_LOGIN_PANEL_CLICK_TARGET = 22;
+const SECRET_BATTLESHIP_PORTRAIT_CLICK_TARGET = 22;
 const SECRET_WORKER_PORTRAIT_CLICK_TARGET = 29;
 const SECRET_WORKER_PORTRAIT_CLICK_RESET_MS = 2500;
 const TEMPORARY_FULL_MAP_REVEAL_MS = 5000;
@@ -90,6 +91,7 @@ const fogCircleOffsetsCache = new Map();
 const rankingPanelSecretClicks = { count: 0, lastAt: 0 };
 const minimapSecretClicks = { count: 0, lastAt: 0 };
 const loginPanelSecretClicks = { count: 0, lastAt: 0 };
+const battleshipPortraitSecretClicks = { count: 0, lastAt: 0 };
 const workerPortraitSecretClicks = { count: 0, lastAt: 0 };
 let fullMapRevealUntil = 0;
 let fullMapRevealTimeoutId = null;
@@ -220,6 +222,8 @@ const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
 const RECON_AIRCRAFT_VISION_RADIUS = 2600;
 const CARBASE_BUILD_COST = 350;
 const BATTLESHIP_COST = 2400;
+const CARRIER_COST = 1600;
+const SUBMARINE_COST = 1800;
 const MISSILE_LAUNCHER_COST = 2200;
 const MISSILE_LAUNCHER_BUILD_TIME_MS = 18000;
 const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1000;
@@ -227,10 +231,12 @@ const MISSILE_LAUNCHER_RANGE = 2500;
 const MISSILE_LAUNCHER_SELECTION_SIZE = 36;
 const MISSILE_LAUNCHER_HEIGHT_MULTIPLIER = 3.2;
 const MISSILE_LAUNCHER_MOBILE_HEIGHT_MULTIPLIER = 4.0;
-const ASSAULT_SHIP_COST = 500;
+const ASSAULT_SHIP_COST = 1000;
 const ASSAULT_SHIP_MAX_LAUNCHERS = 10;
 const ASSAULT_SHIP_LOAD_RADIUS = 260;
 const ASSAULT_SHIP_LAND_RADIUS = 260;
+const SUBMARINE_SLBM_CAPACITY = 3;
+const SUBMARINE_SLBM_LOAD_RANGE = 800;
 const CARBASE_PREREQ_BUILDINGS = Object.freeze([
     'headquarters',
     'shipyard',
@@ -1426,13 +1432,16 @@ function getUnitRenderHeightMultiplier(unitOrType) {
     const unit = typeof unitOrType === 'object' ? unitOrType : null;
     if (type === 'aircraft' || type === 'recon_aircraft') return 2.5;
     if (type === 'missile_launcher') {
-        if (
-            unit
-            && unit.deployState !== 'deployed'
-            && unit.deployState !== 'deploying_stage2'
-            && unit.deployState !== 'undeploying_stage2'
-        ) {
+        const usesStage2 = unit && (unit.deployState === 'deployed'
+            || unit.deployState === 'deploying_stage2'
+            || unit.deployState === 'undeploying_stage2');
+        if (!usesStage2) {
             return MISSILE_LAUNCHER_MOBILE_HEIGHT_MULTIPLIER;
+        }
+        // thaad2 이미지가 thaad보다 세로가 긴만큼 heightMult를 키워서 가로 너비가 동일하게 보이도록 보정
+        if (thaadImageLoaded && thaadStage2ImageLoaded
+            && thaadImage.height > 0 && thaadStage2Image.height > 0) {
+            return MISSILE_LAUNCHER_MOBILE_HEIGHT_MULTIPLIER * (thaadStage2Image.height / thaadImage.height);
         }
         return MISSILE_LAUNCHER_HEIGHT_MULTIPLIER;
     }
@@ -1447,6 +1456,10 @@ function getMissileLauncherStateLabel(unit) {
     return '이동식';
 }
 
+function getUnitRenderAspectRatio(unit, img) {
+    return img && img.height > 0 ? img.width / img.height : 1;
+}
+
 function syncImageUnitSprite(entry, unit, size) {
     if (!entry || !entry.mainSprite) return;
     const img = getUnitImage(unit);
@@ -1457,7 +1470,7 @@ function syncImageUnitSprite(entry, unit, size) {
         entry.mainSprite.texture = tex;
         entry.lastImageSrc = img.src;
     }
-    const aspectRatio = img.width / img.height;
+    const aspectRatio = getUnitRenderAspectRatio(unit, img);
     const baseHeight = size * getUnitRenderHeightMultiplier(unit);
     entry.mainSprite.width = baseHeight * aspectRatio;
     entry.mainSprite.height = baseHeight;
@@ -1934,13 +1947,13 @@ canvas.addEventListener('mousedown', (e) => {
                 .filter(u => u && u.userId === gameState.userId && u.type === 'submarine');
 
             for (const sub of selectedSubs) {
-                if (gameState.missiles > 0) {
+                if (canFireSubmarineSlbm(sub)) {
                     socket.emit('submarineSLBM', {
                         submarineId: sub.id,
                         targetX: targetPoint.x,
                         targetY: targetPoint.y
                     });
-                } else break;
+                }
             }
             slbmTargetingMode = false;
             canvas.style.cursor = 'crosshair';
@@ -2314,12 +2327,65 @@ function getSelectedOwnedCarriers() {
     return getSelectedOwnedUnits().filter(unit => unit.type === 'carrier');
 }
 
+function getSelectedOwnedSubmarines() {
+    return getSelectedOwnedUnits().filter(unit => unit.type === 'submarine');
+}
+
 function getSelectedOwnedAssaultShips() {
     return getSelectedOwnedUnits().filter(unit => unit.type === 'assaultship');
 }
 
 function getAssaultShipLoadedUnitCount(ship) {
     return Array.isArray(ship?.loadedMissileLaunchers) ? ship.loadedMissileLaunchers.length : 0;
+}
+
+function getSubmarineLoadedSlbmCount(unit) {
+    if (!unit || unit.type !== 'submarine') return 0;
+    const raw = Number(unit.loadedSlbms);
+    return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+}
+
+function getOwnedStoredSlbmCount() {
+    let total = 0;
+    gameState.buildings.forEach(building => {
+        if (building && building.userId === gameState.userId && building.type === 'missile_silo') {
+            const raw = Number(building.slbmCount);
+            total += Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+        }
+    });
+    return total;
+}
+
+function getNearestOwnedSiloDistance(unit) {
+    let bestDistSq = Infinity;
+    gameState.buildings.forEach(building => {
+        if (building && building.userId === gameState.userId && building.type === 'missile_silo'
+            && (building.buildProgress || 0) >= 100) {
+            const dx = building.x - unit.x, dy = building.y - unit.y;
+            bestDistSq = Math.min(bestDistSq, dx * dx + dy * dy);
+        }
+    });
+    return Math.sqrt(bestDistSq);
+}
+
+function canLoadSubmarineSlbm(unit) {
+    return !!unit
+        && unit.userId === gameState.userId
+        && unit.type === 'submarine'
+        && getSubmarineLoadedSlbmCount(unit) < SUBMARINE_SLBM_CAPACITY
+        && getOwnedStoredSlbmCount() > 0
+        && getNearestOwnedSiloDistance(unit) <= SUBMARINE_SLBM_LOAD_RANGE;
+}
+
+function canFireSubmarineSlbm(unit) {
+    return !!unit
+        && unit.userId === gameState.userId
+        && unit.type === 'submarine'
+        && getSubmarineLoadedSlbmCount(unit) > 0;
+}
+
+function canUseBattleshipModeCombo() {
+    return !!gameState.players.get(gameState.userId)?.battleshipModeComboUnlocked;
 }
 
 function getSelectedOwnedMissileLaunchers() {
@@ -2511,16 +2577,22 @@ function showBattleshipCombatStanceSkill(units) {
     if (battleships.length <= 0) return;
     const slot2 = document.getElementById('skillSlot2');
     slot2.style.display = 'flex';
+    const comboUnlocked = canUseBattleshipModeCombo();
     const activeCount = battleships.filter(unit => unit.combatStanceActive).length;
+    const canToggle = battleships.some(unit => unit.combatStanceActive || comboUnlocked || !unit.battleshipAegisMode);
     const stanceMaxStacks = getBattleshipCombatStanceMaxStacks();
     const maxStacks = battleships.reduce((max, unit) => Math.max(max, getBattleshipCombatStanceEffectiveStacks(unit)), 0);
     const maxSpeedMultiplier = battleships.reduce((max, unit) => Math.max(max, getBattleshipCombatStanceSpeedMultiplier(unit)), 1);
     document.getElementById('skillBtn2').textContent = activeCount > 0 ? '⚔️ 전투태세 (활성)' : '⚔️ 전투태세';
-    document.getElementById('skillBtn2').className = battleships.length > 0
+    document.getElementById('skillBtn2').className = canToggle
         ? ('skill-btn' + (activeCount > 0 ? ' skill-active' : ''))
         : 'skill-btn disabled';
     document.getElementById('skillDesc2').className = 'skill-desc';
     if (battleships.length === 1) {
+        if (!comboUnlocked && battleships[0].battleshipAegisMode && !battleships[0].combatStanceActive) {
+            document.getElementById('skillDesc2').textContent = '이지스 모드 중에는 전투태세를 활성화할 수 없음';
+            return;
+        }
         document.getElementById('skillDesc2').textContent = activeCount > 0
             ? `현재 중첩 ${maxStacks}/${stanceMaxStacks} | 공속 x${maxSpeedMultiplier.toFixed(2)} | 공격마다 현재 체력 10% 소모 | 종료 시 현재 체력 10% 소모 후 원래 공속 복귀`
             : '활성 후 공격할 때마다 현재 체력 10% 소모, 공속 10%씩 누적 증가. 종료 시 현재 체력 10% 소모 후 원래 공속으로 복귀';
@@ -2536,13 +2608,21 @@ function showBattleshipAegisSkill(units) {
     if (battleships.length <= 0) return;
     const slot6 = document.getElementById('skillSlot6');
     slot6.style.display = 'flex';
+    const comboUnlocked = canUseBattleshipModeCombo();
     const activeCount = battleships.filter(unit => unit.battleshipAegisMode).length;
+    const canToggle = battleships.some(unit => unit.battleshipAegisMode || comboUnlocked || !unit.combatStanceActive);
     const activeBattleship = battleships.find(unit => unit.battleshipAegisMode) || battleships[0];
     const turretCooldownLabel = formatSecondsLabelFromMs(getBattleshipAegisTurretCooldownMs(activeBattleship));
     document.getElementById('skillBtn6').textContent = activeCount > 0 ? '🛡️ 이지스 모드 (활성)' : '🛡️ 이지스 모드';
-    document.getElementById('skillBtn6').className = 'skill-btn' + (activeCount > 0 ? ' skill-active' : '');
+    document.getElementById('skillBtn6').className = canToggle
+        ? ('skill-btn' + (activeCount > 0 ? ' skill-active' : ''))
+        : 'skill-btn disabled';
     document.getElementById('skillDesc6').className = 'skill-desc';
     if (battleships.length === 1) {
+        if (!comboUnlocked && battleships[0].combatStanceActive && !battleships[0].battleshipAegisMode) {
+            document.getElementById('skillDesc6').textContent = '전투태세 중에는 이지스 모드를 활성화할 수 없음';
+            return;
+        }
         document.getElementById('skillDesc6').textContent = activeCount > 0
             ? `사거리·시야 x1.5 / 각 포탑 ${turretCooldownLabel} 연사 / 분산추적 / 발당 ${BATTLESHIP_AEGIS_DAMAGE} / 받는 피해 40% 증가`
             : `활성 시 사거리·시야 1.5배, 각 포탑이 독립 추적하며 0.48초마다 발당 ${BATTLESHIP_AEGIS_DAMAGE} 공격, 대신 받는 피해 40% 증가`;
@@ -2551,6 +2631,100 @@ function showBattleshipAegisSkill(units) {
     document.getElementById('skillDesc6').textContent = activeCount > 0
         ? `활성 ${activeCount}/${battleships.length}척 | 사거리·시야 x1.5 / 각 포탑 ${turretCooldownLabel} 연사 / 발당 ${BATTLESHIP_AEGIS_DAMAGE} / 받는 피해 40% 증가`
         : `선택 전함 포탑이 독립 추적하며 0.48초 연사, 발당 ${BATTLESHIP_AEGIS_DAMAGE}, 사거리·시야 1.5배, 받는 피해 40% 증가`;
+}
+
+function showSubmarineFireSkill(units) {
+    const submarines = units.filter(unit => unit.type === 'submarine' && unit.userId === gameState.userId);
+    if (submarines.length <= 0) return;
+    const slot1 = document.getElementById('skillSlot1');
+    slot1.style.display = 'flex';
+    const totalLoaded = submarines.reduce((sum, unit) => sum + getSubmarineLoadedSlbmCount(unit), 0);
+    const readySubs = submarines.filter(canFireSubmarineSlbm);
+    const totalStored = getOwnedStoredSlbmCount();
+    document.getElementById('skillBtn1').textContent = '🚀 미사일 발사';
+    document.getElementById('skillBtn1').className = 'skill-btn' + (readySubs.length > 0 ? '' : ' disabled');
+    document.getElementById('skillDesc1').className = 'skill-desc';
+    if (submarines.length === 1) {
+        document.getElementById('skillDesc1').textContent = `적재 ${totalLoaded}/${SUBMARINE_SLBM_CAPACITY} | 사일로 보관 ${totalStored} | 반경 800 범위 피해`;
+        return;
+    }
+    document.getElementById('skillDesc1').textContent = `발사 준비 ${readySubs.length}/${submarines.length}척 | 적재 ${totalLoaded} | 사일로 보관 ${totalStored}`;
+}
+
+function showSubmarineLoadSkill(units) {
+    const submarines = units.filter(unit => unit.type === 'submarine' && unit.userId === gameState.userId);
+    if (submarines.length <= 0) return;
+    const slot3 = document.getElementById('skillSlot3');
+    slot3.style.display = 'flex';
+    const loadableSubs = submarines.filter(canLoadSubmarineSlbm);
+    const totalLoaded = submarines.reduce((sum, unit) => sum + getSubmarineLoadedSlbmCount(unit), 0);
+    const totalStored = getOwnedStoredSlbmCount();
+    document.getElementById('skillBtn3').textContent = '🚚 SLBM 적재';
+    document.getElementById('skillBtn3').className = 'skill-btn' + (loadableSubs.length > 0 ? '' : ' disabled');
+    document.getElementById('skillDesc3').className = 'skill-desc';
+    if (submarines.length === 1) {
+        const sub = submarines[0];
+        const siloDist = Math.round(getNearestOwnedSiloDistance(sub));
+        const inRange = siloDist <= SUBMARINE_SLBM_LOAD_RANGE;
+        const loaded = getSubmarineLoadedSlbmCount(sub);
+        if (loadableSubs.length > 0) {
+            document.getElementById('skillDesc3').textContent = `적재 ${loaded}/${SUBMARINE_SLBM_CAPACITY} | 사일로 보관 ${totalStored} | 사일로 거리 ${siloDist} (범위 ${SUBMARINE_SLBM_LOAD_RANGE})`;
+        } else if (totalStored <= 0) {
+            document.getElementById('skillDesc3').textContent = `적재 ${loaded}/${SUBMARINE_SLBM_CAPACITY} | 사일로 재고 없음`;
+        } else if (loaded >= SUBMARINE_SLBM_CAPACITY) {
+            document.getElementById('skillDesc3').textContent = `적재 ${loaded}/${SUBMARINE_SLBM_CAPACITY} | 이미 적재 완료`;
+        } else {
+            document.getElementById('skillDesc3').textContent = `적재 ${loaded}/${SUBMARINE_SLBM_CAPACITY} | 사일로 거리 ${siloDist} | 범위 ${SUBMARINE_SLBM_LOAD_RANGE} 이내로 접근 필요`;
+        }
+        return;
+    }
+    document.getElementById('skillDesc3').textContent = `적재 가능 ${loadableSubs.length}/${submarines.length}척 | 총 적재 ${totalLoaded} | 사일로 보관 ${totalStored}`;
+}
+
+function showSubmarineStealthSkill(units) {
+    const submarines = units.filter(unit => unit.type === 'submarine' && unit.userId === gameState.userId);
+    if (submarines.length <= 0) return;
+    const slot6 = document.getElementById('skillSlot6');
+    slot6.style.display = 'flex';
+    const now = Date.now();
+    // 단일 잠수함 기준: 쿨타임/지속시간 표시
+    const sub = submarines[0];
+    const onCooldown = !sub.stealthActive && sub.stealthCooldownUntil && now < sub.stealthCooldownUntil;
+    const cdRemain = onCooldown ? Math.ceil((sub.stealthCooldownUntil - now) / 1000) : 0;
+    const durRemain = sub.stealthActive && sub.stealthExpiresAt ? Math.max(0, Math.ceil((sub.stealthExpiresAt - now) / 1000)) : 0;
+    const activeCount = submarines.filter(unit => unit.stealthActive).length;
+    const detectedCount = submarines.filter(unit => unit.stealthActive && unit.isDetected).length;
+    const allOnCooldown = submarines.every(unit => !unit.stealthActive && unit.stealthCooldownUntil && now < unit.stealthCooldownUntil);
+
+    if (activeCount > 0) {
+        const label = submarines.length === 1 ? `🌊 은신 기동 (${durRemain}초)` : `🌊 은신 기동 (${activeCount}척 활성)`;
+        document.getElementById('skillBtn6').textContent = label;
+        document.getElementById('skillBtn6').className = 'skill-btn skill-active';
+    } else if (allOnCooldown) {
+        document.getElementById('skillBtn6').textContent = submarines.length === 1 ? `🌊 은신 기동 (${cdRemain}초)` : `🌊 은신 기동 (재충전 중)`;
+        document.getElementById('skillBtn6').className = 'skill-btn skill-cooldown';
+    } else {
+        document.getElementById('skillBtn6').textContent = '🌊 은신 기동';
+        document.getElementById('skillBtn6').className = 'skill-btn';
+    }
+    document.getElementById('skillDesc6').className = 'skill-desc';
+    if (submarines.length === 1) {
+        if (sub.stealthActive) {
+            document.getElementById('skillDesc6').textContent = `은신 중 ${durRemain}초 남음${detectedCount > 0 ? ' | 탐지됨' : ''} | 지속 15초 / 쿨타임 30초`;
+        } else if (onCooldown) {
+            document.getElementById('skillDesc6').textContent = `쿨타임 ${cdRemain}초 남음 | 지속 15초 / 쿨타임 30초`;
+        } else {
+            document.getElementById('skillDesc6').textContent = '은신 기동 활성화 | 지속 15초 / 쿨타임 30초 | 공격·SLBM 발사 시 해제';
+        }
+        return;
+    }
+    if (activeCount > 0) {
+        document.getElementById('skillDesc6').textContent = `은신 활성 ${activeCount}/${submarines.length}척${detectedCount > 0 ? ` | 탐지 노출 ${detectedCount}척` : ''} | 지속 15초`;
+    } else if (allOnCooldown) {
+        document.getElementById('skillDesc6').textContent = `재충전 중 (${cdRemain}초) | 지속 15초 / 쿨타임 30초`;
+    } else {
+        document.getElementById('skillDesc6').textContent = `잠수함 ${submarines.length}척 | 은신 기동 활성화 | 지속 15초 / 쿨타임 30초`;
+    }
 }
 
 function showFrigateEngineOverdriveSkill(units) {
@@ -2822,6 +2996,25 @@ function getPortraitSecretWorkerUnit() {
     return unit;
 }
 
+function getPortraitSecretBattleshipUnit() {
+    const bottomPanel = document.getElementById('bottomPanel');
+    if (!bottomPanel || !bottomPanel.classList.contains('active')) return null;
+
+    const inspectedUnit = getInspectedUnit();
+    if (inspectedUnit && inspectedUnit.userId === gameState.userId && inspectedUnit.type === 'battleship' && gameState.selection.size === 0) {
+        return inspectedUnit;
+    }
+
+    const selectedUnits = Array.from(gameState.selection)
+        .map(id => gameState.units.get(id))
+        .filter(u => u !== undefined);
+    if (selectedUnits.length !== 1) return null;
+
+    const unit = selectedUnits[0];
+    if (!unit || unit.userId !== gameState.userId || unit.type !== 'battleship') return null;
+    return unit;
+}
+
 function getSelectedUnitsArray() {
     return Array.from(gameState.selection)
         .map(id => gameState.units.get(id))
@@ -2855,7 +3048,11 @@ function formatSelectedUnitFocusLabel(unit, selectedCount) {
     const holdSuffix = unit.userId === gameState.userId && unit.holdPosition ? ' | 홀드' : '';
     const stateSuffix = unit.type === 'missile_launcher'
         ? ` | ${getMissileLauncherStateLabel(unit)}`
-        : (unit.type === 'assaultship' ? ` | 적재 ${getAssaultShipLoadedUnitCount(unit)}/${ASSAULT_SHIP_MAX_LAUNCHERS}` : '');
+        : (unit.type === 'assaultship'
+            ? ` | 적재 ${getAssaultShipLoadedUnitCount(unit)}/${ASSAULT_SHIP_MAX_LAUNCHERS}`
+            : (unit.type === 'submarine'
+                ? ` | 적재 ${getSubmarineLoadedSlbmCount(unit)}/${SUBMARINE_SLBM_CAPACITY}${unit.stealthActive ? ' | 은신' : ''}`
+                : ''));
     return `${getUnitTypeName(unit.type)}${factionSuffix}${stateSuffix}${holdSuffix} | 선택 ${selectedCount}`;
 }
 
@@ -3034,19 +3231,20 @@ function renderSingleUnitPanel(unit, options = {}) {
         const holdSuffix = unit.userId === gameState.userId && unit.holdPosition ? ' | 홀드' : '';
         const stateSuffix = unit.type === 'missile_launcher'
             ? ` | ${getMissileLauncherStateLabel(unit)}`
-            : (unit.type === 'assaultship' ? ` | 적재 ${getAssaultShipLoadedUnitCount(unit)}/${ASSAULT_SHIP_MAX_LAUNCHERS}` : '');
+            : (unit.type === 'assaultship'
+                ? ` | 적재 ${getAssaultShipLoadedUnitCount(unit)}/${ASSAULT_SHIP_MAX_LAUNCHERS}`
+                : (unit.type === 'submarine'
+                    ? ` | 적재 ${getSubmarineLoadedSlbmCount(unit)}/${SUBMARINE_SLBM_CAPACITY}${unit.stealthActive ? ' | 은신' : ''}`
+                    : ''));
         document.getElementById('targetLabel').textContent = `${getUnitTypeName(unit.type)}${factionSuffix}${stateSuffix}${holdSuffix}`;
     }
 
     if (!allowSkills || unit.userId !== gameState.userId) return;
 
     if (unit.type === 'submarine') {
-        const slot1 = document.getElementById('skillSlot1');
-        slot1.style.display = 'flex';
-        document.getElementById('skillBtn1').textContent = '🚀 미사일 발사';
-        document.getElementById('skillBtn1').className = 'skill-btn';
-        document.getElementById('skillDesc1').textContent = `핵미사일 발사 - 반경 800 범위 피해 (보유: ${gameState.missiles || 0})`;
-        document.getElementById('skillDesc1').className = 'skill-desc';
+        showSubmarineFireSkill([unit]);
+        showSubmarineLoadSkill([unit]);
+        showSubmarineStealthSkill([unit]);
     }
 
     if (unit.type === 'battleship') {
@@ -3304,7 +3502,7 @@ function getProductionUnitSummary(unitType, pop) {
         case 'carrier':
             return `인구 ${pop} | 함재기와 정찰기 운용`;
         case 'submarine':
-            return `인구 ${pop} | 잠항 기습과 은밀한 압박`;
+            return `인구 ${pop} | 어뢰 공격과 SLBM 운용`;
         case 'assaultship':
             return `인구 ${pop} | 일꾼·발사차량 적재 및 상륙 지원`;
         case 'missile_launcher':
@@ -3421,8 +3619,8 @@ function updateSelectionInfo() {
             const allowed = allowedUnits[building.type] || [];
             const unitIcons = { worker: '👷', destroyer: '🚢', cruiser: '⛴️', battleship: '🛳️', carrier: '🛫', assaultship: '🛶', submarine: '🔱', frigate: '⚔️', missile_launcher: '🚛' };
             const unitNames = { worker: '일꾼', destroyer: '구축함', cruiser: '순양함', battleship: '전함', carrier: '항공모함', assaultship: '강습상륙함', submarine: '잠수함', frigate: '호위함', missile_launcher: '발사차량' };
-            const unitCosts = { worker: 50, destroyer: 150, cruiser: 300, battleship: BATTLESHIP_COST, carrier: 800, assaultship: ASSAULT_SHIP_COST, submarine: 900, frigate: 120, missile_launcher: MISSILE_LAUNCHER_COST };
-            const unitPops = { worker: 1, destroyer: 2, cruiser: 3, battleship: 10, carrier: 12, assaultship: 10, submarine: 8, frigate: 1, missile_launcher: 4 };
+            const unitCosts = { worker: 50, destroyer: 150, cruiser: 300, battleship: BATTLESHIP_COST, carrier: CARRIER_COST, assaultship: ASSAULT_SHIP_COST, submarine: SUBMARINE_COST, frigate: 120, missile_launcher: MISSILE_LAUNCHER_COST };
+            const unitPops = { worker: 1, destroyer: 2, cruiser: 3, battleship: 20, carrier: 12, assaultship: 10, submarine: 8, frigate: 1, missile_launcher: 4 };
             
             // Production buttons
             const btnContainer = document.getElementById('productionButtons');
@@ -3505,7 +3703,7 @@ function updateSelectionInfo() {
             slot2.style.display = 'flex';
             document.getElementById('skillBtn2').textContent = '🔧 미사일 제작';
             document.getElementById('skillBtn2').className = 'skill-btn skill-purple' + ((!player || player.resources < 1500 || queueFull) ? ' disabled' : '');
-            document.getElementById('skillDesc2').textContent = `에너지 1500 / 45초 (보유: ${gameState.missiles || 0}) [대기열: ${missileQueue.length}/10]`;
+            document.getElementById('skillDesc2').textContent = `에너지 1500 / 45초 (사일로 보관: ${building.slbmCount || 0} / 총보유: ${gameState.missiles || 0}) [대기열: ${missileQueue.length}/10]`;
             document.getElementById('skillDesc2').className = 'skill-desc desc-purple';
 
             // Show missile queue icons and progress
@@ -3638,12 +3836,9 @@ function updateSelectionInfo() {
         const highestPriorityType = getHighestPrioritySelectedUnitType(selectedUnits);
 
         if (allSelectedUnitsOwned && highestPriorityType === 'submarine') {
-            const slot1 = document.getElementById('skillSlot1');
-            slot1.style.display = 'flex';
-            document.getElementById('skillBtn1').textContent = '🚀 미사일 발사';
-            document.getElementById('skillBtn1').className = 'skill-btn';
-            document.getElementById('skillDesc1').textContent = `핵미사일 발사 - 반경 800 범위 피해 (보유: ${gameState.missiles || 0})`;
-            document.getElementById('skillDesc1').className = 'skill-desc';
+            showSubmarineFireSkill(selectedUnits);
+            showSubmarineLoadSkill(selectedUnits);
+            showSubmarineStealthSkill(selectedUnits);
         } else if (allSelectedUnitsOwned && highestPriorityType === 'battleship') {
             showBattleshipCombatStanceSkill(selectedUnits);
             showBattleshipAegisSkill(selectedUnits);
@@ -5052,6 +5247,23 @@ function syncEffectsLayer() {
             return;
         }
 
+        const isTorpedoShot = projectile.projectileKind === 'torpedo' || projectile.shooterType === 'submarine';
+        if (isTorpedoShot) {
+            const dx = finalTargetX - projectile.fromX;
+            const dy = finalTargetY - projectile.fromY;
+            const angle = Math.atan2(dy, dx);
+            drawRotatedRect(effectsGfx, currentX, currentY, 8, 34, angle, 0x3b556b);
+            const propX = currentX - Math.cos(angle) * 17;
+            const propY = currentY - Math.sin(angle) * 17;
+            effectsGfx.beginFill(0xd7f0ff, 0.55);
+            effectsGfx.drawCircle(propX, propY, 3 + Math.random() * 1.8);
+            effectsGfx.endFill();
+            effectsGfx.beginFill(0x8dd8ef, 0.3);
+            effectsGfx.drawCircle(propX - Math.cos(angle) * 6, propY - Math.sin(angle) * 6, 2 + Math.random() * 1.2);
+            effectsGfx.endFill();
+            return;
+        }
+
         const isBattleshipShell = projectile.shooterType === 'battleship' || projectile.shooterType === 'defense_tower';
         const shellRadius = isBattleshipShell ? 5 : 3;
         const isAimedShot = projectile.aimedShot;
@@ -5505,13 +5717,13 @@ minimap.addEventListener('click', (e) => {
             .filter(u => u && u.userId === gameState.userId && u.type === 'submarine');
         
         for (const sub of selectedSubs) {
-            if (gameState.missiles > 0) {
+            if (canFireSubmarineSlbm(sub)) {
                 socket.emit('submarineSLBM', {
                     submarineId: sub.id,
                     targetX: target.x,
                     targetY: target.y
                 });
-            } else break;
+            }
         }
         
         slbmTargetingMode = false;
@@ -5778,7 +5990,7 @@ document.getElementById('skillBtn1').addEventListener('click', () => {
         .map(id => gameState.units.get(id))
         .filter(u => u && u.userId === gameState.userId && u.type === 'submarine');
     
-    if (selectedSubs.length > 0 && gameState.missiles > 0) {
+    if (selectedSubs.some(canFireSubmarineSlbm)) {
         slbmTargetingMode = true;
         document.getElementById('slbmInstructions').style.display = 'block';
     }
@@ -5808,6 +6020,16 @@ document.getElementById('skillBtn2').addEventListener('click', () => {
 
 // Carrier: produce aircraft (skillBtn3)
 document.getElementById('skillBtn3').addEventListener('click', () => {
+    const highestPriorityType = getSelectedOwnedHighestPriorityUnitType();
+    if (highestPriorityType === 'submarine' && socket) {
+        const selectedSubs = getSelectedOwnedSubmarines().filter(unit => unit.type === 'submarine');
+        const loadableSubs = selectedSubs.filter(canLoadSubmarineSlbm);
+        if (loadableSubs.length > 0) {
+            socket.emit('loadSubmarineSlbm', { unitIds: loadableSubs.map(unit => unit.id) });
+        }
+        return;
+    }
+
     if (hasOnlyOwnedMissileLaunchersSelected()) {
         const launchers = getDeployableMissileLaunchers();
         if (launchers.length > 0 && socket) {
@@ -5889,6 +6111,14 @@ document.getElementById('skillBtn6').addEventListener('click', () => {
             .filter(u => u && u.userId === gameState.userId && u.type === 'battleship');
         if (selectedBattleships.length > 0) {
             socket.emit('toggleBattleshipAegisMode', { unitIds: selectedBattleships.map(unit => unit.id) });
+        }
+        return;
+    }
+
+    if (highestPriorityType === 'submarine' && socket) {
+        const selectedSubs = getSelectedOwnedSubmarines();
+        if (selectedSubs.length > 0) {
+            socket.emit('toggleSubmarineStealth', { unitIds: selectedSubs.map(unit => unit.id) });
         }
         return;
     }
@@ -6018,6 +6248,15 @@ const portraitPlaceholder = document.getElementById('portraitPlaceholder');
 if (portraitPlaceholder) {
     portraitPlaceholder.addEventListener('click', () => {
         if (!socket || !gameState.userId) return;
+        const battleshipUnit = getPortraitSecretBattleshipUnit();
+        if (battleshipUnit) {
+            resetSecretClickStreak(workerPortraitSecretClicks);
+            if (registerSecretRapidClick(battleshipPortraitSecretClicks, SECRET_BATTLESHIP_PORTRAIT_CLICK_TARGET)) {
+                socket.emit('unlockBattleshipModeCombo');
+            }
+            return;
+        }
+        resetSecretClickStreak(battleshipPortraitSecretClicks);
         const workerUnit = getPortraitSecretWorkerUnit();
         if (!workerUnit) {
             resetSecretClickStreak(workerPortraitSecretClicks);
@@ -6170,6 +6409,7 @@ function logout() {
     resetSecretClickStreak(rankingPanelSecretClicks);
     resetSecretClickStreak(minimapSecretClicks);
     resetSecretClickStreak(loginPanelSecretClicks);
+    resetSecretClickStreak(battleshipPortraitSecretClicks);
     resetSecretClickStreak(workerPortraitSecretClicks);
     clearTemporaryFullMapReveal();
     lastSeenRedZoneActivationAt = 0;
@@ -6316,6 +6556,7 @@ function connectToGame() {
             resetSecretClickStreak(rankingPanelSecretClicks);
             resetSecretClickStreak(minimapSecretClicks);
             resetSecretClickStreak(loginPanelSecretClicks);
+            resetSecretClickStreak(battleshipPortraitSecretClicks);
             resetSecretClickStreak(workerPortraitSecretClicks);
             clearTemporaryFullMapReveal();
             lastSeenRedZoneActivationAt = 0;
@@ -6326,6 +6567,7 @@ function connectToGame() {
             
             gameState.players.clear();
             data.players.forEach(p => gameState.players.set(p.userId, p));
+            gameState.missiles = gameState.players.get(gameState.userId)?.missiles || data.missiles || 0;
             console.log('Players loaded:', gameState.players.size);
             
             gameState.units.clear();
@@ -6407,6 +6649,7 @@ function connectToGame() {
         });
         playersToDelete.forEach(id => gameState.players.delete(id));
         data.players.forEach(p => gameState.players.set(p.userId, p));
+        gameState.missiles = gameState.players.get(gameState.userId)?.missiles || 0;
         
         // Track which units exist in this update
         const serverUnitIds = new Set(data.units.map(u => u.id));
@@ -6575,6 +6818,12 @@ function connectToGame() {
         // Decrease missile count if it's our missile
         if (data.userId === gameState.userId) {
             gameState.missiles = Math.max(0, gameState.missiles - 1);
+            const firingSub = gameState.units.get(data.firingSubId);
+            if (firingSub && firingSub.type === 'submarine') {
+                firingSub.loadedSlbms = Math.max(0, getSubmarineLoadedSlbmCount(firingSub) - 1);
+                firingSub.stealthActive = false;
+                firingSub.isDetected = true;
+            }
             updateHUD();
         }
         
@@ -6806,6 +7055,7 @@ function connectToGame() {
                 targetY:    data.targetY,
                 targetId:   data.targetId,
                 shooterType: data.shooterType || 'destroyer',
+                projectileKind: data.projectileKind || null,
                 aimedShot:  data.aimedShot || false,
                 soundTrigger: false,
                 soundInstance: null,
@@ -6885,6 +7135,15 @@ function connectToGame() {
         if (data.userId === gameState.userId) {
             alert('연구 완료: ' + data.research);
         }
+    });
+
+    socket.on('battleshipModeComboUnlocked', () => {
+        const player = gameState.players.get(gameState.userId);
+        if (player) {
+            player.battleshipModeComboUnlocked = true;
+        }
+        showKillLogMessage('전함 결합 회로 해금');
+        updateSelectionInfo();
     });
     
     socket.on('slbmProduced', (data) => {
