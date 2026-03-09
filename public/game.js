@@ -247,6 +247,9 @@ const DESTROYER_VISION_RADIUS = 1000;
 const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
 const SLBM_OWNER_VISION_RADIUS = 1200;
+const SLBM_STAGE_ONE_PROGRESS = 1 / 3;
+const SLBM_STAGE_TWO_PROGRESS = 2 / 3;
+const SLBM_STAGE_THREE_PROGRESS = 5 / 6;
 const BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER = 1.10;
 const BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS = 150;
 const BATTLESHIP_AEGIS_RANGE_MULTIPLIER = 1.5;
@@ -691,6 +694,12 @@ const BATTLESHIP_TURRET_IMAGE_COORDS = Object.freeze([
     { x: 0.5, y: 70 }
 ]);
 const BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS = 4800;
+const BATTLESHIP_AEGIS_DAMAGE = 7;
+const BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS = 480;
+const BATTLESHIP_AEGIS_MIN_TURRET_COOLDOWN_MS = Math.max(
+    1,
+    Math.round(BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS * (BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS / BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS))
+);
 const BATTLESHIP_MUZZLE_DIRECTION_SIGN = 1;
 
 function getBattleshipTargetHoldMs(unit) {
@@ -951,6 +960,7 @@ let gameState = {
     missiles: 0 // Player's missile count
 };
 let selectionInfoSuspendUntil = 0;
+let lastSelectionInfoFocusedUnitId = null;
 
 function suspendSelectionInfoRefresh(durationMs = 250) {
     selectionInfoSuspendUntil = Math.max(selectionInfoSuspendUntil, Date.now() + durationMs);
@@ -2018,6 +2028,17 @@ canvas.addEventListener('mousemove', (e) => {
         gameState.selectionBox.endX = mouse.worldX;
         gameState.selectionBox.endY = mouse.worldY;
     }
+
+    if (!mouse.down && Date.now() >= selectionInfoSuspendUntil) {
+        const selectedUnits = getSelectedUnitsArray();
+        if (selectedUnits.length > 1) {
+            const focusedUnit = getFocusedSelectedUnit(selectedUnits);
+            const focusedUnitId = focusedUnit ? focusedUnit.id : null;
+            if (focusedUnitId !== lastSelectionInfoFocusedUnitId) {
+                updateSelectionInfo();
+            }
+        }
+    }
     
     // Pan with middle mouse
     if (mouse.down && mouse.button === 1) {
@@ -2433,7 +2454,7 @@ function getHighestPrioritySelectedUnitType(units) {
 function getDisplayedUnitDamageValue(unit) {
     if (!unit) return 0;
     if (unit.type === 'carrier' || unit.type === 'assaultship') return 0;
-    if (unit.type === 'battleship' && unit.battleshipAegisMode) return 5;
+    if (unit.type === 'battleship' && unit.battleshipAegisMode) return BATTLESHIP_AEGIS_DAMAGE;
     if (unit.type === 'cruiser' && unit.aegisMode) return 25;
     if (unit.type === 'cruiser' && unit.isIsolated) return (unit.damage || 0) * 2;
     if (unit.type === 'battleship' && unit.aimedShot) return (unit.damage || 0) * 2;
@@ -2468,6 +2489,23 @@ function getBattleshipCombatStanceAttackCooldownMs(unit) {
     );
 }
 
+function getBattleshipAegisTurretCooldownMs(unit) {
+    const currentAttackCooldown = Math.max(
+        BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS,
+        Number.isFinite(unit?.attackCooldownMs) ? unit.attackCooldownMs : getBattleshipCombatStanceAttackCooldownMs(unit)
+    );
+    return Math.max(
+        BATTLESHIP_AEGIS_MIN_TURRET_COOLDOWN_MS,
+        Math.round(BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS * (currentAttackCooldown / BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS))
+    );
+}
+
+function formatSecondsLabelFromMs(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return '0초';
+    const decimals = ms < 100 ? 3 : 2;
+    return `${(ms / 1000).toFixed(decimals).replace(/\.?0+$/, '')}초`;
+}
+
 function showBattleshipCombatStanceSkill(units) {
     const battleships = units.filter(unit => unit.type === 'battleship' && unit.userId === gameState.userId);
     if (battleships.length <= 0) return;
@@ -2499,18 +2537,20 @@ function showBattleshipAegisSkill(units) {
     const slot6 = document.getElementById('skillSlot6');
     slot6.style.display = 'flex';
     const activeCount = battleships.filter(unit => unit.battleshipAegisMode).length;
+    const activeBattleship = battleships.find(unit => unit.battleshipAegisMode) || battleships[0];
+    const turretCooldownLabel = formatSecondsLabelFromMs(getBattleshipAegisTurretCooldownMs(activeBattleship));
     document.getElementById('skillBtn6').textContent = activeCount > 0 ? '🛡️ 이지스 모드 (활성)' : '🛡️ 이지스 모드';
     document.getElementById('skillBtn6').className = 'skill-btn' + (activeCount > 0 ? ' skill-active' : '');
     document.getElementById('skillDesc6').className = 'skill-desc';
     if (battleships.length === 1) {
         document.getElementById('skillDesc6').textContent = activeCount > 0
-            ? '사거리·시야 x1.5 / 각 포탑 0.48초 연사 / 분산추적 / 발당 5 / 받는 피해 40% 증가'
-            : '활성 시 사거리·시야 1.5배, 각 포탑이 독립 추적하며 0.48초마다 발당 5 공격, 대신 받는 피해 40% 증가';
+            ? `사거리·시야 x1.5 / 각 포탑 ${turretCooldownLabel} 연사 / 분산추적 / 발당 ${BATTLESHIP_AEGIS_DAMAGE} / 받는 피해 40% 증가`
+            : `활성 시 사거리·시야 1.5배, 각 포탑이 독립 추적하며 0.48초마다 발당 ${BATTLESHIP_AEGIS_DAMAGE} 공격, 대신 받는 피해 40% 증가`;
         return;
     }
     document.getElementById('skillDesc6').textContent = activeCount > 0
-        ? `활성 ${activeCount}/${battleships.length}척 | 사거리·시야 x1.5 / 각 포탑 독립 추적 / 발당 5 / 받는 피해 40% 증가`
-        : '선택 전함 포탑이 독립 추적하며 0.48초 연사, 발당 5, 사거리·시야 1.5배, 받는 피해 40% 증가';
+        ? `활성 ${activeCount}/${battleships.length}척 | 사거리·시야 x1.5 / 각 포탑 ${turretCooldownLabel} 연사 / 발당 ${BATTLESHIP_AEGIS_DAMAGE} / 받는 피해 40% 증가`
+        : `선택 전함 포탑이 독립 추적하며 0.48초 연사, 발당 ${BATTLESHIP_AEGIS_DAMAGE}, 사거리·시야 1.5배, 받는 피해 40% 증가`;
 }
 
 function showFrigateEngineOverdriveSkill(units) {
@@ -2585,6 +2625,13 @@ function isUnitVisibleToPlayer(unit) {
     return true;
 }
 
+function isBuildingVisibleToPlayer(building) {
+    if (!building) return false;
+    if (building.userId === gameState.userId) return true;
+    if (hasTemporaryFullMapReveal()) return true;
+    return isPositionVisible(building.x, building.y);
+}
+
 function isPointInsideUnitHitbox(unit, worldX, worldY) {
     const baseSize = getUnitSelectionBaseSize(unit);
     const { x, y } = getUnitDisplayPosition(unit);
@@ -2629,6 +2676,32 @@ function findInspectableEnemyUnitAt(worldX, worldY) {
     });
 
     return clickedUnitId;
+}
+
+function findInspectableBuildingAt(worldX, worldY, predicate = null) {
+    let clickedBuildingId = null;
+    let closestDistanceSq = Infinity;
+
+    gameState.buildings.forEach((building, buildingId) => {
+        if (predicate && !predicate(building)) return;
+        if (!isBuildingVisibleToPlayer(building)) return;
+
+        const buildingHalfSize = getBuildingHitboxHalfSize(building);
+        if (worldX < building.x - buildingHalfSize || worldX > building.x + buildingHalfSize ||
+            worldY < building.y - buildingHalfSize || worldY > building.y + buildingHalfSize) {
+            return;
+        }
+
+        const dx = worldX - building.x;
+        const dy = worldY - building.y;
+        const distanceSq = dx * dx + dy * dy;
+        if (distanceSq < closestDistanceSq) {
+            closestDistanceSq = distanceSq;
+            clickedBuildingId = buildingId;
+        }
+    });
+
+    return clickedBuildingId;
 }
 
 function findOwnedUnitAt(worldX, worldY, predicate = null) {
@@ -2749,6 +2822,43 @@ function getPortraitSecretWorkerUnit() {
     return unit;
 }
 
+function getSelectedUnitsArray() {
+    return Array.from(gameState.selection)
+        .map(id => gameState.units.get(id))
+        .filter(u => u !== undefined);
+}
+
+function getFocusedSelectedUnit(units) {
+    if (!Array.isArray(units) || units.length <= 0) return null;
+    if (units.length === 1) return units[0];
+
+    let closestUnit = null;
+    let closestDistanceSq = Infinity;
+    units.forEach(unit => {
+        const { x, y } = getUnitDisplayPosition(unit);
+        const dx = x - mouse.worldX;
+        const dy = y - mouse.worldY;
+        const distanceSq = (dx * dx) + (dy * dy);
+        if (distanceSq < closestDistanceSq) {
+            closestDistanceSq = distanceSq;
+            closestUnit = unit;
+        }
+    });
+
+    if (closestUnit) return closestUnit;
+    return units[0];
+}
+
+function formatSelectedUnitFocusLabel(unit, selectedCount) {
+    if (!unit) return '';
+    const factionSuffix = unit.userId === gameState.userId ? '' : ' (적군)';
+    const holdSuffix = unit.userId === gameState.userId && unit.holdPosition ? ' | 홀드' : '';
+    const stateSuffix = unit.type === 'missile_launcher'
+        ? ` | ${getMissileLauncherStateLabel(unit)}`
+        : (unit.type === 'assaultship' ? ` | 적재 ${getAssaultShipLoadedUnitCount(unit)}/${ASSAULT_SHIP_MAX_LAUNCHERS}` : '');
+    return `${getUnitTypeName(unit.type)}${factionSuffix}${stateSuffix}${holdSuffix} | 선택 ${selectedCount}`;
+}
+
 function selectUnits() {
     const box = gameState.selectionBox;
     const minX = Math.min(box.startX, box.endX);
@@ -2767,16 +2877,7 @@ function selectUnits() {
             return;
         }
 
-        let clickedBuilding = null;
-        gameState.buildings.forEach((building, buildingId) => {
-            if (building.userId === gameState.userId) {
-                const buildingHalfSize = getBuildingHitboxHalfSize(building);
-                if (clickX >= building.x - buildingHalfSize && clickX <= building.x + buildingHalfSize &&
-                    clickY >= building.y - buildingHalfSize && clickY <= building.y + buildingHalfSize) {
-                    clickedBuilding = buildingId;
-                }
-            }
-        });
+        const clickedBuilding = findInspectableBuildingAt(clickX, clickY, building => building.userId === gameState.userId);
         
         // If we clicked a building and have units with active commands, 
         // just focus the building for production UI without deselecting units
@@ -2820,6 +2921,24 @@ function selectUnits() {
             }
         }
     });
+
+    if (gameState.selection.size === 0) {
+        gameState.units.forEach((unit, unitId) => {
+            if (unit.userId === gameState.userId) return;
+            if (!isUnitVisibleToPlayer(unit)) return;
+
+            if (isClick) {
+                if (isPointInsideUnitHitbox(unit, clickX, clickY)) {
+                    gameState.selection.add(unitId);
+                }
+            } else {
+                const { x, y } = getUnitDisplayPosition(unit);
+                if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+                    gameState.selection.add(unitId);
+                }
+            }
+        });
+    }
     
     // Select buildings (if no units selected)
     if (gameState.selection.size === 0) {
@@ -2841,10 +2960,30 @@ function selectUnits() {
         });
     }
 
+    if (gameState.selection.size === 0) {
+        gameState.buildings.forEach((building, buildingId) => {
+            if (building.userId === gameState.userId) return;
+            if (!isBuildingVisibleToPlayer(building)) return;
+
+            const buildingHalfSize = getBuildingHitboxHalfSize(building);
+            if (isClick) {
+                if (clickX >= building.x - buildingHalfSize && clickX <= building.x + buildingHalfSize &&
+                    clickY >= building.y - buildingHalfSize && clickY <= building.y + buildingHalfSize) {
+                    gameState.selection.add(buildingId);
+                }
+            } else {
+                if (building.x + buildingHalfSize >= minX && building.x - buildingHalfSize <= maxX &&
+                    building.y + buildingHalfSize >= minY && building.y - buildingHalfSize <= maxY) {
+                    gameState.selection.add(buildingId);
+                }
+            }
+        });
+    }
+
     if (gameState.selection.size === 0 && isClick) {
         const enemyUnitId = findInspectableEnemyUnitAt(clickX, clickY);
         if (enemyUnitId !== null) {
-            gameState.inspectedUnitId = enemyUnitId;
+            gameState.selection.add(enemyUnitId);
         }
     }
     
@@ -2862,7 +3001,7 @@ function renderSingleUnitPanel(unit, options = {}) {
     } else if (unit.type === 'assaultship') {
         displayDamage = '수송 전용';
     } else if (unit.type === 'battleship' && unit.battleshipAegisMode) {
-        displayDamage = '10 (이지스)';
+        displayDamage = `${BATTLESHIP_AEGIS_DAMAGE} (이지스)`;
     } else if (unit.type === 'cruiser' && unit.aegisMode) {
         displayDamage = '25 (이지스)';
     } else if (unit.type === 'battleship' && unit.aimedShot) {
@@ -3229,6 +3368,7 @@ function updateSelectionInfo() {
     const btnContainer = document.getElementById('productionButtons');
     
     if (gameState.selection.size === 0 && !inspectedUnit) {
+        lastSelectionInfoFocusedUnitId = null;
         // Remove worker build grid if exists when nothing is selected
         removeWorkerBuildGrid();
         return;
@@ -3240,6 +3380,7 @@ function updateSelectionInfo() {
         .filter(b => b !== undefined);
     
         if (selectedBuildings.length > 0) {
+            lastSelectionInfoFocusedUnitId = null;
             removeWorkerBuildGrid();
             const building = selectedBuildings[0];
             const buildingTypeNames = {
@@ -3263,7 +3404,8 @@ function updateSelectionInfo() {
         }
         document.getElementById('statHp').textContent = `${building.hp || 0} / ${building.maxHp || 0}`;
         document.getElementById('statKills').textContent = '-';
-        document.getElementById('targetLabel').textContent = buildingTypeNames[building.type] || building.type;
+        const buildingFactionSuffix = building.userId === gameState.userId ? '' : ' (적군)';
+        document.getElementById('targetLabel').textContent = `${buildingTypeNames[building.type] || building.type}${buildingFactionSuffix}`;
         
         // Show production UI in skill panel for production buildings
         if ((building.type === 'headquarters' || building.type === 'shipyard' || building.type === 'naval_academy' || building.type === 'carbase') && building.userId === gameState.userId) {
@@ -3394,9 +3536,12 @@ function updateSelectionInfo() {
         return;
     }
     
-    const selectedUnits = Array.from(gameState.selection).map(id => gameState.units.get(id)).filter(u => u !== undefined);
+    const selectedUnits = getSelectedUnitsArray();
+    const ownedSelectedUnits = selectedUnits.filter(unit => unit.userId === gameState.userId);
+    const allSelectedUnitsOwned = selectedUnits.length > 0 && ownedSelectedUnits.length === selectedUnits.length;
     
     if (selectedUnits.length === 0) {
+        lastSelectionInfoFocusedUnitId = null;
         removeWorkerBuildGrid();
         if (!inspectedUnit) return;
         bottomPanel.classList.add('active');
@@ -3405,7 +3550,7 @@ function updateSelectionInfo() {
     }
     
     // Check if workers are selected - show build buttons in skill panel
-    const hasWorkers = selectedUnits.some(u => u.type === 'worker' && u.userId === gameState.userId);
+    const hasWorkers = allSelectedUnitsOwned && selectedUnits.some(u => u.type === 'worker');
     
     // Remove worker build grid if workers are not selected
     if (!hasWorkers) {
@@ -3472,41 +3617,34 @@ function updateSelectionInfo() {
     bottomPanel.classList.add('active');
     
     if (selectedUnits.length === 1) {
-        renderSingleUnitPanel(selectedUnits[0]);
+        lastSelectionInfoFocusedUnitId = selectedUnits[0].id;
+        renderSingleUnitPanel(selectedUnits[0], {
+            allowSkills: allSelectedUnitsOwned,
+            showAttackTarget: allSelectedUnitsOwned
+        });
     } else {
-        // Multiple units selected - show summary stats
-        // Priority order for mixed selections: battleship > submarine > carrier > assaultship > cruiser > destroyer > frigate > missile_launcher/worker.
-        const sortedUnits = [...selectedUnits].sort((a, b) => getUnitSelectionPriority(b.type) - getUnitSelectionPriority(a.type));
-        const primaryUnit = sortedUnits[0];
-        
-        const totalDamage = selectedUnits.reduce((sum, u) => sum + getDisplayedUnitDamageValue(u), 0);
-        const avgRange = Math.round(selectedUnits.reduce((sum, u) => sum + (u.attackRange || 0), 0) / selectedUnits.length);
-        const totalHp = selectedUnits.reduce((sum, u) => sum + (u.hp || 0), 0);
-        const totalMaxHp = selectedUnits.reduce((sum, u) => sum + (u.maxHp || 0), 0);
-        const totalKills = selectedUnits.reduce((sum, u) => sum + (u.kills || 0), 0);
+        const primaryUnit = getFocusedSelectedUnit(selectedUnits);
+        lastSelectionInfoFocusedUnitId = primaryUnit ? primaryUnit.id : null;
         const holdCount = selectedUnits.filter(u => u.userId === gameState.userId && u.holdPosition).length;
-        const holdSuffix = holdCount === selectedUnits.length ? ' | 홀드' : (holdCount > 0 ? ` | 홀드 ${holdCount}` : '');
-        
-        document.getElementById('statDamage').textContent = totalDamage;
-        document.getElementById('statRange').textContent = avgRange;
-        document.getElementById('statHp').textContent = `${totalHp} / ${totalMaxHp}`;
-        document.getElementById('statKills').textContent = totalKills;
-        document.getElementById('targetLabel').textContent = attackTarget && holdCount === 0
-            ? `🎯 ${attackTarget.name}`
-            : getUnitTypeName(primaryUnit.type) + ` 외 ${selectedUnits.length - 1}${holdSuffix}`;
+
+        renderSingleUnitPanel(primaryUnit, {
+            allowSkills: false,
+            showAttackTarget: false
+        });
+        document.getElementById('targetLabel').textContent = formatSelectedUnitFocusLabel(primaryUnit, selectedUnits.length);
         
         // Show skills only for the highest-priority selected unit type.
         const hasTypes = new Set(selectedUnits.map(u => u.type));
         const highestPriorityType = getHighestPrioritySelectedUnitType(selectedUnits);
 
-        if (highestPriorityType === 'submarine') {
+        if (allSelectedUnitsOwned && highestPriorityType === 'submarine') {
             const slot1 = document.getElementById('skillSlot1');
             slot1.style.display = 'flex';
             document.getElementById('skillBtn1').textContent = '🚀 미사일 발사';
             document.getElementById('skillBtn1').className = 'skill-btn';
             document.getElementById('skillDesc1').textContent = `핵미사일 발사 - 반경 800 범위 피해 (보유: ${gameState.missiles || 0})`;
             document.getElementById('skillDesc1').className = 'skill-desc';
-        } else if (highestPriorityType === 'battleship') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'battleship') {
             showBattleshipCombatStanceSkill(selectedUnits);
             showBattleshipAegisSkill(selectedUnits);
             const slot5 = document.getElementById('skillSlot5');
@@ -3538,7 +3676,7 @@ function updateSelectionInfo() {
                     ? '선택된 전함들의 다음 공격 사거리·데미지·시야 2배 (쿨타임 16초)'
                     : '이지스 모드가 아닌 전함들의 다음 공격 사거리·데미지·시야 2배 (쿨타임 16초)';
             }
-        } else if (highestPriorityType === 'carrier') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'carrier') {
             const carriers = selectedUnits.filter(u => u.type === 'carrier' && u.userId === gameState.userId);
             if (carriers.length > 0) {
                 const firstCarrier = carriers[0];
@@ -3595,7 +3733,7 @@ function updateSelectionInfo() {
                     document.getElementById('skillDesc8').textContent = `선택된 각 항모에서 정찰기 1기씩 출격, 항모당 최대 ${RECON_AIRCRAFT_MAX_PER_CARRIER}기 동시 운영`;
                 }
             }
-        } else if (highestPriorityType === 'assaultship') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'assaultship') {
             const slot3 = document.getElementById('skillSlot3');
             slot3.style.display = 'flex';
             const totalLoaded = selectedUnits.reduce((sum, unit) => sum + getAssaultShipLoadedUnitCount(unit), 0);
@@ -3604,7 +3742,7 @@ function updateSelectionInfo() {
             document.getElementById('skillBtn3').className = 'skill-btn' + (unloadReadyCount > 0 ? '' : ' disabled');
             document.getElementById('skillDesc3').textContent = `적재 ${totalLoaded} / 선택 ${selectedUnits.length}척 | 육지와 맞닿은 상륙함 ${unloadReadyCount}척이 탑승 유닛을 방출합니다`;
             showAssaultShipPickupSkill(selectedUnits);
-        } else if (highestPriorityType === 'cruiser') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'cruiser') {
             const slot6 = document.getElementById('skillSlot6');
             slot6.style.display = 'flex';
             const anyAegis = selectedUnits.some(u => u.type === 'cruiser' && u.aegisMode);
@@ -3616,7 +3754,7 @@ function updateSelectionInfo() {
                 document.getElementById('skillBtn6').className = 'skill-btn';
             }
             document.getElementById('skillDesc6').textContent = 'SLBM 요격 모드 전환 (함선 25, SLBM 50, 피해감소 30%, 사거리 60%↓)';
-        } else if (highestPriorityType === 'destroyer') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'destroyer') {
             const slot7 = document.getElementById('skillSlot7');
             slot7.style.display = 'flex';
             document.getElementById('skillBtn7').textContent = '🔍 탐색';
@@ -3628,9 +3766,9 @@ function updateSelectionInfo() {
             document.getElementById('skillBtn8').textContent = '💣 기뢰매설';
             document.getElementById('skillBtn8').className = 'skill-btn';
             document.getElementById('skillDesc8').textContent = '클릭한 위치에 기뢰를 설치합니다';
-        } else if (highestPriorityType === 'frigate') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'frigate') {
             showFrigateEngineOverdriveSkill(selectedUnits);
-        } else if (highestPriorityType === 'missile_launcher') {
+        } else if (allSelectedUnitsOwned && highestPriorityType === 'missile_launcher') {
             const slot3 = document.getElementById('skillSlot3');
             slot3.style.display = 'flex';
             const mobileCount = selectedUnits.filter(u => !u.deployState || u.deployState === 'mobile').length;
@@ -3654,7 +3792,7 @@ function updateSelectionInfo() {
             if (hasOnlyOwnedAssaultShipLoadableUnitsSelected()) {
                 showAssaultShipLoadUnitsSkill(selectedUnits);
             }
-        } else if (hasOnlyOwnedAssaultShipLoadableUnitsSelected()) {
+        } else if (allSelectedUnitsOwned && hasOnlyOwnedAssaultShipLoadableUnitsSelected()) {
             showAssaultShipLoadUnitsSkill(selectedUnits);
         }
         
@@ -3701,6 +3839,7 @@ function render() {
     // Overlay (selection box, SLBM targeting) – drawn in world space
     overlayGfx.clear();
     drawGlobalRedZoneExplosions();
+    drawSlbmSkyEffects(overlayGfx, Date.now(), getViewportBounds(500));
     if (gameState.selectionBox) {
         const box = gameState.selectionBox;
         overlayGfx.lineStyle(2 / gameState.camera.zoom, 0x4fc3f7, 1);
@@ -4714,17 +4853,7 @@ function syncAirstrikeSprites(now, viewport) {
     });
 }
 
-// Combined effects rendering: contrails + projectiles + explosions + unit overlays
-function syncEffectsLayer() {
-    effectsGfx.clear();
-    const now = Date.now();
-    const viewport = getViewportBounds(500);
-    syncSlbmFlightSounds(now);
-
-    // --- Unit overlays (HP bars, selection circles) ---
-    drawUnitOverlays(effectsGfx);
-
-    // --- Contrails ---
+function drawSlbmSkyEffects(gfx, now, viewport) {
     slbmContrails.forEach(contrail => {
         contrail.segments = contrail.segments.filter(seg => now - seg.time < 3000);
         for (let i = 0; i < contrail.segments.length - 1; i++) {
@@ -4735,13 +4864,114 @@ function syncEffectsLayer() {
             const age = now - seg.time;
             const fadeProgress = age / 3000;
             const alpha = Math.max(0, 0.3 - fadeProgress * 0.3);
-            effectsGfx.lineStyle(24, 0xc8c8c8, alpha);
-            effectsGfx.moveTo(seg.x, seg.y);
-            effectsGfx.lineTo(nextSeg.x, nextSeg.y);
+            gfx.lineStyle(24, 0xc8c8c8, alpha);
+            gfx.moveTo(seg.x, seg.y);
+            gfx.lineTo(nextSeg.x, nextSeg.y);
         }
     });
     slbmContrails = slbmContrails.filter(c => c.segments.length > 0);
-    effectsGfx.lineStyle(0);
+    gfx.lineStyle(0);
+
+    slbmMissiles.forEach(missile => {
+        if (!missile.impacted) {
+            const progress = Math.max(0, Math.min(1, (now - missile.startTime) / missile.flightTime));
+            if (progress >= 1) {
+                missile.impacted = true;
+                missile.impactTime = now;
+                return;
+            }
+
+            const dx = missile.targetX - missile.fromX;
+            const dy = missile.targetY - missile.fromY;
+            const angle = Math.atan2(dy, dx);
+            const currentX = missile.fromX + dx * progress;
+            const currentY = missile.fromY + dy * progress;
+            if (currentX < viewport.left - 200 || currentX > viewport.right + 200 || currentY < viewport.top - 200 || currentY > viewport.bottom + 200) return;
+
+            const missileWidth = 24;
+            const missileFullLen = 150;
+
+            if (!missile.contrailId) {
+                missile.contrailId = `contrail-${missile.id}`;
+                slbmContrails.push({ id: missile.contrailId, segments: [{ x: currentX, y: currentY, time: now }] });
+            }
+            const contrail = slbmContrails.find(c => c.id === missile.contrailId);
+            if (contrail && (contrail.segments.length === 0 || now - contrail.segments[contrail.segments.length - 1].time > 50)) {
+                contrail.segments.push({ x: currentX, y: currentY, time: now });
+            }
+
+            const pieceLen = missileFullLen / 3;
+
+            if (progress < SLBM_STAGE_ONE_PROGRESS) {
+                const hl = missileFullLen / 2;
+                drawRotatedRect(gfx, currentX, currentY, missileWidth, missileFullLen, angle, 0x111111);
+                const rearX = currentX - Math.cos(angle) * hl;
+                const rearY = currentY - Math.sin(angle) * hl;
+                drawSlbmFlameGfx(gfx, rearX, rearY, angle, missileWidth, 50);
+            } else if (progress < SLBM_STAGE_TWO_PROGRESS) {
+                const sp = (progress - SLBM_STAGE_ONE_PROGRESS) / (SLBM_STAGE_TWO_PROGRESS - SLBM_STAGE_ONE_PROGRESS);
+                drawRotatedRect(gfx, currentX, currentY, missileWidth, pieceLen * 2, angle, 0x111111);
+                const rearX = currentX - Math.cos(angle) * pieceLen;
+                const rearY = currentY - Math.sin(angle) * pieceLen;
+                drawSlbmFlameGfx(gfx, rearX, rearY, angle, missileWidth, 40);
+                const detachedX = currentX - Math.cos(angle) * pieceLen * (2 + 1.5 * sp) + Math.sin(angle) * 24 * sp;
+                const detachedY = currentY - Math.sin(angle) * pieceLen * (2 + 1.5 * sp) - Math.cos(angle) * 24 * sp;
+                drawRotatedRect(gfx, detachedX, detachedY, missileWidth, pieceLen, angle, 0x333333, Math.max(0.35, 1 - sp * 0.4));
+            } else if (progress < SLBM_STAGE_THREE_PROGRESS) {
+                const sp = (progress - SLBM_STAGE_TWO_PROGRESS) / (SLBM_STAGE_THREE_PROGRESS - SLBM_STAGE_TWO_PROGRESS);
+                drawRotatedRect(gfx, currentX, currentY, missileWidth, pieceLen, angle, 0x111111);
+                const rearX = currentX - Math.cos(angle) * (pieceLen / 2);
+                const rearY = currentY - Math.sin(angle) * (pieceLen / 2);
+                drawSlbmFlameGfx(gfx, rearX, rearY, angle, missileWidth * 0.9, 35);
+                const detachedX = currentX - Math.cos(angle) * pieceLen * (1.8 + 1.6 * sp) - Math.sin(angle) * 18 * sp;
+                const detachedY = currentY - Math.sin(angle) * pieceLen * (1.8 + 1.6 * sp) + Math.cos(angle) * 18 * sp;
+                drawRotatedRect(gfx, detachedX, detachedY, missileWidth, pieceLen, angle, 0x444444, Math.max(0.25, 1 - sp * 0.6));
+            } else {
+                drawRotatedRect(gfx, currentX, currentY, missileWidth, pieceLen, angle, 0x111111);
+                const rearX = currentX - Math.cos(angle) * (pieceLen / 2);
+                const rearY = currentY - Math.sin(angle) * (pieceLen / 2);
+                drawSlbmFlameGfx(gfx, rearX, rearY, angle, missileWidth * 0.8, 28);
+            }
+
+            if (missile.hp !== undefined && missile.maxHp && missile.hp < missile.maxHp) {
+                const barWidth = 40;
+                const barHeight = 4;
+                const barX = currentX - barWidth / 2;
+                const barY = currentY - 50;
+                const hpRatio = Math.max(0, missile.hp / missile.maxHp);
+                gfx.beginFill(0x000000, 0.6);
+                gfx.drawRect(barX, barY, barWidth, barHeight);
+                gfx.endFill();
+                const hpColor = hpRatio > 0.5 ? 0x4caf50 : (hpRatio > 0.25 ? 0xff9800 : 0xf44336);
+                gfx.beginFill(hpColor);
+                gfx.drawRect(barX, barY, barWidth * hpRatio, barHeight);
+                gfx.endFill();
+            }
+            return;
+        }
+
+        const impactElapsed = now - (missile.impactTime || 0);
+        if (impactElapsed > 2600) return;
+        if (missile.targetX < viewport.left || missile.targetX > viewport.right ||
+            missile.targetY < viewport.top || missile.targetY > viewport.bottom) return;
+
+        const pulseRadius = 120 + (impactElapsed * 0.42);
+        const pulseAlpha = Math.max(0, 0.52 - (impactElapsed / 2600));
+        gfx.beginFill(0xff5f14, pulseAlpha);
+        gfx.drawCircle(missile.targetX, missile.targetY, pulseRadius);
+        gfx.endFill();
+    });
+}
+
+// Combined effects rendering: contrails + projectiles + explosions + unit overlays
+function syncEffectsLayer() {
+    effectsGfx.clear();
+    const now = Date.now();
+    const viewport = getViewportBounds(500);
+    syncSlbmFlightSounds(now);
+
+    // --- Unit overlays (HP bars, selection circles) ---
+    drawUnitOverlays(effectsGfx);
 
     // --- Attack projectiles ---
     if (attackProjectiles.length > 0) {
@@ -4854,96 +5084,6 @@ function syncEffectsLayer() {
 
         effectsGfx.beginFill(0x111111);
         effectsGfx.drawCircle(currentX, currentY, shellRadius);
-        effectsGfx.endFill();
-    });
-
-    // --- SLBM missiles ---
-    slbmMissiles.forEach(missile => {
-        if (!missile.impacted) {
-            const progress = Math.max(0, Math.min(1, (now - missile.startTime) / missile.flightTime));
-            if (progress >= 1) { missile.impacted = true; missile.impactTime = now; return; }
-
-            const dx = missile.targetX - missile.fromX;
-            const dy = missile.targetY - missile.fromY;
-            const angle = Math.atan2(dy, dx);
-            const currentX = missile.fromX + dx * progress;
-            const currentY = missile.fromY + dy * progress;
-            if (!isSlbmVisibleToPlayer(missile, now)) return;
-            if (currentX < viewport.left - 200 || currentX > viewport.right + 200 || currentY < viewport.top - 200 || currentY > viewport.bottom + 200) return;
-
-            const missileWidth = 24;
-            const missileFullLen = 150;
-
-            // Contrail
-            if (!missile.contrailId) {
-                missile.contrailId = `contrail-${missile.id}`;
-                slbmContrails.push({ id: missile.contrailId, segments: [{ x: currentX, y: currentY, time: now }] });
-            }
-            const contrail = slbmContrails.find(c => c.id === missile.contrailId);
-            if (contrail && (contrail.segments.length === 0 || now - contrail.segments[contrail.segments.length - 1].time > 50)) {
-                contrail.segments.push({ x: currentX, y: currentY, time: now });
-            }
-
-            if (progress < 0.333) {
-                const hl = missileFullLen / 2;
-                drawRotatedRect(effectsGfx, currentX, currentY, missileWidth, missileFullLen, angle, 0x111111);
-                const rearX = currentX - Math.cos(angle) * hl;
-                const rearY = currentY - Math.sin(angle) * hl;
-                drawSlbmFlameGfx(effectsGfx, rearX, rearY, angle, missileWidth, 50);
-            } else if (progress < 0.666) {
-                const sp = (progress - 0.333) / 0.333;
-                const pieceLen = missileFullLen / 3;
-                drawRotatedRect(effectsGfx, currentX, currentY, missileWidth, pieceLen * 2, angle, 0x111111);
-                const rearX = currentX - Math.cos(angle) * pieceLen;
-                const rearY = currentY - Math.sin(angle) * pieceLen;
-                drawSlbmFlameGfx(effectsGfx, rearX, rearY, angle, missileWidth, 40);
-                const sep1X = currentX - Math.cos(angle) * pieceLen * 1.5 + Math.sin(angle) * 20 * sp;
-                const sep1Y = currentY - Math.sin(angle) * pieceLen * 1.5 - Math.cos(angle) * 20 * sp;
-                drawRotatedRect(effectsGfx, sep1X, sep1Y, missileWidth, pieceLen, angle, 0x333333);
-            } else {
-                const sp = (progress - 0.666) / 0.334;
-                const pieceLen = missileFullLen / 3;
-                drawRotatedRect(effectsGfx, currentX, currentY, missileWidth, pieceLen, angle, 0x111111);
-                const rearX = currentX - Math.cos(angle) * (pieceLen / 2);
-                const rearY = currentY - Math.sin(angle) * (pieceLen / 2);
-                drawSlbmFlameGfx(effectsGfx, rearX, rearY, angle, missileWidth, 35);
-                const sep1X = currentX - Math.cos(angle) * pieceLen * 2.5 + Math.sin(angle) * 35 * Math.min(sp + 0.5, 1);
-                const sep1Y = currentY - Math.sin(angle) * pieceLen * 2.5 - Math.cos(angle) * 35 * Math.min(sp + 0.5, 1);
-                const alpha1 = Math.max(0, 1 - sp * 0.7);
-                drawRotatedRect(effectsGfx, sep1X, sep1Y, missileWidth, pieceLen, angle, 0x444444, alpha1);
-                const sep2X = currentX - Math.cos(angle) * pieceLen * 1.5 - Math.sin(angle) * 30 * sp;
-                const sep2Y = currentY - Math.sin(angle) * pieceLen * 1.5 + Math.cos(angle) * 30 * sp;
-                const alpha2 = Math.max(0, 1 - sp * 0.5);
-                drawRotatedRect(effectsGfx, sep2X, sep2Y, missileWidth, pieceLen, angle, 0x444444, alpha2);
-            }
-
-            // SLBM HP bar
-            if (missile.hp !== undefined && missile.maxHp && missile.hp < missile.maxHp) {
-                const barWidth = 40, barHeight = 4;
-                const barX = currentX - barWidth / 2, barY = currentY - 50;
-                const hpRatio = Math.max(0, missile.hp / missile.maxHp);
-                effectsGfx.beginFill(0x000000, 0.6);
-                effectsGfx.drawRect(barX, barY, barWidth, barHeight);
-                effectsGfx.endFill();
-                const hpColor = hpRatio > 0.5 ? 0x4caf50 : (hpRatio > 0.25 ? 0xff9800 : 0xf44336);
-                effectsGfx.beginFill(hpColor);
-                effectsGfx.drawRect(barX, barY, barWidth * hpRatio, barHeight);
-                effectsGfx.endFill();
-            }
-            return;
-        }
-
-        // Impact effect
-        const impactElapsed = now - (missile.impactTime || 0);
-        if (impactElapsed > 2600) return;
-        if (!isSlbmImpactVisibleToPlayer(missile)) return;
-        if (missile.targetX < viewport.left || missile.targetX > viewport.right ||
-            missile.targetY < viewport.top || missile.targetY > viewport.bottom) return;
-
-        const pulseRadius = 120 + (impactElapsed * 0.42);
-        const pulseAlpha = Math.max(0, 0.52 - (impactElapsed / 2600));
-        effectsGfx.beginFill(0xff5f14, pulseAlpha);
-        effectsGfx.drawCircle(missile.targetX, missile.targetY, pulseRadius);
         effectsGfx.endFill();
     });
 
@@ -5154,7 +5294,7 @@ function renderMinimap() {
     
     // Draw SLBM impact zones (darkened areas)
     slbmMissiles.forEach(missile => {
-        if (missile.impacted && isSlbmImpactVisibleToPlayer(missile)) {
+        if (missile.impacted) {
             const impactX = missile.targetX * scaleX;
             const impactY = missile.targetY * scaleY;
             minimapCtx.fillStyle = 'rgba(0, 0, 0, 0.5)';
@@ -5204,7 +5344,6 @@ function renderMinimap() {
     // Draw active SLBM missiles (black bar with separation stages, scaled for minimap)
     slbmMissiles.forEach(missile => {
         if (!missile.impacted) {
-            if (!isSlbmVisibleToPlayer(missile, now)) return;
             const progress = Math.min(1, (now - missile.startTime) / missile.flightTime);
             if (progress >= 1) return;
             const dx = missile.targetX - missile.fromX;
@@ -5217,7 +5356,9 @@ function renderMinimap() {
             const mw = 2; // missile width on minimap
             const mLen = 8; // missile full length on minimap
             
-            if (progress < 0.333) {
+            const pieceLen = mLen / 3;
+
+            if (progress < SLBM_STAGE_ONE_PROGRESS) {
                 // Phase 1: Single body
                 minimapCtx.save();
                 minimapCtx.translate(currentX, currentY);
@@ -5225,10 +5366,9 @@ function renderMinimap() {
                 minimapCtx.fillStyle = '#111';
                 minimapCtx.fillRect(-mw / 2, -mLen / 2, mw, mLen);
                 minimapCtx.restore();
-            } else if (progress < 0.666) {
+            } else if (progress < SLBM_STAGE_TWO_PROGRESS) {
                 // Phase 2: Main body + 1 separated piece
-                const sp = (progress - 0.333) / 0.333;
-                const pieceLen = mLen / 3;
+                const sp = (progress - SLBM_STAGE_ONE_PROGRESS) / (SLBM_STAGE_TWO_PROGRESS - SLBM_STAGE_ONE_PROGRESS);
                 
                 // Main body
                 minimapCtx.save();
@@ -5239,18 +5379,17 @@ function renderMinimap() {
                 minimapCtx.restore();
                 
                 // Separated piece
-                const s1x = currentX - Math.cos(angle) * pieceLen * 1.5 * scaleX + Math.sin(angle) * 3 * sp;
-                const s1y = currentY - Math.sin(angle) * pieceLen * 1.5 * scaleY - Math.cos(angle) * 3 * sp;
+                const s1x = currentX - Math.cos(angle) * pieceLen * (2 + 1.5 * sp) + Math.sin(angle) * 4 * sp;
+                const s1y = currentY - Math.sin(angle) * pieceLen * (2 + 1.5 * sp) - Math.cos(angle) * 4 * sp;
                 minimapCtx.save();
                 minimapCtx.translate(s1x, s1y);
                 minimapCtx.rotate(angle + Math.PI / 2 + sp * 0.3);
                 minimapCtx.fillStyle = '#555';
                 minimapCtx.fillRect(-mw / 2, -pieceLen / 2, mw, pieceLen);
                 minimapCtx.restore();
-            } else {
-                // Phase 3: Warhead + 2 separated pieces
-                const sp = (progress - 0.666) / 0.334;
-                const pieceLen = mLen / 3;
+            } else if (progress < SLBM_STAGE_THREE_PROGRESS) {
+                // Phase 3: Warhead + 1 separated piece
+                const sp = (progress - SLBM_STAGE_TWO_PROGRESS) / (SLBM_STAGE_THREE_PROGRESS - SLBM_STAGE_TWO_PROGRESS);
                 
                 // Main warhead
                 minimapCtx.save();
@@ -5260,28 +5399,24 @@ function renderMinimap() {
                 minimapCtx.fillRect(-mw / 2, -pieceLen / 2, mw, pieceLen);
                 minimapCtx.restore();
                 
-                // 1st separated piece
-                const s1x = currentX - Math.cos(angle) * pieceLen * 2.5 + Math.sin(angle) * 5 * Math.min(sp + 0.5, 1);
-                const s1y = currentY - Math.sin(angle) * pieceLen * 2.5 - Math.cos(angle) * 5 * Math.min(sp + 0.5, 1);
+                // Separated piece
+                const s1x = currentX - Math.cos(angle) * pieceLen * (1.8 + 1.6 * sp) - Math.sin(angle) * 3 * sp;
+                const s1y = currentY - Math.sin(angle) * pieceLen * (1.8 + 1.6 * sp) + Math.cos(angle) * 3 * sp;
                 minimapCtx.save();
                 minimapCtx.translate(s1x, s1y);
-                minimapCtx.rotate(angle + Math.PI / 2 + 0.5);
-                minimapCtx.globalAlpha = Math.max(0, 1 - sp * 0.7);
+                minimapCtx.rotate(angle + Math.PI / 2 - sp * 0.35);
+                minimapCtx.globalAlpha = Math.max(0.25, 1 - sp * 0.6);
                 minimapCtx.fillStyle = '#666';
                 minimapCtx.fillRect(-mw / 2, -pieceLen / 2, mw, pieceLen);
                 minimapCtx.globalAlpha = 1;
                 minimapCtx.restore();
-                
-                // 2nd separated piece
-                const s2x = currentX - Math.cos(angle) * pieceLen * 1.5 - Math.sin(angle) * 4 * sp;
-                const s2y = currentY - Math.sin(angle) * pieceLen * 1.5 + Math.cos(angle) * 4 * sp;
+            } else {
+                // Phase 4: Terminal warhead only
                 minimapCtx.save();
-                minimapCtx.translate(s2x, s2y);
-                minimapCtx.rotate(angle + Math.PI / 2 - sp * 0.4);
-                minimapCtx.globalAlpha = Math.max(0, 1 - sp * 0.5);
-                minimapCtx.fillStyle = '#666';
+                minimapCtx.translate(currentX, currentY);
+                minimapCtx.rotate(angle + Math.PI / 2);
+                minimapCtx.fillStyle = '#111';
                 minimapCtx.fillRect(-mw / 2, -pieceLen / 2, mw, pieceLen);
-                minimapCtx.globalAlpha = 1;
                 minimapCtx.restore();
             }
             
@@ -6931,8 +7066,6 @@ function updateFogOfWar(force = false) {
     const slbmGridRadius = Math.ceil(SLBM_OWNER_VISION_RADIUS / cellSize);
     const slbmOffsets = getFogCircleOffsets(slbmGridRadius);
     slbmMissiles.forEach(missile => {
-        if (missile.userId !== gameState.userId) return;
-
         let visionX = null;
         let visionY = null;
         if (!missile.impacted) {

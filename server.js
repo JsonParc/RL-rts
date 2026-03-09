@@ -91,7 +91,7 @@ const ADVANCED_BUILDING_COMBAT_POWER = 150;
 const GENERAL_BUILDING_TYPES = new Set(['headquarters', 'power_plant', 'shipyard']);
 const ADVANCED_BUILDING_TYPES = new Set(['defense_tower', 'naval_academy', 'missile_silo', 'carbase', 'research_lab']);
 const BATTLESHIP_AEGIS_TURRET_COUNT = 3;
-const BATTLESHIP_AEGIS_DAMAGE = 5;
+const BATTLESHIP_AEGIS_DAMAGE = 7;
 const BATTLESHIP_AEGIS_RANGE_MULTIPLIER = 1.5;
 const BATTLESHIP_AEGIS_TAKEN_DAMAGE_MULTIPLIER = 1.40;
 const BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS = 480;
@@ -129,6 +129,9 @@ const FRIGATE_ENGINE_OVERDRIVE_SPEED_MULTIPLIER = 1.10;
 const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
 const FRIGATE_ENGINE_OVERDRIVE_TICK_MS = 1000;
 const NAVAL_COLLISION_WAKE_MS = 700;
+const NAVAL_COLLISION_CLEARANCE_BUFFER = 18;
+const NAVAL_REPATH_NO_PROGRESS_TICKS = 6;
+const NAVAL_REPATH_COOLDOWN_MS = 300;
 const THREAT_SCAN_EXCLUDED_AIR_TYPES = new Set(['aircraft']);
 const ENABLE_SERVER_FOG_SNAPSHOTS = false;
 const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
@@ -278,6 +281,35 @@ function doSelectionEllipsesOverlap(unitA, ax, ay, unitB, bx, by) {
     -dy,
     eB.semiMajor + eA.semiMajor,
     eB.semiMinor + eA.semiMinor,
+    eB.angle
+  );
+  return Math.min(valA, valB) < 1.0;
+}
+
+function doSelectionEllipsesOverlapWithPadding(unitA, ax, ay, unitB, bx, by, extraPadding = 0) {
+  if (!unitA || !unitB || unitA.id === unitB.id) return false;
+  const padding = Math.max(0, extraPadding);
+  const eA = getSelectionEllipseForUnit(unitA);
+  const eB = getSelectionEllipseForUnit(unitB);
+  const dx = bx - ax;
+  const dy = by - ay;
+  const maxRadA = Math.max(eA.semiMajor, eA.semiMinor) + padding;
+  const maxRadB = Math.max(eB.semiMajor, eB.semiMinor) + padding;
+  const distSq = (dx * dx) + (dy * dy);
+  if (distSq > (maxRadA + maxRadB) * (maxRadA + maxRadB)) return false;
+
+  const valA = pointInRotatedEllipse(
+    dx,
+    dy,
+    (eA.semiMajor + padding) + (eB.semiMajor + padding),
+    (eA.semiMinor + padding) + (eB.semiMinor + padding),
+    eA.angle
+  );
+  const valB = pointInRotatedEllipse(
+    -dx,
+    -dy,
+    (eB.semiMajor + padding) + (eA.semiMajor + padding),
+    (eB.semiMinor + padding) + (eA.semiMinor + padding),
     eB.angle
   );
   return Math.min(valA, valB) < 1.0;
@@ -683,7 +715,19 @@ function refreshFrigateEngineOverdrive(unit) {
 }
 
 function getBattleshipAegisTurretCooldownMs(unit) {
-  return BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS;
+  const baseAttackCooldown = Math.max(1, getUnitBaseAttackCooldown(unit));
+  const currentAttackCooldown = Math.max(
+    BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS,
+    Number.isFinite(unit?.attackCooldownMs) ? unit.attackCooldownMs : baseAttackCooldown
+  );
+  const minTurretCooldown = Math.max(
+    1,
+    Math.round(BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS * (BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS / baseAttackCooldown))
+  );
+  return Math.max(
+    minTurretCooldown,
+    Math.round(BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS * (currentAttackCooldown / baseAttackCooldown))
+  );
 }
 
 function applyBattleshipCombatStanceAttackCost(unit, now = Date.now()) {
@@ -717,6 +761,8 @@ function initializeUnitRuntimeState(unit) {
   if (usesNavalContactCollision(unit)) {
     unit.navalAvoidanceSideBias = unit.navalAvoidanceSideBias === -1 ? -1 : (unit.navalAvoidanceSideBias === 1 ? 1 : null);
     unit.navalBlockedTicks = Math.max(0, Math.floor(unit.navalBlockedTicks || 0));
+    unit.navalNoProgressTicks = Math.max(0, Math.floor(unit.navalNoProgressTicks || 0));
+    unit.navalLastRepathAt = Number.isFinite(unit.navalLastRepathAt) ? unit.navalLastRepathAt : 0;
   }
   if (unit.type === 'battleship') {
     unit.combatStanceActive = !!unit.combatStanceActive;
@@ -2190,7 +2236,8 @@ function collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialM
     if (!other || other.id === unit.id || !gameState.units.has(other.id)) return;
     if (ignoredIds && ignoredIds.has(other.id)) return;
     if (!usesNavalContactCollision(other)) return;
-    if (doSelectionEllipsesOverlap(unit, candidateX, candidateY, other, other.x, other.y)) {
+    const clearancePadding = getNavalBlockerClearancePadding(unit, other, candidateX, candidateY);
+    if (doSelectionEllipsesOverlapWithPadding(unit, candidateX, candidateY, other, other.x, other.y, clearancePadding)) {
       blockers.push(other);
     }
   }, COLLISION_SPATIAL_CELL_SIZE);
@@ -2209,6 +2256,84 @@ function isNavalUnitStationary(unit) {
     && unit.targetX === null
     && unit.targetY === null
     && (!Array.isArray(unit.pathWaypoints) || unit.pathWaypoints.length === 0);
+}
+
+function getNavalMovementIntent(unit, overrideTargetX = null, overrideTargetY = null) {
+  if (!usesNavalContactCollision(unit)) return null;
+  const targetX = Number.isFinite(overrideTargetX) ? overrideTargetX : unit?.targetX;
+  const targetY = Number.isFinite(overrideTargetY) ? overrideTargetY : unit?.targetY;
+  if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) return null;
+  const dx = targetX - unit.x;
+  const dy = targetY - unit.y;
+  const length = Math.hypot(dx, dy);
+  if (length <= 0.01) return null;
+  return { x: dx / length, y: dy / length };
+}
+
+function getNavalBlockerClearancePadding(unit, other, candidateX, candidateY) {
+  if (isNavalUnitStationary(other)) {
+    return Math.max(8, NAVAL_COLLISION_CLEARANCE_BUFFER * 0.5);
+  }
+  if (unit?.userId != null && unit.userId === other?.userId) {
+    const unitIntent = getNavalMovementIntent(unit, candidateX, candidateY);
+    const otherIntent = getNavalMovementIntent(other);
+    if (unitIntent && otherIntent) {
+      const dot = (unitIntent.x * otherIntent.x) + (unitIntent.y * otherIntent.y);
+      if (dot > 0.65) {
+        return Math.max(6, NAVAL_COLLISION_CLEARANCE_BUFFER * 0.35);
+      }
+    }
+  }
+  return NAVAL_COLLISION_CLEARANCE_BUFFER;
+}
+
+function getNavalRightOfWayFootprint(unit) {
+  const ellipse = getSelectionEllipseForUnit(unit);
+  return ellipse.semiMajor * ellipse.semiMinor;
+}
+
+function getNavalRightOfWayTieBreaker(unit) {
+  const numericId = Number(unit?.id);
+  if (Number.isFinite(numericId)) return numericId;
+  const text = String(unit?.id ?? '');
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash * 31) + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function compareNavalRightOfWay(a, b) {
+  if (!a || !b || a.id === b.id) return 0;
+
+  const aStationary = isNavalUnitStationary(a);
+  const bStationary = isNavalUnitStationary(b);
+  if (aStationary !== bStationary) {
+    return aStationary ? 1 : -1;
+  }
+
+  const aFootprint = getNavalRightOfWayFootprint(a);
+  const bFootprint = getNavalRightOfWayFootprint(b);
+  if (Math.abs(aFootprint - bFootprint) > 12) {
+    return aFootprint > bFootprint ? 1 : -1;
+  }
+
+  const aDistanceToGoal = (Number.isFinite(a.targetX) && Number.isFinite(a.targetY))
+    ? Math.hypot(a.targetX - a.x, a.targetY - a.y)
+    : 0;
+  const bDistanceToGoal = (Number.isFinite(b.targetX) && Number.isFinite(b.targetY))
+    ? Math.hypot(b.targetX - b.x, b.targetY - b.y)
+    : 0;
+  if (Math.abs(aDistanceToGoal - bDistanceToGoal) > 80) {
+    return aDistanceToGoal < bDistanceToGoal ? 1 : -1;
+  }
+
+  const aTieBreaker = getNavalRightOfWayTieBreaker(a);
+  const bTieBreaker = getNavalRightOfWayTieBreaker(b);
+  if (aTieBreaker !== bTieBreaker) {
+    return aTieBreaker < bTieBreaker ? 1 : -1;
+  }
+  return 0;
 }
 
 function tryDisplaceStationaryNavalBlocker(movingUnit, blocker, desiredX, desiredY, navalSpatialMap) {
@@ -2339,33 +2464,60 @@ function findNavalSteeringMovePosition(unit, desiredX, desiredY, navalSpatialMap
 
   const preferredSide = getNavalAvoidanceSidePreference(unit, desiredX, desiredY, blockers);
   const blockedTicks = Math.max(0, Math.floor(unit?.navalBlockedTicks || 0));
-  const extraTurn = Math.min(0.35, blockedTicks * 0.03);
+  const extraTurn = Math.min(0.6, blockedTicks * 0.05);
   const hasMovingBlocker = Array.isArray(blockers) && blockers.some(blocker => !isNavalUnitStationary(blocker));
+  const heavilyBlocked = blockedTicks > 12;
   const turnAngles = hasMovingBlocker
-    ? [
-      0.45 + extraTurn,
-      -(0.45 + extraTurn),
-      0.85 + extraTurn,
-      -(0.85 + extraTurn),
-      1.2 + extraTurn,
-      -(1.2 + extraTurn),
-      0,
-      1.45,
-      -1.45
-    ]
-    : [
-      0,
-      0.3 + extraTurn,
-      -(0.3 + extraTurn),
-      0.65 + extraTurn,
-      -(0.65 + extraTurn),
-      1.0 + extraTurn,
-      -(1.0 + extraTurn)
-    ];
+    ? heavilyBlocked
+      ? [
+        0.8 + extraTurn,
+        -(0.8 + extraTurn),
+        1.2 + extraTurn,
+        -(1.2 + extraTurn),
+        1.6 + extraTurn,
+        -(1.6 + extraTurn),
+        2.0,
+        -2.0,
+        Math.PI * 0.8,
+        -Math.PI * 0.8,
+        0
+      ]
+      : [
+        0.45 + extraTurn,
+        -(0.45 + extraTurn),
+        0.85 + extraTurn,
+        -(0.85 + extraTurn),
+        1.2 + extraTurn,
+        -(1.2 + extraTurn),
+        0,
+        1.6,
+        -1.6
+      ]
+    : heavilyBlocked
+      ? [
+        0,
+        0.5 + extraTurn,
+        -(0.5 + extraTurn),
+        1.0 + extraTurn,
+        -(1.0 + extraTurn),
+        1.5 + extraTurn,
+        -(1.5 + extraTurn),
+        2.0,
+        -2.0
+      ]
+      : [
+        0,
+        0.3 + extraTurn,
+        -(0.3 + extraTurn),
+        0.65 + extraTurn,
+        -(0.65 + extraTurn),
+        1.0 + extraTurn,
+        -(1.0 + extraTurn)
+      ];
   const orderedTurnAngles = turnAngles.map(angle => angle * preferredSide);
   const distanceFractions = hasMovingBlocker
-    ? [1, 0.88, 0.72, 0.58, 0.42]
-    : [1, 0.9, 0.75, 0.6, 0.45];
+    ? heavilyBlocked ? [1, 0.75, 0.55, 0.38, 0.22] : [1, 0.88, 0.72, 0.58, 0.42]
+    : heavilyBlocked ? [1, 0.8, 0.6, 0.4, 0.25] : [1, 0.9, 0.75, 0.6, 0.45];
   const baseAngle = Math.atan2(moveDy, moveDx);
 
   for (let d = 0; d < distanceFractions.length; d++) {
@@ -2403,10 +2555,29 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
     return { x: desiredX, y: desiredY };
   }
 
+  // When heavily blocked by moving units with higher priority, yield (stay put)
+  const currentBlockedTicks = Math.max(0, unit.navalBlockedTicks || 0);
+  if (currentBlockedTicks > 15) {
+    const hasHigherPriorityMovingBlocker = blockers.some(blocker => {
+      if (isNavalUnitStationary(blocker)) return false;
+      return compareNavalRightOfWay(blocker, unit) > 0;
+    });
+    if (hasHigherPriorityMovingBlocker) {
+      // Yield: stay put and let the higher-priority unit pass
+      unit.navalBlockedTicks = Math.min(30, currentBlockedTicks + 2);
+      return { x: unit.x, y: unit.y };
+    }
+  }
+
   const steeringCandidate = findNavalSteeringMovePosition(unit, desiredX, desiredY, navalSpatialMap, blockers);
   if (steeringCandidate) {
     unit.navalBlockedTicks = Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 1);
     return steeringCandidate;
+  }
+
+  // When very heavily blocked and steering failed, try immediate repath
+  if (currentBlockedTicks > 20) {
+    unit.navalNoProgressTicks = Math.max(unit.navalNoProgressTicks || 0, NAVAL_REPATH_NO_PROGRESS_TICKS);
   }
 
   let bestX = unit.x;
@@ -2430,10 +2601,53 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
     }
   }
   const movedDistSq = ((bestX - unit.x) * (bestX - unit.x)) + ((bestY - unit.y) * (bestY - unit.y));
-  unit.navalBlockedTicks = movedDistSq > 0.25
-    ? Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 1)
-    : Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 2);
+  // If binary search found almost no movement, don't jitter - just stay put
+  if (movedDistSq < 1.0) {
+    unit.navalBlockedTicks = Math.min(30, currentBlockedTicks + 2);
+    return { x: unit.x, y: unit.y };
+  }
+  unit.navalBlockedTicks = Math.min(30, currentBlockedTicks + 1);
   return { x: bestX, y: bestY };
+}
+
+function getUnitFinalMoveTarget(unit) {
+  if (!unit) return null;
+  if (Array.isArray(unit.pathWaypoints) && unit.pathWaypoints.length > 0) {
+    return unit.pathWaypoints[unit.pathWaypoints.length - 1];
+  }
+  if (Number.isFinite(unit.targetX) && Number.isFinite(unit.targetY)) {
+    return { x: unit.targetX, y: unit.targetY };
+  }
+  return null;
+}
+
+function tryRefreshNavalRoute(unit, now) {
+  if (!usesNavalContactCollision(unit)) return false;
+  if (!Number.isFinite(now)) return false;
+  if ((unit.navalNoProgressTicks || 0) < NAVAL_REPATH_NO_PROGRESS_TICKS) return false;
+  if ((now - (unit.navalLastRepathAt || 0)) < NAVAL_REPATH_COOLDOWN_MS) return false;
+
+  const finalTarget = getUnitFinalMoveTarget(unit);
+  if (!finalTarget) return false;
+
+  const moveTarget = findNearestNavalPassableWaterPosition(unit, finalTarget.x, finalTarget.y, 360) || finalTarget;
+  const repath = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, unit.type);
+  unit.navalLastRepathAt = now;
+
+  if (repath && repath.length > 1) {
+    unit.pathWaypoints = repath.slice(1);
+    const next = unit.pathWaypoints.shift();
+    unit.targetX = next.x;
+    unit.targetY = next.y;
+    if (unit.pathWaypoints.length === 0) unit.pathWaypoints = null;
+    unit.navalNoProgressTicks = 0;
+    unit.navalBlockedTicks = 0;
+    return true;
+  }
+
+  unit.navalAvoidanceSideBias = unit.navalAvoidanceSideBias === 1 ? -1 : 1;
+  unit.navalBlockedTicks = Math.max(0, (unit.navalBlockedTicks || 0) - 5);
+  return false;
 }
 
 function getRoomHumanCount(roomId) {
@@ -3054,6 +3268,95 @@ function findNearestWaterPosition(x, y, maxSearchRadius = 220) {
   return null;
 }
 
+function getNavalTerrainClearanceCells(unitOrType) {
+  const type = typeof unitOrType === 'string' ? unitOrType : unitOrType?.type;
+  if (type === 'battleship' || type === 'carrier' || type === 'assaultship' || type === 'cruiser') {
+    return 1;
+  }
+  return 0;
+}
+
+function isNavalPositionTerrainPassable(unitOrType, x, y) {
+  const type = typeof unitOrType === 'string' ? unitOrType : unitOrType?.type;
+  if (!isNavalUnitType(type)) {
+    return !isOnLand(x, y);
+  }
+  const map = gameState.map;
+  if (!map || !map.landCellSet) return !isOnLand(x, y);
+
+  const gridSize = map.gridSize;
+  const cellSize = map.cellSize;
+  const centerGX = Math.floor(x / cellSize);
+  const centerGY = Math.floor(y / cellSize);
+  const clearanceCells = getNavalTerrainClearanceCells(type);
+
+  if (centerGX < 0 || centerGX >= gridSize || centerGY < 0 || centerGY >= gridSize) {
+    return false;
+  }
+
+  for (let gy = centerGY - clearanceCells; gy <= centerGY + clearanceCells; gy++) {
+    for (let gx = centerGX - clearanceCells; gx <= centerGX + clearanceCells; gx++) {
+      if (gx < 0 || gx >= gridSize || gy < 0 || gy >= gridSize) {
+        return false;
+      }
+      if (map.landCellSet.has((gy * gridSize) + gx)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function findNearestNavalPassableWaterPosition(unitOrType, x, y, maxSearchRadius = 220) {
+  const map = gameState.map;
+  if (!map) return null;
+
+  const clamped = clampToMapBounds(x, y);
+  if (isNavalPositionTerrainPassable(unitOrType, clamped.x, clamped.y)) {
+    return clamped;
+  }
+
+  const gridSize = map.gridSize;
+  const cellSize = map.cellSize;
+  const centerGridX = Math.max(0, Math.min(gridSize - 1, Math.floor(clamped.x / cellSize)));
+  const centerGridY = Math.max(0, Math.min(gridSize - 1, Math.floor(clamped.y / cellSize)));
+  const maxCellRadius = Math.max(1, Math.ceil(maxSearchRadius / cellSize));
+
+  for (let radius = 1; radius <= maxCellRadius; radius++) {
+    const minY = Math.max(0, centerGridY - radius);
+    const maxY = Math.min(gridSize - 1, centerGridY + radius);
+    const minX = Math.max(0, centerGridX - radius);
+    const maxX = Math.min(gridSize - 1, centerGridX + radius);
+    let bestCandidate = null;
+    let bestDistanceSq = Infinity;
+
+    for (let gridY = minY; gridY <= maxY; gridY++) {
+      for (let gridX = minX; gridX <= maxX; gridX++) {
+        const isEdge = gridY === minY || gridY === maxY || gridX === minX || gridX === maxX;
+        if (!isEdge) continue;
+
+        const candidate = getCellCenter(gridX, gridY);
+        if (!candidate) continue;
+        if (!isNavalPositionTerrainPassable(unitOrType, candidate.x, candidate.y)) continue;
+
+        const dx = candidate.x - clamped.x;
+        const dy = candidate.y - clamped.y;
+        const distanceSq = (dx * dx) + (dy * dy);
+        if (distanceSq < bestDistanceSq) {
+          bestDistanceSq = distanceSq;
+          bestCandidate = candidate;
+        }
+      }
+    }
+
+    if (bestCandidate) {
+      return bestCandidate;
+    }
+  }
+
+  return findNearestWaterPosition(clamped.x, clamped.y, maxSearchRadius);
+}
+
 function assignMoveTarget(unit, targetX, targetY) {
   if (!unit) return false;
   const clampedTarget = clampToMapBounds(targetX, targetY);
@@ -3101,9 +3404,10 @@ function assignMoveTarget(unit, targetX, targetY) {
   }
 
   // Ships can only move on water.
+  resetNavalAvoidanceState(unit);
   let moveTarget = clampedTarget;
-  if (isOnLand(clampedTarget.x, clampedTarget.y)) {
-    const nearestWater = findNearestWaterPosition(clampedTarget.x, clampedTarget.y);
+  if (!isNavalPositionTerrainPassable(unit, clampedTarget.x, clampedTarget.y)) {
+    const nearestWater = findNearestNavalPassableWaterPosition(unit, clampedTarget.x, clampedTarget.y, 320);
     if (!nearestWater) {
       return false;
     }
@@ -3111,7 +3415,7 @@ function assignMoveTarget(unit, targetX, targetY) {
   }
 
   // Use A* pathfinding for ships to navigate around islands
-  const path = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, 'ship');
+  const path = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, unit.type);
   if (path && path.length > 1) {
     unit.pathWaypoints = path.slice(1);
     const next = unit.pathWaypoints.shift();
@@ -3152,9 +3456,9 @@ function normalizeFormationTargetForUnit(unit, x, y) {
       ? clamped
       : findNearestLandPosition(clamped.x, clamped.y);
   }
-  return !isOnLand(clamped.x, clamped.y)
+  return isNavalPositionTerrainPassable(unit, clamped.x, clamped.y)
     ? clamped
-    : findNearestWaterPosition(clamped.x, clamped.y, 12);
+    : findNearestNavalPassableWaterPosition(unit, clamped.x, clamped.y, 160);
 }
 
 function isFormationTargetReserved(candidate, keepOutRadius, reservedTargets) {
@@ -3215,6 +3519,7 @@ function resetNavalAvoidanceState(unit) {
   if (!usesNavalContactCollision(unit)) return;
   unit.navalAvoidanceSideBias = null;
   unit.navalBlockedTicks = 0;
+  unit.navalNoProgressTicks = 0;
 }
 
 function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
@@ -3335,6 +3640,10 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
   const cellSize = map.cellSize;
   const STEP = 2; // Finer grid for more accurate pathing
   const pathGridSize = Math.ceil(gridSize / STEP);
+  const isWorkerPath = unitKind === 'worker';
+  const isLandPath = unitKind === 'land';
+  const isNavalPath = !isWorkerPath && !isLandPath && (unitKind === 'ship' || isNavalUnitType(unitKind));
+  const navalClearanceCells = isNavalPath ? getNavalTerrainClearanceCells(unitKind === 'ship' ? null : unitKind) : 0;
 
   const startGX = Math.floor(fromX / cellSize / STEP);
   const startGY = Math.floor(fromY / cellSize / STEP);
@@ -3347,18 +3656,19 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
   const egx = clamp(endGX, pathGridSize);
   const egy = clamp(endGY, pathGridSize);
 
-  if (sgx === egx && sgy === egy) return null;
-
   // Check if a coarse cell is passable by checking ALL terrain cells in it.
   // Ships require water, land vehicles require land, workers go anywhere.
   function isPassable(gx, gy) {
-    if (unitKind === 'worker') return true;
-    const requireLand = unitKind === 'land';
-    for (let dy = 0; dy < STEP; dy++) {
-      for (let dx = 0; dx < STEP; dx++) {
+    if (isWorkerPath) return true;
+    const requireLand = isLandPath;
+    const minOffset = requireLand ? 0 : -navalClearanceCells;
+    const maxOffset = requireLand ? (STEP - 1) : (STEP - 1 + navalClearanceCells);
+    for (let dy = minOffset; dy <= maxOffset; dy++) {
+      for (let dx = minOffset; dx <= maxOffset; dx++) {
         const cx = gx * STEP + dx;
         const cy = gy * STEP + dy;
         if (cx >= gridSize || cy >= gridSize) return false;
+        if (cx < 0 || cy < 0) return false;
         const isLandCell = map.landCellSet.has(cy * gridSize + cx);
         if (requireLand ? !isLandCell : isLandCell) return false;
       }
@@ -3386,6 +3696,8 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
     }
     if (!found) return null; // no reachable destination
   }
+
+  if (sgx === destGX && sgy === destGY) return null;
 
   // A* with binary heap for performance
   const keyOf = (x, y) => y * pathGridSize + x;
@@ -4047,7 +4359,7 @@ function spawnAdminBase(userId) {
   });
 
   // Spawn one of each unit type near water
-  const waterPos = findNearestWaterPosition(baseX, baseY, 2000);
+  const waterPos = findNearestNavalPassableWaterPosition('battleship', baseX, baseY, 2000);
   const spawnX = waterPos ? waterPos.x : baseX;
   const spawnY = waterPos ? waterPos.y : baseY;
 
@@ -5110,8 +5422,8 @@ function loadPlayerData(userId) {
       }
 
       // Ships should always be on water.
-      if (isNavalUnitType(unit.type) && isOnLand(unitX, unitY)) {
-        const waterPos = findNearestWaterPosition(unitX, unitY);
+      if (isNavalUnitType(unit.type) && !isNavalPositionTerrainPassable(unit.type, unitX, unitY)) {
+        const waterPos = findNearestNavalPassableWaterPosition(unit.type, unitX, unitY, 360);
         if (waterPos) {
           unitX = waterPos.x;
           unitY = waterPos.y;
@@ -5614,8 +5926,8 @@ function updateGame(deltaTime) {
     initializeUnitRuntimeState(unit);
     const prevNavalX = unit.x;
     const prevNavalY = unit.y;
-    if (isNavalUnitType(unit.type) && isOnLand(unit.x, unit.y)) {
-      const waterPos = findNearestWaterPosition(unit.x, unit.y);
+    if (isNavalUnitType(unit.type) && !isNavalPositionTerrainPassable(unit, unit.x, unit.y)) {
+      const waterPos = findNearestNavalPassableWaterPosition(unit, unit.x, unit.y, 360);
       if (waterPos) {
         unit.x = waterPos.x;
         unit.y = waterPos.y;
@@ -5707,7 +6019,16 @@ function updateGame(deltaTime) {
       
       if (distance > 5) {
         unit.angle = Math.atan2(dy, dx);
-        const moveStep = Math.min(distance, unit.speed * deltaTime * 60);
+        let moveStep = Math.min(distance, unit.speed * deltaTime * 60);
+        // Slow down when heavily blocked to reduce collision oscillation
+        if (usesNavalContactCollision(unit)) {
+          const blockedTicks = unit.navalBlockedTicks || 0;
+          if (blockedTicks > 20) {
+            moveStep *= 0.3;
+          } else if (blockedTicks > 12) {
+            moveStep *= 0.6;
+          }
+        }
         const nextX = unit.x + ((dx / distance) * moveStep);
         const nextY = unit.y + ((dy / distance) * moveStep);
         const clampedNext = clampToMapBounds(nextX, nextY);
@@ -5762,15 +6083,15 @@ function updateGame(deltaTime) {
           }
         } else {
           // Ships are restricted to water cells.
-          if (!isOnLand(clampedNext.x, clampedNext.y)) {
+          if (isNavalPositionTerrainPassable(unit, clampedNext.x, clampedNext.y)) {
             const safeNavalPos = getSafeNavalMovePosition(unit, clampedNext.x, clampedNext.y, navalMovementSpatialIndex);
             unit.x = safeNavalPos.x;
             unit.y = safeNavalPos.y;
           } else {
             const slideX = clampToMapBounds(clampedNext.x, unit.y);
             const slideY = clampToMapBounds(unit.x, clampedNext.y);
-            const canSlideX = !isOnLand(slideX.x, slideX.y);
-            const canSlideY = !isOnLand(slideY.x, slideY.y);
+            const canSlideX = isNavalPositionTerrainPassable(unit, slideX.x, slideX.y);
+            const canSlideY = isNavalPositionTerrainPassable(unit, slideY.x, slideY.y);
 
             if (canSlideX && canSlideY) {
               const targetDx = unit.targetX - unit.x;
@@ -5797,8 +6118,8 @@ function updateGame(deltaTime) {
               const finalTarget = (unit.pathWaypoints && unit.pathWaypoints.length > 0)
                 ? unit.pathWaypoints[unit.pathWaypoints.length - 1]
                 : { x: unit.targetX, y: unit.targetY };
-              
-              const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, 'ship');
+               
+              const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, unit.type);
               if (repath && repath.length > 1) {
                 unit.pathWaypoints = repath.slice(1);
                 const next = unit.pathWaypoints.shift();
@@ -5815,6 +6136,15 @@ function updateGame(deltaTime) {
           }
         }
         if (usesNavalContactCollision(unit)) {
+          const movedDistSq = ((unit.x - moveStartX) * (unit.x - moveStartX)) + ((unit.y - moveStartY) * (unit.y - moveStartY));
+          if (unit.targetX !== null && unit.targetY !== null) {
+            unit.navalNoProgressTicks = movedDistSq > 1
+              ? 0
+              : Math.min(60, Math.max(0, unit.navalNoProgressTicks || 0) + 1);
+            tryRefreshNavalRoute(unit, now);
+          } else {
+            unit.navalNoProgressTicks = 0;
+          }
           updateEntitySpatialMapPosition(
             navalMovementSpatialIndex,
             unit,
@@ -5827,8 +6157,7 @@ function updateGame(deltaTime) {
           if (
             unit.targetX !== null ||
             unit.targetY !== null ||
-            Math.abs(unit.x - moveStartX) > 0.01 ||
-            Math.abs(unit.y - moveStartY) > 0.01
+            movedDistSq > 0.0001
           ) {
             unit.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
           }
@@ -5838,7 +6167,7 @@ function updateGame(deltaTime) {
         const moveStartX = unit.x;
         const moveStartY = unit.y;
         // For ships, snap to target only if it's on water
-        if ((isNavalUnitType(unit.type) && isOnLand(unit.targetX, unit.targetY))
+        if ((isNavalUnitType(unit.type) && !isNavalPositionTerrainPassable(unit, unit.targetX, unit.targetY))
           || (isLandCombatUnitType(unit.type) && !isOnLand(unit.targetX, unit.targetY))) {
           // Don't move to a land waypoint, skip it
         } else {
@@ -5852,13 +6181,13 @@ function updateGame(deltaTime) {
         if (unit.pathWaypoints && unit.pathWaypoints.length > 0) {
           const next = unit.pathWaypoints.shift();
           // For ships, skip land waypoints
-          if ((isNavalUnitType(unit.type) && isOnLand(next.x, next.y))
+          if ((isNavalUnitType(unit.type) && !isNavalPositionTerrainPassable(unit, next.x, next.y))
             || (isLandCombatUnitType(unit.type) && !isOnLand(next.x, next.y))) {
             // Re-route to final destination
             const finalTarget = (unit.pathWaypoints.length > 0)
               ? unit.pathWaypoints[unit.pathWaypoints.length - 1]
               : next;
-            const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, isLandCombatUnitType(unit.type) ? 'land' : 'ship');
+            const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, isLandCombatUnitType(unit.type) ? 'land' : unit.type);
             if (repath && repath.length > 1) {
               unit.pathWaypoints = repath.slice(1);
               const wp = unit.pathWaypoints.shift();
@@ -5881,6 +6210,7 @@ function updateGame(deltaTime) {
         if (usesNavalContactCollision(unit) && unit.targetX === null && unit.targetY === null && !unit.pathWaypoints) {
           unit.navalAvoidanceSideBias = null;
           unit.navalBlockedTicks = 0;
+          unit.navalNoProgressTicks = 0;
         }
         if (usesNavalContactCollision(unit)) {
           updateEntitySpatialMapPosition(
@@ -6793,14 +7123,32 @@ function updateGame(deltaTime) {
             const dist = Math.sqrt(distSq);
             const nx = dx / dist;
             const ny = dy / dist;
-            const pushForce = Math.min(1.2, Math.max(0.05, (1.0 - overlapVal) * Math.max(eA.semiMinor + eB.semiMinor, 8) * 0.2));
+            const pushForce = Math.min(2.5, Math.max(0.1, (1.0 - overlapVal) * Math.max(eA.semiMinor + eB.semiMinor, 8) * 0.35));
             const pushX = nx * pushForce;
             const pushY = ny * pushForce;
+            const rightOfWay = compareNavalRightOfWay(a, b);
+            let aPushFactor = 1;
+            let bPushFactor = 1;
+            if (rightOfWay > 0) {
+              aPushFactor = 0.35;
+              bPushFactor = 1.65;
+              if (Number.isFinite(b.targetX) && Number.isFinite(b.targetY)) {
+                b.navalAvoidanceSideBias = getNavalAvoidanceSidePreference(b, b.targetX, b.targetY, [a]);
+                b.navalBlockedTicks = Math.min(30, Math.max(0, b.navalBlockedTicks || 0) + 1);
+              }
+            } else if (rightOfWay < 0) {
+              aPushFactor = 1.65;
+              bPushFactor = 0.35;
+              if (Number.isFinite(a.targetX) && Number.isFinite(a.targetY)) {
+                a.navalAvoidanceSideBias = getNavalAvoidanceSidePreference(a, a.targetX, a.targetY, [b]);
+                a.navalBlockedTicks = Math.min(30, Math.max(0, a.navalBlockedTicks || 0) + 1);
+              }
+            }
 
-            a.x -= pushX;
-            a.y -= pushY;
-            b.x += pushX;
-            b.y += pushY;
+            a.x -= pushX * aPushFactor;
+            a.y -= pushY * aPushFactor;
+            b.x += pushX * bPushFactor;
+            b.y += pushY * bPushFactor;
             a.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
             b.collisionWakeUntil = now + NAVAL_COLLISION_WAKE_MS;
           }
