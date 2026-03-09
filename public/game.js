@@ -248,6 +248,7 @@ const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
 const SLBM_OWNER_VISION_RADIUS = 1200;
 const BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER = 1.10;
+const BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS = 150;
 const BATTLESHIP_AEGIS_RANGE_MULTIPLIER = 1.5;
 const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
 const UNIT_SELECTION_PRIORITY = Object.freeze({
@@ -2432,7 +2433,7 @@ function getHighestPrioritySelectedUnitType(units) {
 function getDisplayedUnitDamageValue(unit) {
     if (!unit) return 0;
     if (unit.type === 'carrier' || unit.type === 'assaultship') return 0;
-    if (unit.type === 'battleship' && unit.battleshipAegisMode) return 10;
+    if (unit.type === 'battleship' && unit.battleshipAegisMode) return 5;
     if (unit.type === 'cruiser' && unit.aegisMode) return 25;
     if (unit.type === 'cruiser' && unit.isIsolated) return (unit.damage || 0) * 2;
     if (unit.type === 'battleship' && unit.aimedShot) return (unit.damage || 0) * 2;
@@ -2444,8 +2445,27 @@ function getSelectedOwnedHighestPriorityUnitType() {
 }
 
 function getBattleshipCombatStanceSpeedMultiplier(unit) {
-    const stacks = Math.max(0, unit?.combatStanceStacks || 0);
-    return Math.pow(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER, stacks);
+    const cooldown = getBattleshipCombatStanceAttackCooldownMs(unit);
+    return BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS / cooldown;
+}
+
+function getBattleshipCombatStanceMaxStacks() {
+    if (BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS <= BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS) return 0;
+    const rawStacks = Math.log(BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS / BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS)
+        / Math.log(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER);
+    return Math.max(0, Math.ceil(rawStacks - 1e-9));
+}
+
+function getBattleshipCombatStanceEffectiveStacks(unit) {
+    return Math.min(getBattleshipCombatStanceMaxStacks(), Math.max(0, Math.floor(unit?.combatStanceStacks || 0)));
+}
+
+function getBattleshipCombatStanceAttackCooldownMs(unit) {
+    const stacks = getBattleshipCombatStanceEffectiveStacks(unit);
+    return Math.max(
+        BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS,
+        Math.round(BATTLESHIP_DEFAULT_ATTACK_COOLDOWN_MS / Math.pow(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER, stacks))
+    );
 }
 
 function showBattleshipCombatStanceSkill(units) {
@@ -2454,7 +2474,8 @@ function showBattleshipCombatStanceSkill(units) {
     const slot2 = document.getElementById('skillSlot2');
     slot2.style.display = 'flex';
     const activeCount = battleships.filter(unit => unit.combatStanceActive).length;
-    const maxStacks = battleships.reduce((max, unit) => Math.max(max, unit.combatStanceStacks || 0), 0);
+    const stanceMaxStacks = getBattleshipCombatStanceMaxStacks();
+    const maxStacks = battleships.reduce((max, unit) => Math.max(max, getBattleshipCombatStanceEffectiveStacks(unit)), 0);
     const maxSpeedMultiplier = battleships.reduce((max, unit) => Math.max(max, getBattleshipCombatStanceSpeedMultiplier(unit)), 1);
     document.getElementById('skillBtn2').textContent = activeCount > 0 ? '⚔️ 전투태세 (활성)' : '⚔️ 전투태세';
     document.getElementById('skillBtn2').className = battleships.length > 0
@@ -2463,12 +2484,12 @@ function showBattleshipCombatStanceSkill(units) {
     document.getElementById('skillDesc2').className = 'skill-desc';
     if (battleships.length === 1) {
         document.getElementById('skillDesc2').textContent = activeCount > 0
-            ? `현재 중첩 ${maxStacks} | 공속 x${maxSpeedMultiplier.toFixed(2)} | 공격마다 현재 체력 10% 소모 | 종료 시 현재 체력 10% 소모 후 원래 공속 복귀`
+            ? `현재 중첩 ${maxStacks}/${stanceMaxStacks} | 공속 x${maxSpeedMultiplier.toFixed(2)} | 공격마다 현재 체력 10% 소모 | 종료 시 현재 체력 10% 소모 후 원래 공속 복귀`
             : '활성 후 공격할 때마다 현재 체력 10% 소모, 공속 10%씩 누적 증가. 종료 시 현재 체력 10% 소모 후 원래 공속으로 복귀';
         return;
     }
     document.getElementById('skillDesc2').textContent = activeCount > 0
-        ? `활성 ${activeCount}/${battleships.length}척 | 최고 중첩 ${maxStacks} | 최고 공속 x${maxSpeedMultiplier.toFixed(2)}`
+        ? `활성 ${activeCount}/${battleships.length}척 | 최고 중첩 ${maxStacks}/${stanceMaxStacks} | 최고 공속 x${maxSpeedMultiplier.toFixed(2)}`
         : '선택 전함 공격마다 현재 체력 10% 소모, 공속 10%씩 누적 증가. 종료 시 현재 체력 10% 소모 후 원래 공속 복귀';
 }
 
@@ -2483,13 +2504,13 @@ function showBattleshipAegisSkill(units) {
     document.getElementById('skillDesc6').className = 'skill-desc';
     if (battleships.length === 1) {
         document.getElementById('skillDesc6').textContent = activeCount > 0
-            ? '사거리·시야 x1.5 / 각 포탑 0.48초 연사 / 분산추적 / 발당 10 / 받는 피해 40% 증가'
-            : '활성 시 사거리·시야 1.5배, 각 포탑이 독립 추적하며 0.48초마다 발당 10 공격, 대신 받는 피해 40% 증가';
+            ? '사거리·시야 x1.5 / 각 포탑 0.48초 연사 / 분산추적 / 발당 5 / 받는 피해 40% 증가'
+            : '활성 시 사거리·시야 1.5배, 각 포탑이 독립 추적하며 0.48초마다 발당 5 공격, 대신 받는 피해 40% 증가';
         return;
     }
     document.getElementById('skillDesc6').textContent = activeCount > 0
-        ? `활성 ${activeCount}/${battleships.length}척 | 사거리·시야 x1.5 / 각 포탑 독립 추적 / 발당 10 / 받는 피해 40% 증가`
-        : '선택 전함 포탑이 독립 추적하며 0.48초 연사, 발당 10, 사거리·시야 1.5배, 받는 피해 40% 증가';
+        ? `활성 ${activeCount}/${battleships.length}척 | 사거리·시야 x1.5 / 각 포탑 독립 추적 / 발당 5 / 받는 피해 40% 증가`
+        : '선택 전함 포탑이 독립 추적하며 0.48초 연사, 발당 5, 사거리·시야 1.5배, 받는 피해 40% 증가';
 }
 
 function showFrigateEngineOverdriveSkill(units) {

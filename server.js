@@ -91,7 +91,7 @@ const ADVANCED_BUILDING_COMBAT_POWER = 150;
 const GENERAL_BUILDING_TYPES = new Set(['headquarters', 'power_plant', 'shipyard']);
 const ADVANCED_BUILDING_TYPES = new Set(['defense_tower', 'naval_academy', 'missile_silo', 'carbase', 'research_lab']);
 const BATTLESHIP_AEGIS_TURRET_COUNT = 3;
-const BATTLESHIP_AEGIS_DAMAGE = 10;
+const BATTLESHIP_AEGIS_DAMAGE = 5;
 const BATTLESHIP_AEGIS_RANGE_MULTIPLIER = 1.5;
 const BATTLESHIP_AEGIS_TAKEN_DAMAGE_MULTIPLIER = 1.40;
 const BATTLESHIP_AEGIS_TURRET_COOLDOWN_MS = 480;
@@ -123,6 +123,7 @@ const ASSAULT_SHIP_LOADABLE_UNIT_TYPES = new Set(['worker', 'missile_launcher'])
 const ROOM_ANNIHILATION_MESSAGE = '거대한 악의 세력이 설치한 핵폭탄에 의해 처치당했습니다';
 const BATTLESHIP_COMBAT_STANCE_HP_COST_RATIO = 0.10;
 const BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER = 1.10;
+const BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS = 150;
 const FRIGATE_ENGINE_OVERDRIVE_HP_COST_RATIO = 0.10;
 const FRIGATE_ENGINE_OVERDRIVE_SPEED_MULTIPLIER = 1.10;
 const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
@@ -600,6 +601,29 @@ function computeCurrentHpSelfDamage(unit, ratio) {
   return Math.min(computePercentSelfDamage(currentHp, ratio), currentHp - 1);
 }
 
+// Combat stance stops getting faster once the minimum attack cooldown is reached.
+function getBattleshipCombatStanceMaxStacks(unit) {
+  const baseCooldown = Math.max(
+    BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS,
+    getUnitBaseAttackCooldown(unit)
+  );
+  if (baseCooldown <= BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS) return 0;
+  const rawStacks = Math.log(baseCooldown / BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS)
+    / Math.log(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER);
+  return Math.max(0, Math.ceil(rawStacks - 1e-9));
+}
+
+function clampBattleshipCombatStanceStacks(unit) {
+  const clampedStacks = Math.min(
+    getBattleshipCombatStanceMaxStacks(unit),
+    Math.max(0, Math.floor(unit?.combatStanceStacks || 0))
+  );
+  if (unit && unit.type === 'battleship') {
+    unit.combatStanceStacks = clampedStacks;
+  }
+  return clampedStacks;
+}
+
 function getUnitBaseAttackCooldown(unit) {
   return unit?.baseAttackCooldownMs ?? getUnitDefinition(unit?.type).attackCooldownMs ?? unit?.attackCooldownMs ?? 1000;
 }
@@ -623,9 +647,15 @@ function refreshBattleshipCombatStance(unit) {
   if (!unit || unit.type !== 'battleship') return;
   const baseCooldown = getUnitBaseAttackCooldown(unit);
   const stanceActive = !!unit.combatStanceActive;
-  const stacks = stanceActive ? Math.max(0, unit.combatStanceStacks || 0) : 0;
+  const stacks = stanceActive ? clampBattleshipCombatStanceStacks(unit) : 0;
+  if (!stanceActive && unit.combatStanceStacks) {
+    unit.combatStanceStacks = 0;
+  }
   unit.attackCooldownMs = stanceActive
-    ? Math.max(150, Math.round(baseCooldown / Math.pow(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER, stacks)))
+    ? Math.max(
+      BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS,
+      Math.round(baseCooldown / Math.pow(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER, stacks))
+    )
     : baseCooldown;
 }
 
@@ -664,7 +694,10 @@ function applyBattleshipCombatStanceAttackCost(unit, now = Date.now()) {
   if (stanceDamage <= 0) {
     return false;
   }
-  unit.combatStanceStacks = Math.max(0, unit.combatStanceStacks || 0) + 1;
+  unit.combatStanceStacks = Math.min(
+    getBattleshipCombatStanceMaxStacks(unit),
+    clampBattleshipCombatStanceStacks(unit) + 1
+  );
   refreshBattleshipModeState(unit);
   return applyUnitSelfDamage(unit, stanceDamage, now);
 }
@@ -681,9 +714,13 @@ function initializeUnitRuntimeState(unit) {
   if (!Number.isFinite(unit.baseAttackRange)) {
     unit.baseAttackRange = unitConfig.attackRange;
   }
+  if (usesNavalContactCollision(unit)) {
+    unit.navalAvoidanceSideBias = unit.navalAvoidanceSideBias === -1 ? -1 : (unit.navalAvoidanceSideBias === 1 ? 1 : null);
+    unit.navalBlockedTicks = Math.max(0, Math.floor(unit.navalBlockedTicks || 0));
+  }
   if (unit.type === 'battleship') {
     unit.combatStanceActive = !!unit.combatStanceActive;
-    unit.combatStanceStacks = Math.max(0, unit.combatStanceStacks || 0);
+    unit.combatStanceStacks = clampBattleshipCombatStanceStacks(unit);
     unit.battleshipAegisMode = !!unit.battleshipAegisMode;
     if (!Array.isArray(unit.battleshipAegisTurretCooldowns) || unit.battleshipAegisTurretCooldowns.length !== BATTLESHIP_AEGIS_TURRET_COUNT) {
       unit.battleshipAegisTurretCooldowns = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => 0);
@@ -2252,6 +2289,106 @@ function tryDisplaceStationaryNavalBlockers(movingUnit, desiredX, desiredY, nava
   return true;
 }
 
+function getDeterministicUnitDirectionSign(unit) {
+  const numericId = Number(unit?.id);
+  if (Number.isFinite(numericId)) {
+    return Math.abs(Math.trunc(numericId)) % 2 === 0 ? 1 : -1;
+  }
+  const text = String(unit?.id ?? '');
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash * 31) + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) % 2 === 0 ? 1 : -1;
+}
+
+function getNavalAvoidanceSidePreference(unit, desiredX, desiredY, blockers = null) {
+  const moveDx = desiredX - unit.x;
+  const moveDy = desiredY - unit.y;
+  const moveDistance = Math.hypot(moveDx, moveDy);
+  if (moveDistance <= 0.01) {
+    return unit?.navalAvoidanceSideBias === -1 ? -1 : 1;
+  }
+
+  const sideX = -moveDy / moveDistance;
+  const sideY = moveDx / moveDistance;
+  let sidePressure = 0;
+  if (Array.isArray(blockers)) {
+    blockers.forEach(blocker => {
+      if (!blocker) return;
+      sidePressure += ((blocker.x - unit.x) * sideX) + ((blocker.y - unit.y) * sideY);
+    });
+  }
+
+  if (Math.abs(sidePressure) > 4) {
+    return sidePressure > 0 ? -1 : 1;
+  }
+  if (unit?.navalAvoidanceSideBias === 1 || unit?.navalAvoidanceSideBias === -1) {
+    return unit.navalAvoidanceSideBias;
+  }
+  return getDeterministicUnitDirectionSign(unit);
+}
+
+function findNavalSteeringMovePosition(unit, desiredX, desiredY, navalSpatialMap, blockers) {
+  if (!usesNavalContactCollision(unit) || !navalSpatialMap) return null;
+
+  const moveDx = desiredX - unit.x;
+  const moveDy = desiredY - unit.y;
+  const moveDistance = Math.hypot(moveDx, moveDy);
+  if (moveDistance <= 0.01) return null;
+
+  const preferredSide = getNavalAvoidanceSidePreference(unit, desiredX, desiredY, blockers);
+  const blockedTicks = Math.max(0, Math.floor(unit?.navalBlockedTicks || 0));
+  const extraTurn = Math.min(0.35, blockedTicks * 0.03);
+  const hasMovingBlocker = Array.isArray(blockers) && blockers.some(blocker => !isNavalUnitStationary(blocker));
+  const turnAngles = hasMovingBlocker
+    ? [
+      0.45 + extraTurn,
+      -(0.45 + extraTurn),
+      0.85 + extraTurn,
+      -(0.85 + extraTurn),
+      1.2 + extraTurn,
+      -(1.2 + extraTurn),
+      0,
+      1.45,
+      -1.45
+    ]
+    : [
+      0,
+      0.3 + extraTurn,
+      -(0.3 + extraTurn),
+      0.65 + extraTurn,
+      -(0.65 + extraTurn),
+      1.0 + extraTurn,
+      -(1.0 + extraTurn)
+    ];
+  const orderedTurnAngles = turnAngles.map(angle => angle * preferredSide);
+  const distanceFractions = hasMovingBlocker
+    ? [1, 0.88, 0.72, 0.58, 0.42]
+    : [1, 0.9, 0.75, 0.6, 0.45];
+  const baseAngle = Math.atan2(moveDy, moveDx);
+
+  for (let d = 0; d < distanceFractions.length; d++) {
+    const step = moveDistance * distanceFractions[d];
+    for (let t = 0; t < orderedTurnAngles.length; t++) {
+      const heading = baseAngle + orderedTurnAngles[t];
+      const candidate = clampToMapBounds(
+        unit.x + (Math.cos(heading) * step),
+        unit.y + (Math.sin(heading) * step)
+      );
+      if (isOnLand(candidate.x, candidate.y)) continue;
+      if (((candidate.x - unit.x) * (candidate.x - unit.x)) + ((candidate.y - unit.y) * (candidate.y - unit.y)) < 0.25) {
+        continue;
+      }
+      if (!canNavalUnitOccupyPosition(unit, candidate.x, candidate.y, navalSpatialMap)) continue;
+      unit.navalAvoidanceSideBias = preferredSide;
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
   if (!usesNavalContactCollision(unit) || !navalSpatialMap) {
     return { x: desiredX, y: desiredY };
@@ -2261,7 +2398,15 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
     blockers = collectNavalOverlapBlockers(unit, desiredX, desiredY, navalSpatialMap);
   }
   if (blockers.length === 0) {
+    unit.navalBlockedTicks = 0;
+    unit.navalAvoidanceSideBias = null;
     return { x: desiredX, y: desiredY };
+  }
+
+  const steeringCandidate = findNavalSteeringMovePosition(unit, desiredX, desiredY, navalSpatialMap, blockers);
+  if (steeringCandidate) {
+    unit.navalBlockedTicks = Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 1);
+    return steeringCandidate;
   }
 
   let bestX = unit.x;
@@ -2284,6 +2429,10 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
       high = mid;
     }
   }
+  const movedDistSq = ((bestX - unit.x) * (bestX - unit.x)) + ((bestY - unit.y) * (bestY - unit.y));
+  unit.navalBlockedTicks = movedDistSq > 0.25
+    ? Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 1)
+    : Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 2);
   return { x: bestX, y: bestY };
 }
 
@@ -3062,9 +3211,16 @@ function findAvailableFormationTarget(unit, desiredX, desiredY, reservedTargets)
   return baseCandidate;
 }
 
+function resetNavalAvoidanceState(unit) {
+  if (!usesNavalContactCollision(unit)) return;
+  unit.navalAvoidanceSideBias = null;
+  unit.navalBlockedTicks = 0;
+}
+
 function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
   const movableUnits = Array.isArray(units) ? units.filter(Boolean) : [];
   if (movableUnits.length <= 0) return;
+  movableUnits.forEach(resetNavalAvoidanceState);
 
   const centerX = movableUnits.reduce((sum, unit) => sum + unit.x, 0) / movableUnits.length;
   const centerY = movableUnits.reduce((sum, unit) => sum + unit.y, 0) / movableUnits.length;
@@ -3088,7 +3244,7 @@ function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
   const sideX = -forwardY;
   const sideY = forwardX;
   const preserveCurrentNavalOffsets = movableUnits.length > 1
-    && movableUnits.length <= 4
+    && movableUnits.length <= 8
     && movableUnits.every(unit => usesNavalContactCollision(unit));
   const reservedTargets = [];
 
@@ -5721,6 +5877,10 @@ function updateGame(deltaTime) {
           }
         } else {
           unit.pathWaypoints = null;
+        }
+        if (usesNavalContactCollision(unit) && unit.targetX === null && unit.targetY === null && !unit.pathWaypoints) {
+          unit.navalAvoidanceSideBias = null;
+          unit.navalBlockedTicks = 0;
         }
         if (usesNavalContactCollision(unit)) {
           updateEntitySpatialMapPosition(
