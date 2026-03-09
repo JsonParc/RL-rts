@@ -445,8 +445,8 @@ function createAssaultShipCargoPayload(unit) {
   const unitDef = getUnitDefinition(unitType);
   return {
     type: unitType,
-    hp: Math.max(1, Math.min(unit.maxHp || unitDef.hp, unit.hp || unitDef.hp)),
-    maxHp: unit.maxHp || unitDef.hp,
+    hp: normalizeEntityHpValue(unit.hp || unitDef.hp, unit.maxHp || unitDef.hp, 1),
+    maxHp: Math.max(1, Math.round(unit.maxHp || unitDef.hp)),
     kills: unit.kills || 0
   };
 }
@@ -517,16 +517,56 @@ function getAssaultShipCargoSpawnSize(cargo) {
     : MISSILE_LAUNCHER_RENDER_SIZE;
 }
 
+function normalizeEntityHpValue(value, maxHp = Number.POSITIVE_INFINITY, minimumHp = 0) {
+  if (!Number.isFinite(value)) return minimumHp;
+  const roundedValue = value > minimumHp ? Math.ceil(value) : Math.floor(value);
+  const normalizedMaxHp = Number.isFinite(maxHp)
+    ? Math.max(minimumHp, Math.round(maxHp))
+    : Number.POSITIVE_INFINITY;
+  return Math.max(minimumHp, Math.min(normalizedMaxHp, roundedValue));
+}
+
+function normalizeIntegerDelta(value) {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.max(1, Math.round(value));
+}
+
+function applyDamageToEntity(target, damage, now = Date.now(), minimumHp = 0) {
+  if (!target) return 0;
+  const currentHp = normalizeEntityHpValue(target.hp, target.maxHp, 0);
+  const appliedDamage = normalizeIntegerDelta(damage);
+  const nextHp = appliedDamage > 0
+    ? Math.max(minimumHp, currentHp - appliedDamage)
+    : currentHp;
+  target.hp = nextHp;
+  target.lastDamageTime = now;
+  return currentHp - nextHp;
+}
+
+function applyHealingToEntity(target, amount) {
+  if (!target) return 0;
+  const currentHp = normalizeEntityHpValue(target.hp, target.maxHp, 0);
+  const healedAmount = normalizeIntegerDelta(amount);
+  const maxHp = Number.isFinite(target.maxHp)
+    ? Math.max(0, Math.round(target.maxHp))
+    : currentHp;
+  const nextHp = healedAmount > 0
+    ? Math.min(maxHp, currentHp + healedAmount)
+    : currentHp;
+  target.hp = nextHp;
+  return nextHp - currentHp;
+}
+
 function getAdjustedUnitDamage(target, damage) {
-  if (!target) return damage;
   let adjustedDamage = damage;
+  if (!target) return normalizeIntegerDelta(adjustedDamage);
   if (target.type === 'assaultship') {
     adjustedDamage *= 0.8;
   }
   if (target.type === 'battleship' && target.battleshipAegisMode) {
     adjustedDamage *= BATTLESHIP_AEGIS_TAKEN_DAMAGE_MULTIPLIER;
   }
-  return Math.max(1, adjustedDamage);
+  return normalizeIntegerDelta(adjustedDamage);
 }
 
 function registerUnitKill(attacker) {
@@ -557,7 +597,7 @@ function computePercentSelfDamage(value, ratio) {
 }
 
 function computeCurrentHpSelfDamage(unit, ratio) {
-  const currentHp = Math.max(0, unit?.hp || 0);
+  const currentHp = normalizeEntityHpValue(unit?.hp || 0, unit?.maxHp, 0);
   if (currentHp <= 1) return 0;
   return Math.min(computePercentSelfDamage(currentHp, ratio), currentHp - 1);
 }
@@ -584,7 +624,7 @@ function getFrigateEngineOverdriveEvasionChance(unit) {
 function refreshBattleshipCombatStance(unit) {
   if (!unit || unit.type !== 'battleship') return;
   const baseCooldown = getUnitBaseAttackCooldown(unit);
-  const stanceActive = !!unit.combatStanceActive && !unit.battleshipAegisMode;
+  const stanceActive = !!unit.combatStanceActive;
   const stacks = stanceActive ? Math.max(0, unit.combatStanceStacks || 0) : 0;
   unit.attackCooldownMs = stanceActive
     ? Math.max(150, Math.round(baseCooldown / Math.pow(BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER, stacks)))
@@ -619,12 +659,15 @@ function getBattleshipAegisTurretCooldownMs(unit) {
 }
 
 function applyBattleshipCombatStanceAttackCost(unit, now = Date.now()) {
-  if (!unit || unit.type !== 'battleship' || !unit.combatStanceActive || unit.battleshipAegisMode || !gameState.units.has(unit.id)) {
+  if (!unit || unit.type !== 'battleship' || !unit.combatStanceActive || !gameState.units.has(unit.id)) {
+    return false;
+  }
+  const stanceDamage = computeCurrentHpSelfDamage(unit, BATTLESHIP_COMBAT_STANCE_HP_COST_RATIO);
+  if (stanceDamage <= 0) {
     return false;
   }
   unit.combatStanceStacks = Math.max(0, unit.combatStanceStacks || 0) + 1;
   refreshBattleshipModeState(unit);
-  const stanceDamage = computeCurrentHpSelfDamage(unit, BATTLESHIP_COMBAT_STANCE_HP_COST_RATIO);
   return applyUnitSelfDamage(unit, stanceDamage, now);
 }
 
@@ -644,14 +687,19 @@ function initializeUnitRuntimeState(unit) {
     unit.combatStanceActive = !!unit.combatStanceActive;
     unit.combatStanceStacks = Math.max(0, unit.combatStanceStacks || 0);
     unit.battleshipAegisMode = !!unit.battleshipAegisMode;
-    if (unit.battleshipAegisMode && unit.combatStanceActive) {
-      unit.combatStanceActive = false;
-      unit.combatStanceStacks = 0;
-    }
     if (!Array.isArray(unit.battleshipAegisTurretCooldowns) || unit.battleshipAegisTurretCooldowns.length !== BATTLESHIP_AEGIS_TURRET_COUNT) {
       unit.battleshipAegisTurretCooldowns = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => 0);
     } else {
       unit.battleshipAegisTurretCooldowns = unit.battleshipAegisTurretCooldowns.map(value => Number.isFinite(value) ? value : 0);
+    }
+    if (!Array.isArray(unit.battleshipAegisTurretTargetLocks) || unit.battleshipAegisTurretTargetLocks.length !== BATTLESHIP_AEGIS_TURRET_COUNT) {
+      unit.battleshipAegisTurretTargetLocks = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => null);
+    } else {
+      unit.battleshipAegisTurretTargetLocks = unit.battleshipAegisTurretTargetLocks.map(lock => (
+        lock && lock.targetId != null && (lock.targetType === 'unit' || lock.targetType === 'building')
+          ? { targetId: lock.targetId, targetType: lock.targetType }
+          : null
+      ));
     }
     refreshBattleshipModeState(unit);
   }
@@ -679,16 +727,20 @@ function destroyUnitFromGame(unit) {
 
 function applyUnitSelfDamage(unit, damage, now = Date.now()) {
   if (!unit || !gameState.units.has(unit.id)) return true;
-  const currentHp = Math.max(0, unit.hp || 0);
+  const currentHp = normalizeEntityHpValue(unit.hp || 0, unit.maxHp, 0);
   if (currentHp <= 0) {
     destroyUnitFromGame(unit);
     return true;
   }
-  const appliedDamage = Math.max(0, Number.isFinite(damage) ? damage : 0);
-  unit.hp = appliedDamage > 0
-    ? Math.max(1, currentHp - appliedDamage)
-    : currentHp;
-  unit.lastDamageTime = now;
+  unit.hp = currentHp;
+  const appliedDamage = normalizeIntegerDelta(damage);
+  if (appliedDamage <= 0) {
+    if (unit.type === 'frigate') {
+      refreshFrigateEngineOverdrive(unit);
+    }
+    return false;
+  }
+  applyDamageToEntity(unit, appliedDamage, now, 1);
   if (unit.type === 'frigate') {
     refreshFrigateEngineOverdrive(unit);
   }
@@ -811,6 +863,90 @@ function pickBattleshipAegisTarget(unit, combatRange, primaryTarget, primaryTarg
   return uniqueCandidate || candidates[0];
 }
 
+function getBattleshipAegisLockKey(lock) {
+  if (!lock || lock.targetId == null || !lock.targetType) return null;
+  return `${lock.targetType}:${lock.targetId}`;
+}
+
+function createBattleshipAegisTargetLock(target, targetType) {
+  if (!target || target.id == null || !targetType) return null;
+  return { targetId: target.id, targetType };
+}
+
+function selectBattleshipAegisTargetsForReadyTurrets(unit, candidates, readyTurretIndices, primaryTarget, primaryTargetType) {
+  const assignments = new Map();
+  if (!unit || candidates.length <= 0 || readyTurretIndices.length <= 0) return assignments;
+
+  const candidateByKey = new Map(candidates.map(candidate => [candidate.key, candidate]));
+  const remainingTurretIndices = readyTurretIndices.slice();
+  const usedKeys = new Set();
+
+  let anchorKey = null;
+  if (primaryTarget && primaryTargetType && primaryTargetType !== 'slbm') {
+    const primaryKey = `${primaryTargetType}:${primaryTarget.id}`;
+    if (candidateByKey.has(primaryKey)) {
+      anchorKey = primaryKey;
+    }
+  }
+  if (!anchorKey) {
+    const lockedAnchor = remainingTurretIndices
+      .map(turretIndex => getBattleshipAegisLockKey(unit.battleshipAegisTurretTargetLocks[turretIndex]))
+      .find(lockKey => lockKey && candidateByKey.has(lockKey));
+    if (lockedAnchor) {
+      anchorKey = lockedAnchor;
+    }
+  }
+  if (!anchorKey) {
+    anchorKey = candidates[0].key;
+  }
+
+  const assignTurret = (turretIndex, candidate) => {
+    if (!candidate) return false;
+    assignments.set(turretIndex, candidate);
+    const remainingIndex = remainingTurretIndices.indexOf(turretIndex);
+    if (remainingIndex >= 0) {
+      remainingTurretIndices.splice(remainingIndex, 1);
+    }
+    usedKeys.add(candidate.key);
+    return true;
+  };
+
+  const anchorCandidate = candidateByKey.get(anchorKey) || candidates[0];
+  if (anchorCandidate) {
+    const anchorTurretIndex = remainingTurretIndices.find(turretIndex => (
+      getBattleshipAegisLockKey(unit.battleshipAegisTurretTargetLocks[turretIndex]) === anchorCandidate.key
+    )) ?? remainingTurretIndices[0];
+    assignTurret(anchorTurretIndex, anchorCandidate);
+  }
+
+  readyTurretIndices.forEach(turretIndex => {
+    if (assignments.has(turretIndex)) return;
+    const lockKey = getBattleshipAegisLockKey(unit.battleshipAegisTurretTargetLocks[turretIndex]);
+    if (!lockKey || lockKey === anchorKey || usedKeys.has(lockKey)) return;
+    const lockedCandidate = candidateByKey.get(lockKey);
+    if (lockedCandidate) {
+      assignTurret(turretIndex, lockedCandidate);
+    }
+  });
+
+  readyTurretIndices.forEach(turretIndex => {
+    if (assignments.has(turretIndex)) return;
+    const uniqueCandidate = candidates.find(candidate => !usedKeys.has(candidate.key));
+    if (uniqueCandidate) {
+      assignTurret(turretIndex, uniqueCandidate);
+    }
+  });
+
+  const fallbackCandidate = anchorCandidate || candidates[0];
+  readyTurretIndices.forEach(turretIndex => {
+    if (!assignments.has(turretIndex) && fallbackCandidate) {
+      assignments.set(turretIndex, fallbackCandidate);
+    }
+  });
+
+  return assignments;
+}
+
 function processBattleshipAegisAttacks(
   unit,
   primaryTarget,
@@ -833,66 +969,114 @@ function processBattleshipAegisAttacks(
   }
 
   const turretCooldownMs = getBattleshipAegisTurretCooldownMs(unit);
-  const hasReadyTurret = unit.battleshipAegisTurretCooldowns.some(lastFireAt => !lastFireAt || (now - lastFireAt) >= turretCooldownMs);
-  if (!hasReadyTurret) return;
-
-  const usedTargetKeys = new Set();
+  const readyTurretIndices = [];
   for (let turretIndex = 0; turretIndex < unit.battleshipAegisTurretCooldowns.length; turretIndex++) {
     const lastFireAt = unit.battleshipAegisTurretCooldowns[turretIndex];
-    if (lastFireAt && (now - lastFireAt) < turretCooldownMs) continue;
+    if (!lastFireAt || (now - lastFireAt) >= turretCooldownMs) {
+      readyTurretIndices.push(turretIndex);
+    }
+  }
+  if (readyTurretIndices.length <= 0) return;
 
-    const selectedTarget = pickBattleshipAegisTarget(
-      unit,
-      combatRange,
-      primaryTarget,
-      primaryTargetType,
-      usedTargetKeys,
-      combatUnitSpatialIndex,
-      combatBuildingSpatialIndex
-    );
+  const candidates = collectBattleshipAegisTargets(
+    unit,
+    combatRange,
+    primaryTarget,
+    primaryTargetType,
+    combatUnitSpatialIndex,
+    combatBuildingSpatialIndex
+  );
+  if (candidates.length <= 0) return;
+
+  const assignments = selectBattleshipAegisTargetsForReadyTurrets(
+    unit,
+    candidates,
+    readyTurretIndices,
+    primaryTarget,
+    primaryTargetType
+  );
+  const shotPlans = [];
+  for (let i = 0; i < readyTurretIndices.length; i++) {
+    const turretIndex = readyTurretIndices[i];
+    const selectedTarget = assignments.get(turretIndex);
     if (!selectedTarget) continue;
 
     const { entity: target, type: targetType, key: targetKey } = selectedTarget;
-    usedTargetKeys.add(targetKey);
-
-    emitAttackProjectile(unit, target, { turretIndices: [turretIndex] });
+    shotPlans.push({
+      turretIndex,
+      target,
+      targetType,
+      targetKey,
+      targetId: target.id,
+      targetUserId: target.userId,
+      targetX: target.x,
+      targetY: target.y
+    });
     unit.battleshipAegisTurretCooldowns[turretIndex] = now;
-    unit.lastAttackTime = now;
+    unit.battleshipAegisTurretTargetLocks[turretIndex] = createBattleshipAegisTargetLock(target, targetType);
+  }
+
+  if (shotPlans.length <= 0) return;
+
+  unit.lastAttackTime = now;
+  emitBattleshipAegisProjectileBurst(unit, shotPlans, now);
+
+  const damagePlans = new Map();
+  for (let i = 0; i < shotPlans.length; i++) {
+    const shotPlan = shotPlans[i];
+    const { target, targetType, targetKey } = shotPlan;
 
     let targetEvaded = false;
     if (targetType === 'unit') {
       targetEvaded = doesUnitEvadeDirectAttack(target);
     }
+    if (targetEvaded) continue;
 
-    if (!targetEvaded) {
-      let damage = BATTLESHIP_AEGIS_DAMAGE;
-      if (targetType === 'unit' && target.type === 'cruiser') {
-        if (target.aegisMode) {
-          damage *= 0.7;
-        }
-        if (target.isIsolated && !target.aegisMode) {
-          damage *= 0.5;
-        }
+    let damage = BATTLESHIP_AEGIS_DAMAGE;
+    if (targetType === 'unit' && target.type === 'cruiser') {
+      if (target.aegisMode) {
+        damage *= 0.7;
       }
-
-      if (targetType === 'unit') {
-        damage = getAdjustedUnitDamage(target, damage);
-        target.hp -= damage;
-        target.lastDamageTime = now;
-        recordAiUnitAttackResponse(target, unit, now);
-      } else {
-        target.hp -= damage;
-        target.lastDamageTime = now;
-      }
-
-      if (target.hp <= 0) {
-        destroyCombatTargetByUnit(unit, target, targetType);
-        if (!gameState.units.has(unit.id)) {
-          return;
-        }
+      if (target.isIsolated && !target.aegisMode) {
+        damage *= 0.5;
       }
     }
+    if (targetType === 'unit') {
+      damage = getAdjustedUnitDamage(target, damage);
+    }
 
+    const existingPlan = damagePlans.get(targetKey);
+    if (existingPlan) {
+      existingPlan.damage += damage;
+    } else {
+      damagePlans.set(targetKey, {
+        target,
+        targetType,
+        damage
+      });
+    }
+  }
+
+  for (const damagePlan of damagePlans.values()) {
+    const { target, targetType, damage } = damagePlan;
+    if (targetType === 'unit') {
+      if (!gameState.units.has(target.id)) continue;
+      applyDamageToEntity(target, damage, now);
+      recordAiUnitAttackResponse(target, unit, now);
+    } else {
+      if (!gameState.buildings.has(target.id)) continue;
+      applyDamageToEntity(target, damage, now);
+    }
+
+    if (target.hp <= 0) {
+      destroyCombatTargetByUnit(unit, target, targetType);
+      if (!gameState.units.has(unit.id)) {
+        return;
+      }
+    }
+  }
+
+  for (let i = 0; i < shotPlans.length; i++) {
     if (applyBattleshipCombatStanceAttackCost(unit, now)) {
       return;
     }
@@ -1527,6 +1711,7 @@ function sanitizeViewportState(data) {
     zoom: Math.max(0.3, Math.min(2, zoom)),
     width: Math.max(320, Math.min(4096, width)),
     height: Math.max(240, Math.min(2160, height)),
+    revealAllBuildings: !!data.revealAllBuildings,
     updatedAt: Date.now()
   };
 }
@@ -1559,10 +1744,11 @@ function isEntityRelevantToSocket(socket, entity, bounds) {
 
 function buildClientStatePayloadForSocket(socket, sharedPlayersPayload = null) {
   const bounds = getSocketInterestBounds(socket);
+  const revealAllBuildings = !!socket?.viewportState?.revealAllBuildings;
   return {
     players: sharedPlayersPayload || buildClientPlayersPayload(),
     units: buildClientUnitsPayload(unit => isEntityRelevantToSocket(socket, unit, bounds)),
-    buildings: buildClientBuildingsPayload(building => isEntityRelevantToSocket(socket, building, bounds))
+    buildings: buildClientBuildingsPayload(building => revealAllBuildings || isEntityRelevantToSocket(socket, building, bounds))
   };
 }
 
@@ -1590,6 +1776,54 @@ function createSegmentBounds(x1, y1, x2, y2, padding = 0) {
     right: Math.max(x1, x2) + padding,
     top: Math.min(y1, y2) - padding,
     bottom: Math.max(y1, y2) + padding
+  };
+}
+
+function createProjectilePayloadBounds(payload, padding = 0) {
+  if (!payload) return null;
+  const burstShots = Array.isArray(payload.shots) ? payload.shots : null;
+  if (!burstShots || burstShots.length <= 0) {
+    return createSegmentBounds(payload.fromX, payload.fromY, payload.targetX, payload.targetY, padding);
+  }
+
+  let left = Number.isFinite(payload.fromX) ? payload.fromX : Number.POSITIVE_INFINITY;
+  let right = Number.isFinite(payload.fromX) ? payload.fromX : Number.NEGATIVE_INFINITY;
+  let top = Number.isFinite(payload.fromY) ? payload.fromY : Number.POSITIVE_INFINITY;
+  let bottom = Number.isFinite(payload.fromY) ? payload.fromY : Number.NEGATIVE_INFINITY;
+
+  burstShots.forEach(shot => {
+    const shotFromX = Number.isFinite(shot?.fromX) ? shot.fromX : payload.fromX;
+    const shotFromY = Number.isFinite(shot?.fromY) ? shot.fromY : payload.fromY;
+    const shotTargetX = Number.isFinite(shot?.targetX) ? shot.targetX : null;
+    const shotTargetY = Number.isFinite(shot?.targetY) ? shot.targetY : null;
+
+    if (Number.isFinite(shotFromX)) {
+      left = Math.min(left, shotFromX);
+      right = Math.max(right, shotFromX);
+    }
+    if (Number.isFinite(shotFromY)) {
+      top = Math.min(top, shotFromY);
+      bottom = Math.max(bottom, shotFromY);
+    }
+    if (Number.isFinite(shotTargetX)) {
+      left = Math.min(left, shotTargetX);
+      right = Math.max(right, shotTargetX);
+    }
+    if (Number.isFinite(shotTargetY)) {
+      top = Math.min(top, shotTargetY);
+      bottom = Math.max(bottom, shotTargetY);
+    }
+  });
+
+  if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(top) || !Number.isFinite(bottom)) {
+    return null;
+  }
+
+  return {
+    left: left - padding,
+    right: right + padding,
+    top: top - padding,
+    bottom: bottom + padding
   };
 }
 
@@ -1677,7 +1911,7 @@ function emitBuildingDestroyedEvent(building) {
 function emitAttackProjectileFiredEvent(payload, extraUserIds = []) {
   if (!payload) return;
   emitScopedRoomEvent('attackProjectileFired', payload, {
-    bounds: createSegmentBounds(payload.fromX, payload.fromY, payload.targetX, payload.targetY, 900),
+    bounds: createProjectilePayloadBounds(payload, 900),
     userIds: extraUserIds,
     volatile: true
   });
@@ -3167,6 +3401,50 @@ function emitAttackProjectile(attacker, target, options = {}) {
   }, [attacker.userId, target.userId]);
 }
 
+function emitBattleshipAegisProjectileBurst(attacker, shots, now = Date.now()) {
+  if (!attacker || attacker.type !== 'battleship' || !Array.isArray(shots) || shots.length <= 0) return;
+
+  const projectileId = (now * 1000) + Math.floor(Math.random() * 1000);
+  const userIds = new Set([attacker.userId]);
+  const normalizedShots = shots
+    .map((shot, index) => {
+      if (!shot || !Number.isInteger(shot.turretIndex) || !Number.isFinite(shot.targetX) || !Number.isFinite(shot.targetY)) {
+        return null;
+      }
+      if (shot.targetUserId != null) {
+        userIds.add(shot.targetUserId);
+      }
+      const dx = shot.targetX - attacker.x;
+      const dy = shot.targetY - attacker.y;
+      const distance = Math.sqrt((dx * dx) + (dy * dy));
+      const projectileSpeed = 3000;
+      const flightTimeMs = Math.max(200, Math.min(2200, Math.round((distance / projectileSpeed) * 1000)));
+      return {
+        id: `${projectileId}-${index}`,
+        turretIndex: shot.turretIndex,
+        targetX: shot.targetX,
+        targetY: shot.targetY,
+        targetId: shot.targetId,
+        targetType: shot.targetType,
+        flightTime: flightTimeMs
+      };
+    })
+    .filter(Boolean);
+
+  if (normalizedShots.length <= 0) return;
+
+  emitAttackProjectileFiredEvent({
+    id: projectileId,
+    fromX: attacker.x,
+    fromY: attacker.y,
+    shooterId: attacker.id,
+    shooterType: attacker.type,
+    aimedShot: false,
+    startTime: now,
+    shots: normalizedShots
+  }, Array.from(userIds));
+}
+
 function findNonOverlappingPosition(x, y, size) {
   let bestX = x;
   let bestY = y;
@@ -3619,7 +3897,7 @@ function spawnAdminBase(userId) {
   const spawnX = waterPos ? waterPos.x : baseX;
   const spawnY = waterPos ? waterPos.y : baseY;
 
-  const adminUnits = ['destroyer', 'cruiser', 'battleship', 'carrier', 'submarine', 'frigate'];
+  const adminUnits = ['destroyer', 'cruiser', 'battleship', 'carrier', 'submarine', 'frigate', 'assaultship'];
   let totalPop = player.population; // already 4 from workers
   adminUnits.forEach((type, i) => {
     const unitConfig = getUnitDefinition(type);
@@ -3639,16 +3917,36 @@ function spawnAdminBase(userId) {
       buildTargetX: null, buildTargetY: null,
       kills: 0
     }));
+    if (type === 'assaultship') {
+      const assaultShip = gameState.units.get(uid);
+      if (assaultShip) {
+        assaultShip.loadedMissileLaunchers = [];
+      }
+    }
     totalPop += unitConfig.pop;
   });
+
+  const launcherSpawn = findNearestLandPosition(baseX + 260, baseY + 260) || { x: baseX + 260, y: baseY + 260 };
+  const adminLauncher = createMissileLauncherUnit(userId, launcherSpawn);
+  gameState.units.set(adminLauncher.id, initializeUnitRuntimeState(adminLauncher));
+  totalPop += getUnitDefinition('missile_launcher').pop;
 
   // Pre-fill carrier with 10 aircraft (ready for airstrike)
   const carrierUnit = [...gameState.units.values()].find(u => u.userId === userId && u.type === 'carrier');
   if (carrierUnit) {
     if (!carrierUnit.aircraft) carrierUnit.aircraft = [];
+    if (!carrierUnit.aircraftDeployed) carrierUnit.aircraftDeployed = [];
+    if (!carrierUnit.aircraftQueue) carrierUnit.aircraftQueue = [];
+    if (!carrierUnit.reconAircraft) carrierUnit.reconAircraft = [];
+    if (!carrierUnit.reconAircraftDeployed) carrierUnit.reconAircraftDeployed = [];
+    if (!carrierUnit.reconAircraftQueue) carrierUnit.reconAircraftQueue = [];
     const acConfig = getUnitDefinition('aircraft');
     for (let i = 0; i < 10; i++) {
       carrierUnit.aircraft.push({ hp: acConfig.hp });
+    }
+    const reconConfig = getUnitDefinition('recon_aircraft');
+    for (let i = 0; i < RECON_AIRCRAFT_MAX_PER_CARRIER; i++) {
+      carrierUnit.reconAircraft.push({ hp: reconConfig.hp });
     }
     carrierUnit.airstrikeReady = true;
   }
@@ -4192,7 +4490,6 @@ io.on('connection', (socket) => {
       const unit = gameState.units.get(unitId);
       if (!unit || unit.userId !== socket.userId || unit.type !== 'battleship') return;
       initializeUnitRuntimeState(unit);
-      if (unit.battleshipAegisMode) return;
       if (unit.combatStanceActive) {
         unit.combatStanceActive = false;
         unit.combatStanceStacks = 0;
@@ -4216,11 +4513,11 @@ io.on('connection', (socket) => {
       unit.battleshipAegisMode = !unit.battleshipAegisMode;
       if (unit.battleshipAegisMode) {
         unit.aimedShot = false;
-        unit.combatStanceActive = false;
-        unit.combatStanceStacks = 0;
+        unit.battleshipAegisTurretTargetLocks = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => null);
       }
       if (!unit.battleshipAegisMode) {
         unit.lastTurretTargetTime = Date.now();
+        unit.battleshipAegisTurretTargetLocks = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => null);
       }
       refreshBattleshipModeState(unit);
     });
@@ -5085,8 +5382,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
     if (!targetIntersectsDamageCircle(slbm.targetX, slbm.targetY, damageRadius, target.x, target.y, targetRadius)) {
       return;
     }
-    target.hp = Math.max(0, target.hp - getAdjustedUnitDamage(target, 500));
-    target.lastDamageTime = now;
+    applyDamageToEntity(target, getAdjustedUnitDamage(target, 500), now);
     if (target.hp <= 0) {
       if (target.type === 'mine') {
         emitUnitDestroyedEvent(target);
@@ -5104,8 +5400,7 @@ function applySlbmDamage(slbm, now = Date.now()) {
     if (!targetIntersectsDamageCircle(slbm.targetX, slbm.targetY, damageRadius, target.x, target.y, targetRadius)) {
       return;
     }
-    target.hp = Math.max(0, target.hp - 800);
-    target.lastDamageTime = now;
+    applyDamageToEntity(target, 800, now);
     if (target.hp <= 0) {
       emitBuildingDestroyedEvent(target);
       awardCombatScore(firingPlayer, getCombatPowerRewardForTarget(target, 'building'));
@@ -5243,7 +5538,7 @@ function updateGame(deltaTime) {
         const lastRegenTime = unit.lastRegenTime || 0;
         if (now - lastRegenTime >= HP_REGEN_CONFIG.regenIntervalMs) {
           unit.lastRegenTime = now;
-          unit.hp = Math.min(unit.maxHp, unit.hp + HP_REGEN_CONFIG.regenPerSecond);
+          applyHealingToEntity(unit, HP_REGEN_CONFIG.regenPerSecond);
         }
       }
     }
@@ -5517,7 +5812,7 @@ function updateGame(deltaTime) {
         const lastRegenTime = building.lastRegenTime || 0;
         if (now - lastRegenTime >= HP_REGEN_CONFIG.regenIntervalMs) {
           building.lastRegenTime = now;
-          building.hp = Math.min(building.maxHp, building.hp + HP_REGEN_CONFIG.regenPerSecond);
+          applyHealingToEntity(building, HP_REGEN_CONFIG.regenPerSecond);
         }
       }
     }
@@ -5740,8 +6035,7 @@ function updateGame(deltaTime) {
       gameState.units.forEach(target => {
         const targetRadius = getUnitAreaHitRadius(target);
         if (targetIntersectsDamageCircle(strike.targetX, strike.targetY, damageRadius, target.x, target.y, targetRadius)) {
-          target.hp -= getAdjustedUnitDamage(target, strike.damagePerPass);
-          target.lastDamageTime = now;
+          applyDamageToEntity(target, getAdjustedUnitDamage(target, strike.damagePerPass), now);
           if (target.hp <= 0) {
             if (target.type === 'mine') {
               emitUnitDestroyedEvent(target);
@@ -5759,8 +6053,7 @@ function updateGame(deltaTime) {
       gameState.buildings.forEach(target => {
         const targetRadius = getBuildingCollisionSize(target.type) / 2;
         if (targetIntersectsDamageCircle(strike.targetX, strike.targetY, damageRadius, target.x, target.y, targetRadius)) {
-          target.hp -= strike.damagePerPass;
-          target.lastDamageTime = now;
+          applyDamageToEntity(target, strike.damagePerPass, now);
           if (target.hp <= 0) {
             emitBuildingDestroyedEvent(target);
             awardCombatScore(strike.userId, getCombatPowerRewardForTarget(target, 'building'));
@@ -6170,8 +6463,7 @@ function updateGame(deltaTime) {
         emitAttackProjectile(building, nearestTarget);
         const targetEvaded = doesUnitEvadeDirectAttack(nearestTarget);
         if (!targetEvaded) {
-          nearestTarget.hp -= getAdjustedUnitDamage(nearestTarget, towerDamage);
-          nearestTarget.lastDamageTime = now; // Track for HP regeneration
+          applyDamageToEntity(nearestTarget, getAdjustedUnitDamage(nearestTarget, towerDamage), now);
           
           // Track attackers for AI counterattack response (defense tower attacks)
           if (nearestTarget.userId < 0) {
@@ -6237,7 +6529,7 @@ function updateGame(deltaTime) {
           towerTrackedTarget = true;
           building.lastSlbmAttackTime = now;
           emitAttackProjectile(building, { id: slbm.id, x: slbm.currentX, y: slbm.currentY });
-          slbm.hp = Math.max(0, slbm.hp - towerDamage);
+          applyDamageToEntity(slbm, towerDamage, now);
           emitSlbmDamagedEvent({ id: slbm.id, hp: slbm.hp, maxHp: slbm.maxHp, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
           if (slbm.hp <= 0) {
             emitSlbmDestroyedEvent({ id: slbm.id, x: slbm.currentX, y: slbm.currentY, userId: slbm.userId });
@@ -6589,14 +6881,9 @@ function updateGame(deltaTime) {
           
           // SLBMs take direct damage like other targets.
           if (unit.attackTargetType === 'slbm') {
-            target.hp = Math.max(0, target.hp - dmg);
+            applyDamageToEntity(target, dmg, now);
           } else if (!targetEvaded) {
-            target.hp -= dmg;
-          }
-          
-          // Track last damage time for HP regeneration
-          if (!targetEvaded && (unit.attackTargetType === 'unit' || unit.attackTargetType === 'building')) {
-            target.lastDamageTime = now;
+            applyDamageToEntity(target, dmg, now);
           }
           
           // Track attackers for AI counterattack response (units only)
@@ -7997,8 +8284,7 @@ function applyRedZoneBombardment(zone, now) {
   gameState.units.forEach(target => {
     const targetRadius = getUnitAreaHitRadius(target);
     if (!isEntityHitByRedZone(zone, target.x, target.y, targetRadius)) return;
-    target.hp -= getAdjustedUnitDamage(target, RED_ZONE_BLAST_DAMAGE);
-    target.lastDamageTime = now;
+    applyDamageToEntity(target, getAdjustedUnitDamage(target, RED_ZONE_BLAST_DAMAGE), now);
     if (target.hp <= 0) {
       destroyedUnits.push(target);
     }
@@ -8019,8 +8305,7 @@ function applyRedZoneBombardment(zone, now) {
   gameState.buildings.forEach(target => {
     const targetRadius = getBuildingCollisionSize(target.type) / 2;
     if (!isEntityHitByRedZone(zone, target.x, target.y, targetRadius)) return;
-    target.hp -= RED_ZONE_BLAST_DAMAGE;
-    target.lastDamageTime = now;
+    applyDamageToEntity(target, RED_ZONE_BLAST_DAMAGE, now);
     if (target.hp <= 0) {
       destroyedBuildings.push(target);
     }

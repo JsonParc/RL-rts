@@ -1050,6 +1050,7 @@ function clearTemporaryFullMapReveal() {
         fullMapRevealTimeoutId = null;
     }
     invalidateFogAndMinimap();
+    maybeSyncViewportState(true);
 }
 
 function activateTemporaryFullMapReveal(durationMs = TEMPORARY_FULL_MAP_REVEAL_MS) {
@@ -1062,6 +1063,7 @@ function activateTemporaryFullMapReveal(durationMs = TEMPORARY_FULL_MAP_REVEAL_M
         updateFogOfWar(true);
         renderMinimap();
     }
+    maybeSyncViewportState(true);
     fullMapRevealTimeoutId = setTimeout(() => {
         fullMapRevealUntil = 0;
         fullMapRevealTimeoutId = null;
@@ -1069,6 +1071,7 @@ function activateTemporaryFullMapReveal(durationMs = TEMPORARY_FULL_MAP_REVEAL_M
         if (gameState.map) {
             updateFogOfWar(true);
         }
+        maybeSyncViewportState(true);
     }, durationMs);
 }
 
@@ -1114,6 +1117,115 @@ function playOneShot(soundTemplate, options = {}) {
         return sound;
     } catch(e) {}
     return null;
+}
+
+function collectBattleshipAegisVisualCandidates(unit) {
+    if (!unit) return [];
+    const shipPos = getUnitDisplayPosition(unit);
+    const range = Number.isFinite(unit.attackRange) ? unit.attackRange : 0;
+    if (range <= 0) return [];
+
+    const rangeSq = range * range;
+    const candidates = [];
+    const seen = new Set();
+
+    const pushCandidate = (entity, type, priority) => {
+        if (!entity || entity.userId === unit.userId) return;
+        if (type === 'unit') {
+            if (entity.id === unit.id || !isUnitVisibleToPlayer(entity)) return;
+        } else if (entity.userId !== gameState.userId && !isPositionVisible(entity.x, entity.y)) {
+            return;
+        }
+
+        const pos = type === 'unit'
+            ? getUnitDisplayPosition(entity)
+            : { x: entity.x, y: entity.y };
+        const dx = pos.x - shipPos.x;
+        const dy = pos.y - shipPos.y;
+        const distSq = (dx * dx) + (dy * dy);
+        if (distSq > rangeSq) return;
+
+        const key = `${type}:${entity.id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        candidates.push({ key, x: pos.x, y: pos.y, distSq, priority });
+    };
+
+    if (unit.attackTargetId != null && unit.attackTargetType) {
+        if (unit.attackTargetType === 'unit') {
+            pushCandidate(gameState.units.get(unit.attackTargetId), 'unit', 0);
+        } else if (unit.attackTargetType === 'building') {
+            pushCandidate(gameState.buildings.get(unit.attackTargetId), 'building', 0);
+        }
+    }
+
+    gameState.units.forEach(enemy => pushCandidate(enemy, 'unit', 1));
+    gameState.buildings.forEach(enemy => pushCandidate(enemy, 'building', 2));
+
+    candidates.sort((a, b) => {
+        if (a.priority !== b.priority) return a.priority - b.priority;
+        if (a.distSq !== b.distSq) return a.distSq - b.distSq;
+        return a.key.localeCompare(b.key);
+    });
+
+    return candidates;
+}
+
+function getBattleshipAegisVisualTargets(unit) {
+    const turretCount = BATTLESHIP_TURRET_IMAGE_COORDS.length;
+    const candidates = collectBattleshipAegisVisualCandidates(unit);
+    if (candidates.length <= 0) {
+        return Array.from({ length: turretCount }, () => null);
+    }
+
+    const candidateByKey = new Map(candidates.map(candidate => [candidate.key, candidate]));
+    const previousTargets = Array.isArray(unit.battleshipAegisVisualTargets)
+        ? unit.battleshipAegisVisualTargets
+        : [];
+    const assignments = Array.from({ length: turretCount }, () => null);
+    const usedKeys = new Set();
+
+    let anchorKey = null;
+    if (unit.attackTargetId != null && unit.attackTargetType) {
+        const primaryKey = `${unit.attackTargetType}:${unit.attackTargetId}`;
+        if (candidateByKey.has(primaryKey)) {
+            anchorKey = primaryKey;
+        }
+    }
+    if (!anchorKey) {
+        const lockedTarget = previousTargets.find(target => target && candidateByKey.has(target.key));
+        if (lockedTarget) {
+            anchorKey = lockedTarget.key;
+        }
+    }
+    if (!anchorKey) {
+        anchorKey = candidates[0].key;
+    }
+
+    const anchorCandidate = candidateByKey.get(anchorKey) || candidates[0];
+    if (anchorCandidate) {
+        assignments[0] = anchorCandidate;
+        usedKeys.add(anchorCandidate.key);
+    }
+
+    for (let turretIndex = 1; turretIndex < turretCount; turretIndex++) {
+        const preferredKey = previousTargets[turretIndex]?.key;
+        const preferredCandidate = preferredKey && !usedKeys.has(preferredKey)
+            ? candidateByKey.get(preferredKey)
+            : null;
+        const nextCandidate = preferredCandidate
+            || candidates.find(candidate => !usedKeys.has(candidate.key))
+            || anchorCandidate
+            || null;
+        assignments[turretIndex] = nextCandidate;
+        if (nextCandidate) {
+            usedKeys.add(nextCandidate.key);
+        }
+    }
+
+    return assignments.map(candidate => candidate
+        ? { key: candidate.key, x: candidate.x, y: candidate.y }
+        : null);
 }
 
 function stopManagedBattleSound(instance) {
@@ -1412,7 +1524,8 @@ function buildViewportSyncPayload() {
         y: gameState.camera.y,
         zoom: gameState.camera.zoom,
         width: canvas.width,
-        height: canvas.height
+        height: canvas.height,
+        revealAllBuildings: hasTemporaryFullMapReveal()
     };
 }
 
@@ -1422,7 +1535,8 @@ function hasViewportSyncChanged(prev, next) {
         || Math.abs(prev.y - next.y) > 20
         || Math.abs(prev.zoom - next.zoom) > 0.02
         || prev.width !== next.width
-        || prev.height !== next.height;
+        || prev.height !== next.height
+        || !!prev.revealAllBuildings !== !!next.revealAllBuildings;
 }
 
 function maybeSyncViewportState(force = false) {
@@ -2337,22 +2451,16 @@ function getBattleshipCombatStanceSpeedMultiplier(unit) {
 function showBattleshipCombatStanceSkill(units) {
     const battleships = units.filter(unit => unit.type === 'battleship' && unit.userId === gameState.userId);
     if (battleships.length <= 0) return;
-    const stanceEligibleBattleships = battleships.filter(unit => !unit.battleshipAegisMode);
     const slot2 = document.getElementById('skillSlot2');
     slot2.style.display = 'flex';
-    const activeCount = stanceEligibleBattleships.filter(unit => unit.combatStanceActive).length;
-    const maxStacks = stanceEligibleBattleships.reduce((max, unit) => Math.max(max, unit.combatStanceStacks || 0), 0);
-    const maxSpeedMultiplier = stanceEligibleBattleships.reduce((max, unit) => Math.max(max, getBattleshipCombatStanceSpeedMultiplier(unit)), 1);
-    const hasEligibleBattleships = stanceEligibleBattleships.length > 0;
+    const activeCount = battleships.filter(unit => unit.combatStanceActive).length;
+    const maxStacks = battleships.reduce((max, unit) => Math.max(max, unit.combatStanceStacks || 0), 0);
+    const maxSpeedMultiplier = battleships.reduce((max, unit) => Math.max(max, getBattleshipCombatStanceSpeedMultiplier(unit)), 1);
     document.getElementById('skillBtn2').textContent = activeCount > 0 ? '⚔️ 전투태세 (활성)' : '⚔️ 전투태세';
-    document.getElementById('skillBtn2').className = hasEligibleBattleships
+    document.getElementById('skillBtn2').className = battleships.length > 0
         ? ('skill-btn' + (activeCount > 0 ? ' skill-active' : ''))
         : 'skill-btn disabled';
     document.getElementById('skillDesc2').className = 'skill-desc';
-    if (!hasEligibleBattleships) {
-        document.getElementById('skillDesc2').textContent = '이지스 모드 중인 전함은 전투태세를 사용할 수 없음';
-        return;
-    }
     if (battleships.length === 1) {
         document.getElementById('skillDesc2').textContent = activeCount > 0
             ? `현재 중첩 ${maxStacks} | 공속 x${maxSpeedMultiplier.toFixed(2)} | 공격마다 현재 체력 10% 소모 | 종료 시 현재 체력 10% 소모 후 원래 공속 복귀`
@@ -2360,10 +2468,8 @@ function showBattleshipCombatStanceSkill(units) {
         return;
     }
     document.getElementById('skillDesc2').textContent = activeCount > 0
-        ? `활성 ${activeCount}/${stanceEligibleBattleships.length}척 | 최고 중첩 ${maxStacks} | 최고 공속 x${maxSpeedMultiplier.toFixed(2)}`
-        : (stanceEligibleBattleships.length === battleships.length
-            ? '선택 전함 공격마다 현재 체력 10% 소모, 공속 10%씩 누적 증가. 종료 시 현재 체력 10% 소모 후 원래 공속 복귀'
-            : '이지스 모드가 아닌 선택 전함만 전투태세를 사용함');
+        ? `활성 ${activeCount}/${battleships.length}척 | 최고 중첩 ${maxStacks} | 최고 공속 x${maxSpeedMultiplier.toFixed(2)}`
+        : '선택 전함 공격마다 현재 체력 10% 소모, 공속 10%씩 누적 증가. 종료 시 현재 체력 10% 소모 후 원래 공속 복귀';
 }
 
 function showBattleshipAegisSkill(units) {
@@ -4240,13 +4346,21 @@ function syncUnitLayer() {
         // Battleship turret logic
         if (unit.type === 'battleship' && entry.turretSprites && entry.turretSprites.length > 0) {
             const shipAngle = angle;
+            const aegisTargets = unit.battleshipAegisMode ? getBattleshipAegisVisualTargets(unit) : null;
             const attackTgt = unit.battleshipAegisMode ? null : getBattleshipAimTarget(unit);
             const turretWorldStates = getBattleshipTurretWorldStates(posX, posY, shipAngle, size, null, unit);
             const turretTargetAngles = turretWorldStates.map((ts, ti) => {
+                const aegisTarget = aegisTargets && aegisTargets[ti];
+                if (aegisTarget) return Math.atan2(aegisTarget.y - ts.centerY, aegisTarget.x - ts.centerX);
                 if (attackTgt) return Math.atan2(attackTgt.y - ts.centerY, attackTgt.x - ts.centerX);
                 if (unit.turretAngles && unit.turretAngles[ti] !== undefined) return unit.turretAngles[ti];
                 return shipAngle;
             });
+            if (unit.battleshipAegisMode) {
+                unit.battleshipAegisVisualTargets = aegisTargets;
+            } else if (unit.battleshipAegisVisualTargets) {
+                unit.battleshipAegisVisualTargets = null;
+            }
             if (!unit.turretAngles || unit.turretAngles.length !== turretTargetAngles.length) {
                 unit.turretAngles = turretTargetAngles.slice();
             }
@@ -5520,7 +5634,7 @@ document.getElementById('skillBtn2').addEventListener('click', () => {
     if (highestPriorityType === 'battleship' && socket) {
         const selectedBattleships = Array.from(gameState.selection)
             .map(id => gameState.units.get(id))
-            .filter(u => u && u.userId === gameState.userId && u.type === 'battleship' && !u.battleshipAegisMode);
+            .filter(u => u && u.userId === gameState.userId && u.type === 'battleship');
         if (selectedBattleships.length > 0) {
             socket.emit('toggleCombatStance', { unitIds: selectedBattleships.map(unit => unit.id) });
         }
@@ -6407,11 +6521,14 @@ function connectToGame() {
 
         if (isBattleship) {
             const shooter = data.shooterId ? gameState.units.get(data.shooterId) : null;
+            const firstBurstShot = Array.isArray(data.shots) && data.shots.length > 0 ? data.shots[0] : null;
+            const fallbackTargetX = Number.isFinite(data.targetX) ? data.targetX : firstBurstShot?.targetX;
+            const fallbackTargetY = Number.isFinite(data.targetY) ? data.targetY : firstBurstShot?.targetY;
             const shipAngle = (shooter && shooter.displayAngle !== undefined)
                 ? shooter.displayAngle
                 : (shooter && shooter.commandAngle !== undefined)
                     ? shooter.commandAngle
-                    : Math.atan2(data.targetY - data.fromY, data.targetX - data.fromX);
+                    : Math.atan2((fallbackTargetY ?? data.fromY) - data.fromY, (fallbackTargetX ?? data.fromX) - data.fromX);
 
             const shipX = (shooter && shooter.interpDisplayX !== undefined)
                 ? shooter.interpDisplayX
@@ -6421,44 +6538,88 @@ function connectToGame() {
                 : ((shooter && shooter.y !== undefined) ? shooter.y : data.fromY);
 
             const turretCenters = getBattleshipTurretWorldStates(shipX, shipY, shipAngle, 60, null, shooter);
-            const fireAngles = turretCenters.map(turret => Math.atan2(
-                data.targetY - turret.centerY,
-                data.targetX - turret.centerX
-            ));
-            const turretIndices = Array.isArray(data.turretIndices) && data.turretIndices.length > 0
-                ? data.turretIndices.filter(index => Number.isInteger(index) && index >= 0 && index < turretCenters.length)
-                : turretCenters.map((_, index) => index);
+            const shotPayloads = Array.isArray(data.shots) && data.shots.length > 0
+                ? data.shots
+                    .map((shot, shotIndex) => ({
+                        id: shot.id || `${baseId}-${shotIndex}`,
+                        turretIndex: Number.isInteger(shot.turretIndex) ? shot.turretIndex : shotIndex,
+                        targetX: shot.targetX,
+                        targetY: shot.targetY,
+                        targetId: shot.targetId,
+                        targetType: shot.targetType,
+                        flightTime: shot.flightTime || flightTime
+                    }))
+                    .filter(shot => Number.isInteger(shot.turretIndex)
+                        && shot.turretIndex >= 0
+                        && shot.turretIndex < turretCenters.length
+                        && Number.isFinite(shot.targetX)
+                        && Number.isFinite(shot.targetY))
+                : (() => {
+                    const turretIndices = Array.isArray(data.turretIndices) && data.turretIndices.length > 0
+                        ? data.turretIndices.filter(index => Number.isInteger(index) && index >= 0 && index < turretCenters.length)
+                        : turretCenters.map((_, index) => index);
+                    return turretIndices.map(turretIndex => ({
+                        id: `${baseId}-${turretIndex}`,
+                        turretIndex,
+                        targetX: data.targetX,
+                        targetY: data.targetY,
+                        targetId: data.targetId,
+                        targetType: data.targetType,
+                        flightTime
+                    }));
+                })();
+
+            const nextTurretAngles = shooter && Array.isArray(shooter.turretAngles)
+                ? shooter.turretAngles.slice()
+                : turretCenters.map(() => shipAngle);
+            const nextAegisTargets = shooter && Array.isArray(shooter.battleshipAegisVisualTargets)
+                ? shooter.battleshipAegisVisualTargets.slice()
+                : turretCenters.map(() => null);
+
+            shotPayloads.forEach(shot => {
+                const turret = turretCenters[shot.turretIndex];
+                if (!turret) return;
+                nextTurretAngles[shot.turretIndex] = Math.atan2(
+                    shot.targetY - turret.centerY,
+                    shot.targetX - turret.centerX
+                );
+                nextAegisTargets[shot.turretIndex] = {
+                    key: (shot.targetType && shot.targetId != null) ? `${shot.targetType}:${shot.targetId}` : null,
+                    x: shot.targetX,
+                    y: shot.targetY
+                };
+            });
 
             if (shooter) {
-                const nextTurretAngles = Array.isArray(shooter.turretAngles)
-                    ? shooter.turretAngles.slice()
-                    : turretCenters.map(() => shipAngle);
-                turretIndices.forEach(index => {
-                    nextTurretAngles[index] = fireAngles[index];
-                });
                 shooter.turretAngles = nextTurretAngles;
-                shooter.lastTurretTargetX = data.targetX;
-                shooter.lastTurretTargetY = data.targetY;
-                shooter.lastTurretTargetTime = startTime;
+                if (shooter.battleshipAegisMode) {
+                    shooter.battleshipAegisVisualTargets = nextAegisTargets;
+                }
+                if (!Array.isArray(data.shots) || data.shots.length <= 0) {
+                    shooter.lastTurretTargetX = data.targetX;
+                    shooter.lastTurretTargetY = data.targetY;
+                    shooter.lastTurretTargetTime = startTime;
+                }
             }
 
-            const turretMuzzles = getBattleshipTurretWorldStates(shipX, shipY, shipAngle, 60, fireAngles, shooter);
-            turretIndices.forEach((turretIndex, sequenceIndex) => {
+            const turretMuzzles = getBattleshipTurretWorldStates(shipX, shipY, shipAngle, 60, nextTurretAngles, shooter);
+            shotPayloads.forEach((shot, sequenceIndex) => {
+                const turretIndex = shot.turretIndex;
                 const turret = turretMuzzles[turretIndex];
                 if (!turret) return;
                 attackProjectiles.push({
-                    id: `${baseId}-${turretIndex}`,
+                    id: shot.id,
                     fromX: turret.muzzleX,
                     fromY: turret.muzzleY,
-                    targetX: data.targetX,
-                    targetY: data.targetY,
-                    targetId: data.targetId,
+                    targetX: shot.targetX,
+                    targetY: shot.targetY,
+                    targetId: shot.targetId,
                     shooterType: 'battleship',
                     aimedShot: data.aimedShot || false,
                     soundTrigger: sequenceIndex === 0,
                     soundInstance: null,
                     startTime,
-                    flightTime
+                    flightTime: shot.flightTime
                 });
             });
         } else {
