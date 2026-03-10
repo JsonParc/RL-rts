@@ -113,8 +113,8 @@ const CARBASE_PREREQ_BUILDINGS = Object.freeze([
 const BUILDING_PLACEMENT_BUFFER = 50;
 const BUILDING_PLACEMENT_SEARCH_RADIUS = 4000;
 const SLBM_MAX_HP = 500;
-const DEFENSE_TOWER_CANNON_START = Object.freeze({ x: 5, y: 8 });
-const DEFENSE_TOWER_CANNON_MUZZLE = Object.freeze({ x: 21, y: 12 });
+const DEFENSE_TOWER_CANNON_START = Object.freeze({ x: 14, y: 8 });
+const DEFENSE_TOWER_CANNON_MUZZLE = Object.freeze({ x: 14, y: 17 });
 const DESTROYER_SEARCH_VISION_RADIUS = 4800;
 const DESTROYER_MAX_MINES = 5;
 const SEARCH_REVEAL_DURATION_MS = 10000;
@@ -141,10 +141,7 @@ const NAVAL_REPATH_NO_PROGRESS_TICKS = 6;
 const NAVAL_REPATH_COOLDOWN_MS = 300;
 const THREAT_SCAN_EXCLUDED_AIR_TYPES = new Set(['aircraft']);
 const ENABLE_SERVER_FOG_SNAPSHOTS = false;
-const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.atan2(
-  DEFENSE_TOWER_CANNON_MUZZLE.y - DEFENSE_TOWER_CANNON_START.y,
-  DEFENSE_TOWER_CANNON_MUZZLE.x - DEFENSE_TOWER_CANNON_START.x
-);
+const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.PI / 2; // 6시 방향이 기본 총구 방향
 let nextAirstrikeId = 1;
 
 function readPngDimensions(filePath) {
@@ -879,7 +876,9 @@ function initializeUnitRuntimeState(unit) {
   if (unit.type === 'frigate') {
     unit.engineOverdriveActive = !!unit.engineOverdriveActive;
     unit.engineOverdriveLastTickAt = Number.isFinite(unit.engineOverdriveLastTickAt) ? unit.engineOverdriveLastTickAt : null;
-    refreshFrigateEngineOverdrive(unit);
+    if (!unit.squadId) {
+      refreshFrigateEngineOverdrive(unit);
+    }
   }
   if (unit.type === 'submarine') {
     unit.loadedSlbms = getSubmarineLoadedSlbmCount(unit);
@@ -1896,7 +1895,9 @@ function buildClientUnitsPayload(filterFn = null) {
       searchActiveUntil: unit.searchActiveUntil ?? null,
       airstrikeReady: !!unit.airstrikeReady,
       airstrikeCooldownUntil: unit.airstrikeCooldownUntil ?? null,
-      isMine: unit.type === 'mine'
+      isMine: unit.type === 'mine',
+      squadId: unit.squadId ?? null,
+      formationType: unit.squadId ? (gameState.squads.get(unit.squadId)?.formationType || 'trapezoid') : null
     });
   });
   return units;
@@ -2339,7 +2340,7 @@ try {
 }
 
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.static('public', { etag: false, maxAge: 0, lastModified: false }));
 
 app.get(['/healthz', '/health'], (req, res) => {
   res.status(200).json({ ok: true, app: APP_NAME });
@@ -2376,6 +2377,8 @@ function createRoomState() {
     lastUpdate: Date.now(),
     fogOfWar: new Map(),
     aiRespawnTimers: new Map(),
+    squads: new Map(),
+    nextSquadId: 1,
     nextRedZoneId: 1,
     nextRedZoneRollAt: Date.now() + RED_ZONE_SELECTION_INTERVAL_MS,
     lastRedZoneCountdownSecond: null
@@ -2402,6 +2405,8 @@ function roomEmit(event, data) {
 function collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialMap, ignoredIds = null) {
   const blockers = [];
   if (!usesNavalContactCollision(unit) || !navalSpatialMap) return blockers;
+  // Skip collision entirely for units forming up in squad formation
+  if (unit.formingUp) return blockers;
 
   const ownEllipse = getSelectionEllipseForUnit(unit);
   const probeRange = Math.max(320, Math.max(ownEllipse.semiMajor, ownEllipse.semiMinor) + 260);
@@ -2409,6 +2414,8 @@ function collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialM
     if (!other || other.id === unit.id || !gameState.units.has(other.id)) return;
     if (ignoredIds && ignoredIds.has(other.id)) return;
     if (!usesNavalContactCollision(other)) return;
+    // Skip collision between squad-mates during formation
+    if (other.formingUp && unit.squadId && other.squadId === unit.squadId) return;
     const clearancePadding = getNavalBlockerClearancePadding(unit, other, candidateX, candidateY);
     if (doSelectionEllipsesOverlapWithPadding(unit, candidateX, candidateY, other, other.x, other.y, clearancePadding)) {
       blockers.push(other);
@@ -3695,6 +3702,394 @@ function resetNavalAvoidanceState(unit) {
   unit.navalNoProgressTicks = 0;
 }
 
+// ==================== SQUAD (부대지정) SYSTEM ====================
+
+function getUnitSquad(unit) {
+  if (!unit || !unit.squadId) return null;
+  return gameState.squads.get(unit.squadId) || null;
+}
+
+function getSquadSlowestSpeed(squad) {
+  let minSpeed = Infinity;
+  for (const uid of squad.unitIds) {
+    const u = gameState.units.get(uid);
+    if (u) minSpeed = Math.min(minSpeed, getUnitBaseSpeed(u));
+  }
+  return minSpeed === Infinity ? 6 : minSpeed;
+}
+
+function getSquadAliveUnits(squad) {
+  const alive = [];
+  for (const uid of squad.unitIds) {
+    const u = gameState.units.get(uid);
+    if (u && u.hp > 0) alive.push(u);
+  }
+  return alive;
+}
+
+function cleanupSquad(squadId) {
+  const squad = gameState.squads.get(squadId);
+  if (!squad) return;
+  const alive = getSquadAliveUnits(squad);
+  // Remove dead units from squad
+  squad.unitIds = alive.map(u => u.id || [...gameState.units.entries()].find(([, v]) => v === u)?.[0]).filter(Boolean);
+  if (squad.unitIds.length <= 1) {
+    disbandSquadInternal(squadId);
+  }
+}
+
+function disbandSquadInternal(squadId) {
+  const squad = gameState.squads.get(squadId);
+  if (!squad) return;
+  for (const uid of squad.unitIds) {
+    const u = gameState.units.get(uid);
+    if (u) {
+      u.squadId = null;
+      u.speed = getUnitBaseSpeed(u);
+      u.formingUp = false;
+      u.formingUpUntil = null;
+      u.squadOffsetX = null;
+      u.squadOffsetY = null;
+    }
+  }
+  gameState.squads.delete(squadId);
+}
+
+function getUnitFormationSize(unit) {
+  const ellipse = getSelectionEllipseForUnit(unit);
+  const longAxis = Math.max(ellipse.semiMajor, ellipse.semiMinor);
+  const shortAxis = Math.min(ellipse.semiMajor, ellipse.semiMinor);
+  return { longAxis, shortAxis };
+}
+
+function getSquadFormationPositions(units, targetX, targetY, moveAngle, formationType) {
+  if (!formationType) formationType = 'trapezoid';
+  const sorted = [...units].sort((a, b) => (a.attackRange || 0) - (b.attackRange || 0));
+  const count = sorted.length;
+  if (count === 0) return [];
+
+  const forwardX = Math.cos(moveAngle);
+  const forwardY = Math.sin(moveAngle);
+  const sideX = -forwardY;
+  const sideY = forwardX;
+  const FORMATION_GAP = 30;
+  const MAX_PER_ROW = 7;
+  const FLANK_MAX_PER_ROW = 3;
+  const positions = [];
+  const NON_COMBAT_TYPES = new Set(['assaultship', 'submarine']);
+
+  // Tier grouping: same tier units can share rows, but same type stays adjacent
+  function getUnitTier(u) {
+    const t = u.type;
+    if (t === 'assaultship' || t === 'submarine') return 0;
+    if (t === 'frigate') return 1;
+    if (t === 'destroyer' || t === 'cruiser') return 2;
+    if (t === 'battleship' || t === 'carrier') return 3;
+    return Math.floor((u.attackRange || 0) / 500);
+  }
+
+  function getRowWidth(row) {
+    const widths = row.map(u => getUnitFormationSize(u).shortAxis * 2);
+    return widths.reduce((s, w) => s + w, 0) + FORMATION_GAP * Math.max(0, row.length - 1);
+  }
+  function getRowDepth(row) {
+    return row.reduce((m, u) => Math.max(m, getUnitFormationSize(u).longAxis * 2), 40);
+  }
+  function placeRow(rowUnits, fwdOff, latOff) {
+    const widths = rowUnits.map(u => getUnitFormationSize(u).shortAxis * 2);
+    const total = widths.reduce((s, w) => s + w, 0) + FORMATION_GAP * Math.max(0, rowUnits.length - 1);
+    let cursor = latOff - total / 2;
+    rowUnits.forEach((u, i) => {
+      const hW = widths[i] / 2;
+      const lat = cursor + hW;
+      positions.push({ unit: u, x: targetX + sideX * lat + forwardX * fwdOff, y: targetY + sideY * lat + forwardY * fwdOff });
+      cursor += widths[i] + FORMATION_GAP;
+    });
+  }
+  function makeRows(arr, maxPerRow) {
+    if (arr.length === 0) return [];
+    // Sort by tier, then by type (same type adjacent), then by range
+    const s = [...arr].sort((a, b) => {
+      const ta = getUnitTier(a), tb = getUnitTier(b);
+      if (ta !== tb) return ta - tb;
+      if (a.type !== b.type) return a.type < b.type ? -1 : 1;
+      return (a.attackRange || 0) - (b.attackRange || 0);
+    });
+    // Group by tier (units in same tier can share a row)
+    const tierGroups = [];
+    for (const u of s) {
+      const tier = getUnitTier(u);
+      if (tierGroups.length === 0 || tierGroups[tierGroups.length - 1].tier !== tier) {
+        tierGroups.push({ tier, units: [u] });
+      } else {
+        tierGroups[tierGroups.length - 1].units.push(u);
+      }
+    }
+    const result = [];
+    for (const g of tierGroups) {
+      for (let i = 0; i < g.units.length; i += maxPerRow) {
+        result.push(g.units.slice(i, i + maxPerRow));
+      }
+    }
+    return result;
+  }
+
+  if (formationType === 'diamond') {
+    // DIAMOND: long range center, short range outer, non-combat behind
+    const combatUnits = [], nonCombatUnits = [];
+    for (const u of sorted) { if (NON_COMBAT_TYPES.has(u.type)) nonCombatUnits.push(u); else combatUnits.push(u); }
+    // Sort by tier desc (highest tier = center), then same type adjacent
+    const byTierDesc = [...combatUnits].sort((a, b) => {
+      const ta = getUnitTier(a), tb = getUnitTier(b);
+      if (ta !== tb) return tb - ta;
+      if (a.type !== b.type) return a.type < b.type ? -1 : 1;
+      return (b.attackRange || 0) - (a.attackRange || 0);
+    });
+    const rings = [];
+    let placed = 0, ri = 0;
+    while (placed < byTierDesc.length) {
+      const cap = ri === 0 ? 1 : 4 * ri;
+      rings.push(byTierDesc.slice(placed, placed + cap));
+      placed += rings[rings.length - 1].length;
+      ri++;
+    }
+    const avgSize = combatUnits.length > 0 ? combatUnits.reduce((s, u) => s + getUnitFormationSize(u).longAxis * 2, 0) / combatUnits.length : 40;
+    const ringSpacing = avgSize + FORMATION_GAP + NAVAL_COLLISION_CLEARANCE_BUFFER;
+    for (let r = 0; r < rings.length; r++) {
+      const ru = rings[r];
+      if (r === 0) {
+        positions.push({ unit: ru[0], x: targetX, y: targetY });
+      } else {
+        const dist = r * ringSpacing;
+        const n = ru.length;
+        for (let i = 0; i < n; i++) {
+          const t = i / n;
+          let px, py;
+          if (t < 0.25) { const s2 = t / 0.25; px = dist * s2; py = dist * (1 - s2); }
+          else if (t < 0.5) { const s2 = (t - 0.25) / 0.25; px = dist * (1 - s2); py = -dist * s2; }
+          else if (t < 0.75) { const s2 = (t - 0.5) / 0.25; px = -dist * s2; py = -dist * (1 - s2); }
+          else { const s2 = (t - 0.75) / 0.25; px = -dist * (1 - s2); py = dist * s2; }
+          positions.push({ unit: ru[i], x: targetX + sideX * px + forwardX * py, y: targetY + sideY * px + forwardY * py });
+        }
+      }
+    }
+    if (nonCombatUnits.length > 0) {
+      const rearDist = rings.length * ringSpacing + FORMATION_GAP;
+      const ncW = nonCombatUnits.reduce((s, u) => s + getUnitFormationSize(u).shortAxis * 2, 0) + FORMATION_GAP * Math.max(0, nonCombatUnits.length - 1);
+      let cur = -ncW / 2;
+      for (const u of nonCombatUnits) {
+        const w = getUnitFormationSize(u).shortAxis * 2;
+        positions.push({ unit: u, x: targetX + sideX * (cur + w / 2) - forwardX * rearDist, y: targetY + sideY * (cur + w / 2) - forwardY * rearDist });
+        cur += w + FORMATION_GAP;
+      }
+    }
+    return positions;
+  }
+
+  // ===== TRAPEZOID =====
+  const combatUnits = [], forcedRearUnits = [];
+  for (const u of sorted) { if (NON_COMBAT_TYPES.has(u.type)) forcedRearUnits.push(u); else combatUnits.push(u); }
+  // Group combat units by tier instead of raw range
+  const tierMap = new Map();
+  for (const u of combatUnits) {
+    const tier = getUnitTier(u);
+    if (!tierMap.has(tier)) tierMap.set(tier, []);
+    tierMap.get(tier).push(u);
+  }
+  const rangeGroups = [...tierMap.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
+  let frontUnits = [], flankUnits = [], rearUnits = [];
+  const N = rangeGroups.length;
+  if (N <= 1) { frontUnits = combatUnits.slice(); }
+  else if (N === 2) { frontUnits = rangeGroups[0].slice(); rearUnits = rangeGroups[1].slice(); }
+  else {
+    let fc = Math.max(1, Math.round(N * 0.43));
+    let rc = Math.max(1, Math.round(N * 0.35));
+    if (fc + rc >= N) { fc = Math.floor(N / 3); rc = Math.floor(N / 3); }
+    if (fc + rc >= N) { fc = 1; rc = 1; }
+    for (let i = 0; i < N; i++) {
+      if (i < fc) frontUnits.push(...rangeGroups[i]);
+      else if (i >= N - rc) rearUnits.push(...rangeGroups[i]);
+      else flankUnits.push(...rangeGroups[i]);
+    }
+  }
+  rearUnits.push(...forcedRearUnits);
+
+  const frontRows = makeRows(frontUnits, MAX_PER_ROW);
+  const rearRows = makeRows(rearUnits.filter(u => !NON_COMBAT_TYPES.has(u.type)), MAX_PER_ROW);
+  const forcedRearRows = makeRows(forcedRearUnits, MAX_PER_ROW);
+  const frontDepths = frontRows.map(r => getRowDepth(r));
+  const rearDepths = rearRows.map(r => getRowDepth(r));
+  let centerMaxWidth = 0;
+  frontRows.forEach(r => { centerMaxWidth = Math.max(centerMaxWidth, getRowWidth(r)); });
+  rearRows.forEach(r => { centerMaxWidth = Math.max(centerMaxWidth, getRowWidth(r)); });
+
+  let fOff = FORMATION_GAP / 2;
+  for (let i = frontRows.length - 1; i >= 0; i--) {
+    fOff += frontDepths[i] / 2; placeRow(frontRows[i], fOff, 0); fOff += frontDepths[i] / 2 + FORMATION_GAP;
+  }
+  let rOff = -FORMATION_GAP / 2;
+  for (let i = 0; i < rearRows.length; i++) {
+    rOff -= rearDepths[i] / 2; placeRow(rearRows[i], rOff, 0); rOff -= rearDepths[i] / 2 + FORMATION_GAP;
+  }
+  // Non-combat units (assaultship, submarine) go behind ALL other rear units
+  if (forcedRearRows.length > 0) {
+    rOff -= FORMATION_GAP;
+    const frDepths = forcedRearRows.map(r => getRowDepth(r));
+    for (let i = 0; i < forcedRearRows.length; i++) {
+      rOff -= frDepths[i] / 2; placeRow(forcedRearRows[i], rOff, 0); rOff -= frDepths[i] / 2 + FORMATION_GAP;
+    }
+  }
+
+  if (flankUnits.length > 0) {
+    const half = Math.ceil(flankUnits.length / 2);
+    const leftFlank = flankUnits.slice(0, half);
+    const rightFlank = flankUnits.slice(half);
+    function placeFlankSide(sideUnits, sign) {
+      if (sideUnits.length === 0) return;
+      const rows = [];
+      for (let i = 0; i < sideUnits.length; i += FLANK_MAX_PER_ROW) rows.push(sideUnits.slice(i, i + FLANK_MAX_PER_ROW));
+      let maxW = 0;
+      rows.forEach(r => { maxW = Math.max(maxW, getRowWidth(r)); });
+      const latCenter = sign * (centerMaxWidth / 2 + FORMATION_GAP + maxW / 2);
+      const depths = rows.map(r => getRowDepth(r));
+      const totalD = depths.reduce((s, d) => s + d, 0) + FORMATION_GAP * Math.max(0, rows.length - 1);
+      let vOff = totalD / 2;
+      for (let i = 0; i < rows.length; i++) { vOff -= depths[i] / 2; placeRow(rows[i], vOff, latCenter); vOff -= depths[i] / 2 + FORMATION_GAP; }
+    }
+    placeFlankSide(leftFlank, -1);
+    placeFlankSide(rightFlank, 1);
+  }
+  return positions;
+}
+
+function getSquadPathfindType(squad) {
+  const units = getSquadAliveUnits(squad);
+  // Use the largest naval unit for clearance; fall back to 'ship' for all-naval, 'land' for land
+  let hasNaval = false, hasLand = false, largestNaval = null;
+  for (const u of units) {
+    if (isNavalUnitType(u.type)) {
+      hasNaval = true;
+      if (!largestNaval) largestNaval = u.type;
+      else {
+        const cur = getNavalTerrainClearanceCells(largestNaval);
+        const nxt = getNavalTerrainClearanceCells(u.type);
+        if (nxt > cur) largestNaval = u.type;
+      }
+    } else if (isLandCombatUnitType(u.type)) {
+      hasLand = true;
+    }
+  }
+  if (hasNaval) return largestNaval || 'ship';
+  if (hasLand) return 'land';
+  return 'worker';
+}
+
+function issueSquadMoveOrder(squad, targetX, targetY) {
+  const formationType = squad.formationType || 'trapezoid';
+  const units = getSquadAliveUnits(squad);
+  if (units.length === 0) return;
+
+  const centerX = units.reduce((s, u) => s + u.x, 0) / units.length;
+  const centerY = units.reduce((s, u) => s + u.y, 0) / units.length;
+  const dx = targetX - centerX;
+  const dy = targetY - centerY;
+  const moveAngle = Math.atan2(dy, dx);
+  const slowestSpeed = getSquadSlowestSpeed(squad);
+
+  squad.centerX = centerX;
+  squad.centerY = centerY;
+  squad.targetX = targetX;
+  squad.targetY = targetY;
+  squad.moveAngle = moveAngle;
+  squad.moving = true;
+  squad.attackMove = false;
+
+  // Pathfind for the center around terrain
+  const pathType = getSquadPathfindType(squad);
+  const centerPath = findPath(centerX, centerY, targetX, targetY, pathType);
+  if (centerPath && centerPath.length > 1) {
+    squad.centerWaypoints = centerPath.slice(1);
+  } else {
+    squad.centerWaypoints = null;
+  }
+
+  const positions = getSquadFormationPositions(units, targetX, targetY, moveAngle, formationType);
+
+  positions.forEach(({ unit, x, y }) => {
+    unit.squadOffsetX = x - targetX;
+    unit.squadOffsetY = y - targetY;
+    unit.speed = slowestSpeed;
+    unit.holdPosition = false;
+    unit.attackMove = false;
+    unit.attackTargetId = null;
+    unit.attackTargetType = null;
+    unit.angle = moveAngle;
+    unit.formingUp = false;
+    unit.formingUpUntil = null;
+    unit.targetX = null;
+    unit.targetY = null;
+    unit.pathWaypoints = null;
+    resetNavalAvoidanceState(unit);
+  });
+}
+
+function issueSquadAttackTarget(squad, targetId, targetType) {
+  const units = getSquadAliveUnits(squad);
+  units.forEach(unit => {
+    if (canAcceptPlayerOrders(unit)) {
+      unit.attackTargetId = targetId;
+      unit.attackTargetType = targetType;
+    }
+  });
+}
+
+function issueSquadAttackMove(squad, targetX, targetY) {
+  const formationType = squad.formationType || 'trapezoid';
+  const units = getSquadAliveUnits(squad);
+  if (units.length === 0) return;
+
+  const centerX = units.reduce((s, u) => s + u.x, 0) / units.length;
+  const centerY = units.reduce((s, u) => s + u.y, 0) / units.length;
+  const moveAngle = Math.atan2(targetY - centerY, targetX - centerX);
+  const slowestSpeed = getSquadSlowestSpeed(squad);
+
+  squad.centerX = centerX;
+  squad.centerY = centerY;
+  squad.targetX = targetX;
+  squad.targetY = targetY;
+  squad.moveAngle = moveAngle;
+  squad.moving = true;
+  squad.attackMove = true;
+
+  // Pathfind for the center around terrain
+  const pathType = getSquadPathfindType(squad);
+  const centerPath = findPath(centerX, centerY, targetX, targetY, pathType);
+  if (centerPath && centerPath.length > 1) {
+    squad.centerWaypoints = centerPath.slice(1);
+  } else {
+    squad.centerWaypoints = null;
+  }
+
+  const positions = getSquadFormationPositions(units, targetX, targetY, moveAngle, formationType);
+
+  positions.forEach(({ unit, x, y }) => {
+    unit.squadOffsetX = x - targetX;
+    unit.squadOffsetY = y - targetY;
+    unit.speed = slowestSpeed;
+    unit.holdPosition = false;
+    unit.attackMove = true;
+    unit.attackTargetId = null;
+    unit.attackTargetType = null;
+    unit.angle = moveAngle;
+    unit.formingUp = false;
+    unit.formingUpUntil = null;
+    unit.targetX = null;
+    unit.targetY = null;
+    unit.pathWaypoints = null;
+    resetNavalAvoidanceState(unit);
+  });
+}
+
 function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
   const movableUnits = Array.isArray(units) ? units.filter(Boolean) : [];
   if (movableUnits.length <= 0) return;
@@ -4797,40 +5192,203 @@ io.on('connection', (socket) => {
     switchRoom(socket.roomId);
     const { unitIds, targetX, targetY } = data;
     const movableUnits = [];
+    // Check if any selected unit belongs to a squad — move entire squad
+    const squadsMoved = new Set();
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (unit && unit.type === 'missile_launcher' && unit.deployState !== 'mobile') return;
       if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
-        movableUnits.push(unit);
+        if (unit.squadId && !squadsMoved.has(unit.squadId)) {
+          const squad = gameState.squads.get(unit.squadId);
+          if (squad) {
+            squadsMoved.add(unit.squadId);
+            issueSquadMoveOrder(squad, targetX, targetY);
+          }
+        } else if (!unit.squadId) {
+          movableUnits.push(unit);
+        }
       }
     });
-    issueGroupedMoveOrder(movableUnits, targetX, targetY);
-    movableUnits.forEach(unit => {
-      unit.holdPosition = false;
-      unit.attackMove = false;
-      unit.attackTargetId = null;
-      unit.attackTargetType = null;
-    });
+    if (movableUnits.length > 0) {
+      issueGroupedMoveOrder(movableUnits, targetX, targetY);
+      movableUnits.forEach(unit => {
+        unit.holdPosition = false;
+        unit.attackMove = false;
+        unit.attackTargetId = null;
+        unit.attackTargetType = null;
+      });
+    }
   });
   
   socket.on('attackTarget', (data) => {
     switchRoom(socket.roomId);
     const { unitIds, targetId, targetType } = data;
+    // Check if any selected unit belongs to a squad — attack with entire squad
+    const squadsCommanded = new Set();
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (unit && unit.type === 'missile_launcher') return;
       if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
-        if (unit.type === 'battleship' && unit.battleshipAegisMode && targetType === 'slbm') {
-          unit.attackTargetId = null;
-          unit.attackTargetType = null;
-          return;
+        if (unit.squadId && !squadsCommanded.has(unit.squadId)) {
+          const squad = gameState.squads.get(unit.squadId);
+          if (squad) {
+            squadsCommanded.add(unit.squadId);
+            issueSquadAttackTarget(squad, targetId, targetType);
+          }
+        } else if (!unit.squadId) {
+          if (unit.type === 'battleship' && unit.battleshipAegisMode && targetType === 'slbm') {
+            unit.attackTargetId = null;
+            unit.attackTargetType = null;
+            return;
+          }
+          unit.holdPosition = false;
+          unit.attackMove = false;
+          unit.attackTargetId = targetId;
+          unit.attackTargetType = targetType;
         }
-        unit.holdPosition = false;
-        unit.attackMove = false;
-        unit.attackTargetId = targetId;
-        unit.attackTargetType = targetType;
       }
     });
+  });
+
+  socket.on('createSquad', (data) => {
+    console.log('[Squad] createSquad received from', socket.userId, 'data:', JSON.stringify(data));
+    switchRoom(socket.roomId);
+    const unitIds = Array.isArray(data?.unitIds) ? data.unitIds : [];
+    const validUnits = [];
+    unitIds.forEach(uid => {
+      const unit = gameState.units.get(uid);
+      if (unit && unit.userId === socket.userId && unit.hp > 0) {
+        // Remove from any existing squad first
+        if (unit.squadId) {
+          const oldSquad = gameState.squads.get(unit.squadId);
+          if (oldSquad) {
+            oldSquad.unitIds = oldSquad.unitIds.filter(id => id !== uid);
+            if (oldSquad.unitIds.length <= 1) disbandSquadInternal(unit.squadId);
+          }
+        }
+        validUnits.push(uid);
+      }
+    });
+    if (validUnits.length < 2) { console.log('[Squad] Not enough valid units:', validUnits.length); return; }
+    const squadId = gameState.nextSquadId++;
+    console.log('[Squad] Creating squad', squadId, 'with', validUnits.length, 'units');
+    const squad = { unitIds: validUnits, ownerId: socket.userId, formationType: 'trapezoid' };
+    gameState.squads.set(squadId, squad);
+    const slowestSpeed = getSquadSlowestSpeed(squad);
+    validUnits.forEach(uid => {
+      const unit = gameState.units.get(uid);
+      if (unit) {
+        unit.squadId = squadId;
+        unit.speed = slowestSpeed;
+      }
+    });
+    // Immediately form up: move units into formation around their center
+    // Temporarily ignore collision so units can quickly arrange
+    const aliveUnits = getSquadAliveUnits(squad);
+    if (aliveUnits.length >= 2) {
+      const cx = aliveUnits.reduce((s, u) => s + u.x, 0) / aliveUnits.length;
+      const cy = aliveUnits.reduce((s, u) => s + u.y, 0) / aliveUnits.length;
+      let avgAngle = 0;
+      const angles = aliveUnits.filter(u => u.angle !== undefined).map(u => u.angle);
+      if (angles.length > 0) {
+        const sx = angles.reduce((s, a) => s + Math.cos(a), 0);
+        const sy = angles.reduce((s, a) => s + Math.sin(a), 0);
+        avgAngle = Math.atan2(sy, sx);
+      }
+      // Store squad state
+      squad.centerX = cx;
+      squad.centerY = cy;
+      squad.targetX = cx;
+      squad.targetY = cy;
+      squad.moveAngle = avgAngle;
+      squad.moving = false;
+      squad.centerWaypoints = null;
+
+      const fPositions = getSquadFormationPositions(aliveUnits, cx, cy, avgAngle, squad.formationType);
+      const formingUpUntil = Date.now() + 4000;
+      fPositions.forEach(({ unit, x, y }) => {
+        unit.squadOffsetX = x - cx;
+        unit.squadOffsetY = y - cy;
+        unit.speed = slowestSpeed;
+        unit.holdPosition = false;
+        unit.attackMove = false;
+        unit.attackTargetId = null;
+        unit.attackTargetType = null;
+        unit.angle = avgAngle;
+        unit.formingUp = true;
+        unit.formingUpUntil = formingUpUntil;
+        resetNavalAvoidanceState(unit);
+        assignMoveTarget(unit, x, y);
+      });
+    }
+    socket.emit('squadCreated', { squadId, unitIds: validUnits, formationType: squad.formationType });
+  });
+
+  socket.on('setFormationType', (data) => {
+    switchRoom(socket.roomId);
+    const sqId = data?.squadId;
+    const fType = data?.formationType;
+    if (!sqId || !fType || !['trapezoid', 'diamond'].includes(fType)) return;
+    const sq = gameState.squads.get(sqId);
+    if (!sq || sq.ownerId !== socket.userId) return;
+    sq.formationType = fType;
+    const sUnits = getSquadAliveUnits(sq);
+    if (sUnits.length > 0) {
+      const cx2 = sUnits.reduce((s, u) => s + u.x, 0) / sUnits.length;
+      const cy2 = sUnits.reduce((s, u) => s + u.y, 0) / sUnits.length;
+      const pos = getSquadFormationPositions(sUnits, sq.targetX || cx2, sq.targetY || cy2, sq.moveAngle || 0, fType);
+      const spd = getSquadSlowestSpeed(sq);
+      const fUntil = Date.now() + 3000;
+      pos.forEach(({ unit, x, y }) => {
+        unit.squadOffsetX = x - (sq.centerX || cx2);
+        unit.squadOffsetY = y - (sq.centerY || cy2);
+        unit.speed = spd;
+        unit.formingUp = true;
+        unit.formingUpUntil = fUntil;
+        assignMoveTarget(unit, x, y);
+      });
+    }
+    socket.emit('formationTypeChanged', { squadId: sqId, formationType: fType });
+  });
+
+  socket.on('disbandSquad', (data) => {
+    switchRoom(socket.roomId);
+    const squadId = data?.squadId;
+    const squad = gameState.squads.get(squadId);
+    if (!squad || squad.ownerId !== socket.userId) return;
+    disbandSquadInternal(squadId);
+    socket.emit('squadDisbanded', { squadId });
+  });
+
+  socket.on('attackMoveUnits', (data) => {
+    switchRoom(socket.roomId);
+    const { unitIds, targetX, targetY } = data;
+    const movableUnits = [];
+    const squadsMoved = new Set();
+    (Array.isArray(unitIds) ? unitIds : []).forEach(unitId => {
+      const unit = gameState.units.get(unitId);
+      if (unit && unit.type === 'missile_launcher' && unit.deployState !== 'mobile') return;
+      if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
+        if (unit.squadId && !squadsMoved.has(unit.squadId)) {
+          const squad = gameState.squads.get(unit.squadId);
+          if (squad) {
+            squadsMoved.add(unit.squadId);
+            issueSquadAttackMove(squad, targetX, targetY);
+          }
+        } else if (!unit.squadId) {
+          movableUnits.push(unit);
+        }
+      }
+    });
+    if (movableUnits.length > 0) {
+      issueGroupedMoveOrder(movableUnits, targetX, targetY);
+      movableUnits.forEach(unit => {
+        unit.holdPosition = false;
+        unit.attackMove = true;
+        unit.attackTargetId = null;
+        unit.attackTargetType = null;
+      });
+    }
   });
   
   socket.on('buildUnit', (data) => {
@@ -4897,7 +5455,7 @@ io.on('connection', (socket) => {
       player.missiles = Math.max(0, normalizeStoredSlbmCount(player.missiles) - 1);
       unit.slbmReloadReadyAt = firedAt + SUBMARINE_SLBM_RELOAD_MS;
       // Fire SLBM - tracked entity
-      unit.stealthCooldownUntil = now + SUBMARINE_STEALTH_COOLDOWN_MS;
+      unit.stealthCooldownUntil = firedAt + SUBMARINE_STEALTH_COOLDOWN_MS;
       unit.stealthActive = false;
       unit.isDetected = true; // Firing reveals submarine
       unit.lastAttackTime = firedAt;
@@ -5266,18 +5824,31 @@ io.on('connection', (socket) => {
     switchRoom(socket.roomId);
     const { unitIds, targetX, targetY } = data;
     const movableUnits = [];
-    unitIds.forEach(unitId => {
+    const squadsMoved = new Set();
+    (Array.isArray(unitIds) ? unitIds : []).forEach(unitId => {
       const unit = gameState.units.get(unitId);
-      if (unit && unit.type === 'missile_launcher') return;
+      if (unit && unit.type === 'missile_launcher' && unit.deployState !== 'mobile') return;
       if (unit && unit.userId === socket.userId && canAcceptPlayerOrders(unit)) {
-        movableUnits.push(unit);
+        if (unit.squadId && !squadsMoved.has(unit.squadId)) {
+          const squad = gameState.squads.get(unit.squadId);
+          if (squad) {
+            squadsMoved.add(unit.squadId);
+            issueSquadAttackMove(squad, targetX, targetY);
+          }
+        } else if (!unit.squadId) {
+          movableUnits.push(unit);
+        }
       }
     });
-    issueGroupedMoveOrder(movableUnits, targetX, targetY);
-    movableUnits.forEach(unit => {
-      unit.holdPosition = false;
-      unit.attackMove = true;
-    });
+    if (movableUnits.length > 0) {
+      issueGroupedMoveOrder(movableUnits, targetX, targetY);
+      movableUnits.forEach(unit => {
+        unit.holdPosition = false;
+        unit.attackMove = true;
+        unit.attackTargetId = null;
+        unit.attackTargetType = null;
+      });
+    }
   });
 
   socket.on('holdPosition', (data) => {
@@ -6187,6 +6758,158 @@ function resolveActiveSlbmImpacts(now) {
 
 function updateGame(deltaTime) {
   const now = Date.now();
+
+  // Squad maintenance: remove dead units, disband small squads
+  gameState.squads.forEach((squad, squadId) => {
+    cleanupSquad(squadId);
+  });
+
+  // Per-tick squad formation enforcement: smooth interpolation + waypoint pathfinding
+  gameState.squads.forEach((squad, squadId) => {
+    if (!squad) return;
+    const units = getSquadAliveUnits(squad);
+    if (units.length < 2) return;
+
+    const slowestSpeed = getSquadSlowestSpeed(squad);
+    units.forEach(u => { u.speed = slowestSpeed; });
+
+    // Initialize centerX/Y if missing
+    if (!Number.isFinite(squad.centerX) || !Number.isFinite(squad.centerY)) {
+      squad.centerX = units.reduce((s, u) => s + u.x, 0) / units.length;
+      squad.centerY = units.reduce((s, u) => s + u.y, 0) / units.length;
+    }
+
+    // Move virtual center along waypoints or straight to target
+    if (squad.moving && Number.isFinite(squad.targetX) && Number.isFinite(squad.targetY)) {
+      const centerStep = slowestSpeed * deltaTime * 60;
+
+      // Follow waypoints if available
+      if (squad.centerWaypoints && squad.centerWaypoints.length > 0) {
+        const wp = squad.centerWaypoints[0];
+        const wdx = wp.x - squad.centerX;
+        const wdy = wp.y - squad.centerY;
+        const wDist = Math.hypot(wdx, wdy);
+        // Update moveAngle to face current waypoint direction
+        if (wDist > 1) squad.moveAngle = Math.atan2(wdy, wdx);
+        if (wDist < centerStep + 5) {
+          squad.centerX = wp.x;
+          squad.centerY = wp.y;
+          squad.centerWaypoints.shift();
+          if (squad.centerWaypoints.length === 0) squad.centerWaypoints = null;
+        } else {
+          squad.centerX += (wdx / wDist) * centerStep;
+          squad.centerY += (wdy / wDist) * centerStep;
+        }
+      } else {
+        // Move straight to target
+        const tdx = squad.targetX - squad.centerX;
+        const tdy = squad.targetY - squad.centerY;
+        const tDist = Math.hypot(tdx, tdy);
+        if (tDist < 10) {
+          squad.centerX = squad.targetX;
+          squad.centerY = squad.targetY;
+          squad.moving = false;
+        } else {
+          const step = Math.min(tDist, centerStep);
+          squad.centerX += (tdx / tDist) * step;
+          squad.centerY += (tdy / tDist) * step;
+        }
+      }
+
+      // Check final arrival
+      const finalDx = squad.targetX - squad.centerX;
+      const finalDy = squad.targetY - squad.centerY;
+      if (Math.hypot(finalDx, finalDy) < 10) {
+        squad.centerX = squad.targetX;
+        squad.centerY = squad.targetY;
+        squad.moving = false;
+        squad.centerWaypoints = null;
+      }
+    }
+
+    // Smooth-move each unit toward center + offset (no teleporting)
+    const cx = squad.centerX;
+    const cy = squad.centerY;
+    const catchUpSpeed = slowestSpeed * deltaTime * 60 * 2.5; // Allow faster catch-up
+
+    units.forEach(u => {
+      if (u.formingUp) return; // Still using normal movement for initial formation
+      if (!Number.isFinite(u.squadOffsetX) || !Number.isFinite(u.squadOffsetY)) return;
+
+      const desiredX = cx + u.squadOffsetX;
+      const desiredY = cy + u.squadOffsetY;
+      const dx = desiredX - u.x;
+      const dy = desiredY - u.y;
+      const dist = Math.hypot(dx, dy);
+
+      if (dist < 1) {
+        // Close enough, snap
+        u.x = desiredX;
+        u.y = desiredY;
+      } else {
+        const step = Math.min(dist, catchUpSpeed);
+        const nx = u.x + (dx / dist) * step;
+        const ny = u.y + (dy / dist) * step;
+
+        // Validate terrain before moving
+        let canMove = true;
+        if (isNavalUnitType(u.type)) {
+          canMove = isNavalPositionTerrainPassable(u, nx, ny);
+        } else if (isLandCombatUnitType(u.type)) {
+          canMove = isOnLand(nx, ny);
+        }
+
+        if (canMove) {
+          const clamped = clampToMapBounds(nx, ny);
+          u.x = clamped.x;
+          u.y = clamped.y;
+        }
+        // If terrain blocks, unit stays put (will catch up later)
+      }
+
+      // Keep individual movement cleared
+      u.targetX = null;
+      u.targetY = null;
+      u.pathWaypoints = null;
+      u.angle = squad.moveAngle || u.angle;
+
+      if (squad.attackMove) {
+        u.attackMove = true;
+      }
+    });
+
+    // Post-formation collision separation: push overlapping squad-mates apart
+    if (!squad.moving) {
+      for (let i = 0; i < units.length; i++) {
+        if (units[i].formingUp) continue;
+        const ui = units[i];
+        const eiA = getSelectionEllipseForUnit(ui);
+        for (let j = i + 1; j < units.length; j++) {
+          if (units[j].formingUp) continue;
+          const uj = units[j];
+          if (doSelectionEllipsesOverlapWithPadding(ui, ui.x, ui.y, uj, uj.x, uj.y, NAVAL_COLLISION_CLEARANCE_BUFFER)) {
+            const sdx = uj.x - ui.x;
+            const sdy = uj.y - ui.y;
+            const sDist = Math.hypot(sdx, sdy);
+            if (sDist < 0.1) continue;
+            const pushStr = 1.5 * deltaTime * 60;
+            const pnx = sdx / sDist;
+            const pny = sdy / sDist;
+            ui.x -= pnx * pushStr;
+            ui.y -= pny * pushStr;
+            uj.x += pnx * pushStr;
+            uj.y += pny * pushStr;
+            // Update offsets to reflect pushed positions
+            ui.squadOffsetX = ui.x - cx;
+            ui.squadOffsetY = ui.y - cy;
+            uj.squadOffsetX = uj.x - cx;
+            uj.squadOffsetY = uj.y - cy;
+          }
+        }
+      }
+    }
+  });
+
   const navalMovementSpatialIndex = new Map();
   gameState.units.forEach(unit => {
     if (usesNavalContactCollision(unit) && gameState.units.has(unit.id)) {
@@ -6282,14 +7005,22 @@ function updateGame(deltaTime) {
       }
     }
 
-    // Movement
-    if (unit.targetX !== null && unit.targetY !== null) {
+    // Movement - skip units controlled by squad (unless still forming up)
+    if (unit.squadId && !unit.formingUp) {
+      // Squad units are positioned directly by the per-tick squad loop above
+      // Do nothing here — skip all individual movement/pathfinding/collision
+    } else if (unit.targetX !== null && unit.targetY !== null) {
       const moveStartX = unit.x;
       const moveStartY = unit.y;
       const dx = unit.targetX - unit.x;
       const dy = unit.targetY - unit.y;
       const distance = Math.sqrt(dx * dx + dy * dy);
       
+      // Clear formingUp flag based on timeout
+      if (unit.formingUp && (!unit.formingUpUntil || Date.now() >= unit.formingUpUntil)) {
+        unit.formingUp = false;
+        unit.formingUpUntil = null;
+      }
       if (distance > 5) {
         unit.angle = Math.atan2(dy, dx);
         let moveStep = Math.min(distance, unit.speed * deltaTime * 60);
@@ -6479,6 +7210,11 @@ function updateGame(deltaTime) {
           }
         } else {
           unit.pathWaypoints = null;
+        }
+        // Clear formingUp when unit has finished all movement
+        if (unit.formingUp && unit.targetX === null && unit.targetY === null && !unit.pathWaypoints) {
+          unit.formingUp = false;
+          unit.formingUpUntil = null;
         }
         if (usesNavalContactCollision(unit) && unit.targetX === null && unit.targetY === null && !unit.pathWaypoints) {
           unit.navalAvoidanceSideBias = null;
@@ -7355,6 +8091,8 @@ function updateGame(deltaTime) {
           if (j <= i) continue;
           const b = unitArray[j];
           if (!usesNavalContactCollision(b)) continue;
+          // Skip collision between same-squad units during formation movement
+          if (a.squadId && a.squadId === b.squadId && (a.targetX !== null || b.targetX !== null)) continue;
 
           let dx = b.x - a.x;
           let dy = b.y - a.y;
