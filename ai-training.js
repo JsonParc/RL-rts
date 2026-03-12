@@ -78,27 +78,45 @@ function isGoogleDriveUrl(url) {
   return /drive\.google\.com|drive\.usercontent\.google\.com/.test(String(url || ''));
 }
 
+function extractHtmlAttribute(tag, attrName) {
+  const match = String(tag || '').match(new RegExp(`${attrName}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
+  return match ? decodeHtmlEntities(match[2]) : null;
+}
+
 function extractGoogleDriveDownloadUrl(html, currentUrl) {
   const downloadUrlMatch = html.match(/"downloadUrl":"([^"]+)"/i);
   if (downloadUrlMatch) {
     return decodeGoogleDriveEscapedUrl(downloadUrlMatch[1]);
   }
 
-  const hrefMatch = html.match(/href="(\/uc\?export=download[^"]+)"/i);
+  const hrefMatch = html.match(/href\s*=\s*(['"])(\/[^'"]*export=download[^'"]*|https?:\/\/[^'"]*(?:export=download|drive\.usercontent\.google\.com\/download)[^'"]*)\1/i);
   if (hrefMatch) {
-    return new URL(decodeHtmlEntities(hrefMatch[1]), currentUrl).toString();
+    return new URL(decodeGoogleDriveEscapedUrl(hrefMatch[2]), currentUrl).toString();
   }
 
-  const formMatch = html.match(/<form[^>]+action="([^"]*uc\?export=download[^"]*)"/i);
-  if (formMatch) {
-    const actionUrl = new URL(decodeHtmlEntities(formMatch[1]), currentUrl);
-    const inputRegex = /<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi;
+  const formRegex = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+  let formMatch;
+  while ((formMatch = formRegex.exec(html)) !== null) {
+    const formAttrs = formMatch[1] || '';
+    const formBody = formMatch[2] || '';
+    const action = extractHtmlAttribute(formAttrs, 'action');
+    if (!action) continue;
+    const actionUrl = new URL(decodeGoogleDriveEscapedUrl(action), currentUrl);
+    const actionText = actionUrl.toString();
+    if (!/export=download|drive\.usercontent\.google\.com\/download/i.test(actionText)) {
+      continue;
+    }
+
+    const inputRegex = /<input\b([^>]*)>/gi;
     let inputMatch;
-    while ((inputMatch = inputRegex.exec(html)) !== null) {
-      actionUrl.searchParams.set(
-        decodeHtmlEntities(inputMatch[1]),
-        decodeHtmlEntities(inputMatch[2])
-      );
+    while ((inputMatch = inputRegex.exec(formBody)) !== null) {
+      const inputAttrs = inputMatch[1] || '';
+      const type = (extractHtmlAttribute(inputAttrs, 'type') || '').toLowerCase();
+      const name = extractHtmlAttribute(inputAttrs, 'name');
+      const value = extractHtmlAttribute(inputAttrs, 'value') || '';
+      if (!name) continue;
+      if (type && type !== 'hidden') continue;
+      actionUrl.searchParams.set(name, value);
     }
     return actionUrl.toString();
   }
