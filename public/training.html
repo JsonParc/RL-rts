@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>MW Craft - AI 학습 관리</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; padding: 30px; }
+.container { width: 560px; background: #1a1f25; border: 2px solid #4a9eff; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; }
+.header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: #252b33; border-bottom: 1px solid #333; }
+.header h2 { color: #4a9eff; font-size: 18px; }
+.header a { color: #888; text-decoration: none; font-size: 13px; }
+.header a:hover { color: #4a9eff; }
+.body { padding: 16px; }
+.info-box { background: #0d1117; border: 1px solid #333; border-radius: 6px; padding: 10px; margin-bottom: 14px; font-size: 12px; color: #8b949e; line-height: 1.6; }
+.tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+.tab { flex: 1; padding: 8px; border: 2px solid #555; border-radius: 8px; background: #1a1f25; color: #888; font-weight: bold; font-size: 14px; cursor: pointer; text-align: center; transition: all 0.2s; }
+.tab.active { border-color: #4a9eff; color: #4a9eff; background: #1a2332; }
+.tab[data-diff="expert"].active { border-color: #ff6b6b; color: #ff6b6b; }
+.summary-row { display: flex; gap: 8px; margin-bottom: 14px; }
+.summary-card { flex: 1; background: #0d1117; border: 1px solid #333; border-radius: 6px; padding: 8px; font-size: 12px; }
+.summary-card .label { font-weight: bold; margin-bottom: 4px; }
+.summary-card .label.hard { color: #4a9eff; }
+.summary-card .label.expert { color: #ff6b6b; }
+.stats { background: #0d1117; border: 1px solid #333; border-radius: 6px; padding: 10px; margin-bottom: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 13px; }
+.stats div { display: flex; justify-content: space-between; }
+.stats .val { color: #4a9eff; font-weight: bold; }
+.presets { margin-bottom: 14px; }
+.presets .label { color: #aaa; font-size: 12px; margin-bottom: 6px; }
+.preset-btn { padding: 6px 12px; margin: 3px; border: 1px solid #555; border-radius: 6px; background: #1a2332; color: #4a9eff; cursor: pointer; font-size: 13px; transition: background 0.2s; }
+.preset-btn:hover { background: #2a3a52; border-color: #4a9eff; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.controls label { color: #aaa; font-size: 12px; }
+.controls input[type="number"] { width: 100px; padding: 6px; background: #0d1117; color: #fff; border: 1px solid #555; border-radius: 6px; font-size: 13px; }
+.btn { padding: 6px 14px; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; transition: opacity 0.2s; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-start { background: #238636; color: #fff; }
+.btn-stop { background: #da3633; color: #fff; }
+.btn-freeze { background: #2d1b4e; color: #d4a5ff; }
+.btn-freeze.frozen { background: #1b4e2d; color: #a5ffd4; }
+.btn-reset { background: #8b4513; color: #fff; }
+.chk-row { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+.chk-row label { color: #aaa; font-size: 12px; cursor: pointer; }
+.log { max-height: 200px; overflow-y: auto; background: #0d1117; border: 1px solid #333; border-radius: 6px; padding: 10px; font-size: 11px; font-family: monospace; color: #8b949e; }
+.log div { padding: 2px 0; border-bottom: 1px solid #1a1f25; }
+.frozen-badge { color: #ff4444; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h2>🧠 AI 강화학습 관리</h2>
+        <a href="/">← 게임으로 돌아가기</a>
+    </div>
+    <div class="body">
+        <div class="info-box">
+            💡 난이도별로 독립된 가중치(Q-table)를 사용합니다.<br>
+            <b style="color:#4a9eff;">어려움</b>과 <b style="color:#ff6b6b;">전문가</b>를 각각 따로 학습시키세요.<br>
+            🔒 고정하면 학습/온라인 업데이트가 차단됩니다.<br>
+            ⚔️ <b>셀프플레이:</b> N명의 AI가 FFA 대전하여 압도적 승리를 학습합니다.
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" data-diff="hard">🔵 어려움</div>
+            <div class="tab" data-diff="expert">🔴 전문가</div>
+        </div>
+
+        <div class="summary-row">
+            <div class="summary-card">
+                <div class="label hard">어려움</div>
+                <div>상태: <span id="sumHardStates">0</span> | 학습: <span id="sumHardEpisodes">0</span></div>
+                <div id="sumHardFrozen" style="color:#888;">🔓 활성</div>
+            </div>
+            <div class="summary-card">
+                <div class="label expert">전문가</div>
+                <div>상태: <span id="sumExpertStates">0</span> | 학습: <span id="sumExpertEpisodes">0</span></div>
+                <div id="sumExpertFrozen" style="color:#888;">🔓 활성</div>
+            </div>
+        </div>
+
+        <div class="stats">
+            <div>상태: <span class="val" id="trainStatus">대기중</span></div>
+            <div><span id="trainFrozenBadge" class="frozen-badge" style="display:none;">🔒 고정됨</span></div>
+            <div>에피소드: <span class="val"><span id="trainEpisode">0</span> / <span id="trainMaxEpisode">0</span></span></div>
+            <div>총 학습: <span class="val" id="trainTotalEpisodes">0</span></div>
+            <div>탐색 상태: <span class="val" id="trainStates">0</span></div>
+            <div>평균 보상: <span class="val" id="trainAvgReward">0</span></div>
+            <div>탐험률(ε): <span class="val" id="trainEpsilon">0.3</span></div>
+        </div>
+
+        <div id="selfPlayStats" style="display:none; background: #0d1117; border: 1px solid #f0a030; border-radius: 6px; padding: 10px; margin-bottom: 14px; font-size: 13px;">
+            <div style="color: #f0a030; font-weight: bold; margin-bottom: 6px;">⚔️ 셀프플레이 통계</div>
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 4px;">
+                <div>매치 수: <span class="val" id="spMatches">0</span></div>
+                <div>에이전트: <span class="val" id="spAgents">0</span>명</div>
+                <div>평균 승리마진: <span class="val" id="spMargin">0</span></div>
+                <div>평균 생존: <span class="val" id="spSurvivors">0</span></div>
+            </div>
+            <div style="margin-top: 6px;">ELO: <span class="val" id="spElo" style="font-size:11px;">-</span></div>
+        </div>
+
+        <div class="presets">
+            <div class="label">빠른 시작:</div>
+            <button class="preset-btn" data-ep="500">⚡ 500</button>
+            <button class="preset-btn" data-ep="5000">🔥 5,000</button>
+            <button class="preset-btn" data-ep="50000">💪 50,000</button>
+            <button class="preset-btn" data-ep="200000">🏆 200,000</button>
+        </div>
+
+        <div class="controls" style="margin-bottom: 8px;">
+            <label>모드:</label>
+            <select id="modeSelect" style="padding: 6px; background: #0d1117; color: #fff; border: 1px solid #555; border-radius: 6px; font-size: 13px;">
+                <option value="solo">🎯 솔로 (기존)</option>
+                <option value="selfplay">⚔️ 셀프플레이</option>
+            </select>
+            <label id="agentLabel" style="display:none;">에이전트:</label>
+            <select id="agentSelect" style="display:none; padding: 6px; background: #0d1117; color: #fff; border: 1px solid #555; border-radius: 6px; font-size: 13px;">
+                <option value="2">2명</option>
+                <option value="3">3명</option>
+                <option value="4" selected>4명</option>
+                <option value="6">6명</option>
+                <option value="8">8명</option>
+            </select>
+        </div>
+
+        <div class="controls">
+            <label>에피소드:</label>
+            <input type="number" id="epInput" value="5000" min="10" max="999999">
+            <button class="btn btn-start" id="startBtn">학습 시작</button>
+            <button class="btn btn-stop" id="stopBtn" disabled>중단</button>
+        </div>
+
+        <div class="chk-row">
+            <input type="checkbox" id="contChk">
+            <label for="contChk">연속 학습 (끝나면 자동 재시작)</label>
+        </div>
+
+        <div class="controls">
+            <button class="btn btn-freeze" id="freezeBtn">🔒 고정</button>
+            <button class="btn btn-reset" id="resetBtn">초기화</button>
+        </div>
+
+        <div class="log" id="logDiv"></div>
+    </div>
+</div>
+
+<script>
+let diff = 'hard';
+let polling = null;
+
+document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+        diff = t.dataset.diff;
+        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+        t.classList.add('active');
+        poll();
+    });
+});
+
+document.querySelectorAll('.preset-btn').forEach(b => {
+    b.addEventListener('click', () => { document.getElementById('epInput').value = b.dataset.ep; });
+});
+
+// Mode selector: show/hide agent count
+document.getElementById('modeSelect').addEventListener('change', function() {
+    const isSP = this.value === 'selfplay';
+    document.getElementById('agentLabel').style.display = isSP ? '' : 'none';
+    document.getElementById('agentSelect').style.display = isSP ? '' : 'none';
+    document.getElementById('startBtn').textContent = isSP ? '⚔️ 셀프플레이 시작' : '학습 시작';
+});
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+    const episodes = parseInt(document.getElementById('epInput').value) || 5000;
+    const continuous = document.getElementById('contChk').checked;
+    const mode = document.getElementById('modeSelect').value;
+    const numAgents = parseInt(document.getElementById('agentSelect').value) || 4;
+    const res = await fetch('/api/ai-training/start', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ episodes, continuous, difficulty: diff, mode, numAgents })
+    });
+    const data = await res.json();
+    if (data.frozen) { alert('이 난이도는 고정 상태입니다. 해제 후 학습하세요.'); return; }
+    if (data.started) {
+        document.getElementById('startBtn').disabled = true;
+        document.getElementById('stopBtn').disabled = false;
+        startPoll();
+    }
+});
+
+document.getElementById('stopBtn').addEventListener('click', async () => {
+    await fetch('/api/ai-training/stop', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ difficulty: diff })
+    });
+    document.getElementById('stopBtn').disabled = true;
+    document.getElementById('startBtn').disabled = false;
+});
+
+document.getElementById('freezeBtn').addEventListener('click', async () => {
+    const st = await (await fetch('/api/ai-training/status?difficulty=' + diff)).json();
+    await fetch('/api/ai-training/freeze', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ difficulty: diff, freeze: !st.frozen })
+    });
+    poll();
+});
+
+document.getElementById('resetBtn').addEventListener('click', async () => {
+    const label = diff === 'hard' ? '어려움' : '전문가';
+    if (!confirm('[' + label + '] 가중치를 초기화하시겠습니까?')) return;
+    await fetch('/api/ai-training/reset', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ difficulty: diff })
+    });
+    poll();
+});
+
+function startPoll() { stopPoll(); poll(); polling = setInterval(poll, 2000); }
+function stopPoll() { if (polling) { clearInterval(polling); polling = null; } }
+
+async function poll() {
+    try {
+        const data = await (await fetch('/api/ai-training/status?difficulty=' + diff)).json();
+        document.getElementById('trainStatus').textContent = data.isTraining ? '학습 중...' : '대기중';
+        const fb = document.getElementById('trainFrozenBadge');
+        fb.style.display = data.frozen ? 'inline' : 'none';
+        const fb2 = document.getElementById('freezeBtn');
+        fb2.textContent = data.frozen ? '🔓 해제' : '🔒 고정';
+        fb2.className = 'btn btn-freeze' + (data.frozen ? ' frozen' : '');
+        document.getElementById('trainEpisode').textContent = data.currentEpisode || 0;
+        document.getElementById('trainMaxEpisode').textContent = data.maxEpisodes || 0;
+        document.getElementById('trainTotalEpisodes').textContent = data.stats ? data.stats.episodes : 0;
+        if (data.stats) {
+            document.getElementById('trainStates').textContent = data.stats.states || 0;
+            document.getElementById('trainAvgReward').textContent = data.stats.avgReward || 0;
+            document.getElementById('trainEpsilon').textContent = data.stats.epsilon || 0;
+        }
+        // Self-play stats section
+        const spDiv = document.getElementById('selfPlayStats');
+        if (data.selfPlay) {
+            spDiv.style.display = 'block';
+            document.getElementById('spMatches').textContent = data.selfPlay.matches || 0;
+            document.getElementById('spAgents').textContent = data.selfPlay.numAgents || 0;
+            document.getElementById('spMargin').textContent = data.selfPlay.avgVictoryMargin || 0;
+            document.getElementById('spSurvivors').textContent = data.selfPlay.avgSurvivors || 0;
+            document.getElementById('spElo').textContent = data.selfPlay.eloRatings
+                ? data.selfPlay.eloRatings.map((r, i) => 'A' + (i+1) + ':' + r).join(' | ')
+                : '-';
+        } else {
+            spDiv.style.display = 'none';
+        }
+        const log = document.getElementById('logDiv');
+        if (data.log && data.log.length) {
+            log.innerHTML = data.log.map(l => '<div>' + l + '</div>').join('');
+            log.scrollTop = log.scrollHeight;
+        }
+        if (!data.isTraining) {
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+        }
+        if (data.allDifficulties) {
+            for (const [d, info] of Object.entries(data.allDifficulties)) {
+                const cap = d === 'hard' ? 'Hard' : 'Expert';
+                const stEl = document.getElementById('sum' + cap + 'States');
+                if (stEl) stEl.textContent = info.stats.states || 0;
+                const epEl = document.getElementById('sum' + cap + 'Episodes');
+                if (epEl) epEl.textContent = info.stats.episodes || 0;
+                const frEl = document.getElementById('sum' + cap + 'Frozen');
+                if (frEl) {
+                    frEl.textContent = info.frozen ? '🔒 고정됨' : (info.isTraining ? '⚡ 학습중' : '🔓 활성');
+                    frEl.style.color = info.frozen ? '#ff4444' : (info.isTraining ? '#4aff4a' : '#888');
+                }
+            }
+        }
+    } catch(e) { console.error(e); }
+}
+
+// Start polling immediately
+startPoll();
+</script>
+</body>
+</html>

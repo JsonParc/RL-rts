@@ -7,10 +7,28 @@ const Database = require('better-sqlite3');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
+const BENCHMARK_MODE = process.env.MW_BENCHMARK === '1';
+const RL_WEIGHT_UPDATES_ENABLED = process.env.MW_ALLOW_RL_WEIGHT_UPDATES === '1';
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
+const aiTraining = require('./ai-training');
+// Separate training sessions for each RL-enabled difficulty
+const trainingSessions = BENCHMARK_MODE
+  ? { hard: null, expert: null }
+  : {
+    hard: new aiTraining.TrainingSession('hard'),
+    expert: new aiTraining.TrainingSession('expert')
+  };
+if (!RL_WEIGHT_UPDATES_ENABLED) {
+  Object.values(trainingSessions).forEach((session) => {
+    if (session) {
+      session.frozen = true;
+    }
+  });
+}
+const DIFFICULTY_PRESETS = aiTraining.DIFFICULTY_PRESETS;
 const APP_NAME = 'MW Craft';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
 const GAME_TICK_RATE = 30; // 30 ticks per second
@@ -22,6 +40,11 @@ const COLLISION_SPATIAL_CELL_SIZE = 400;
 const NETWORK_UPDATE_BASE_MS = 100;
 const NETWORK_VIEWPORT_MARGIN_WORLD = 2200;
 const NETWORK_VIEWPORT_STATE_STALE_MS = 5000;
+const PERF_DEBUG_ENABLED = BENCHMARK_MODE || process.env.MW_PERF_DEBUG === '1';
+const PERF_LOG_INTERVAL_MS = Math.max(1000, Number(process.env.MW_PERF_LOG_INTERVAL_MS || 5000));
+const PERF_LOG_TOP_N = Math.max(5, Number(process.env.MW_PERF_TOP_N || 12));
+const PATH_CACHE_TTL_MS = 15000;
+const PATH_CACHE_MAX_ENTRIES = 8000;
 const SLBM_DAMAGE_RADIUS = 800;
 const AIRSTRIKE_DAMAGE_RADIUS = 400;
 const AIRSTRIKE_VISUAL_RADIUS = 400;
@@ -30,7 +53,7 @@ const AIRSTRIKE_TOTAL_DAMAGE = 720;
 const AIRSTRIKE_DAMAGE_PER_PASS = AIRSTRIKE_TOTAL_DAMAGE / AIRSTRIKE_PASS_COUNT;
 const AIRSTRIKE_PASS_INTERVAL_MS = 667;
 const RECON_AIRCRAFT_MAX_PER_CARRIER = 3;
-const RECON_AIRCRAFT_BUILD_TIME_MS = 18000;
+const RECON_AIRCRAFT_BUILD_TIME_MS = 27000;
 const RECON_AIRCRAFT_LOITER_MS = 8000;
 const RECON_AIRCRAFT_TARGET_THRESHOLD = 160;
 const RECON_AIRCRAFT_DOCK_RADIUS = 90;
@@ -41,7 +64,7 @@ const RED_ZONE_SELECTION_INTERVAL_MS = 10 * 60 * 1000;
 const RED_ZONE_WARNING_DURATION_MS = 30 * 1000;
 const RED_ZONE_COUNTDOWN_START_MS = 10 * 1000;
 const RED_ZONE_POST_BLAST_VISUAL_MS = 5000;
-const RED_ZONE_BLAST_DAMAGE = 999;
+const RED_ZONE_BLAST_DAMAGE = 999999;
 const RED_ZONE_BLAST_RADIUS = SLBM_DAMAGE_RADIUS;
 const RED_ZONE_ISLAND_COUNT = 5;
 const RED_ZONE_MAX_BURSTS = 32;
@@ -55,9 +78,10 @@ const HEADQUARTERS_BUILD_COST = 800;
 const MISSILE_SILO_COST = 1600;
 const CARBASE_BUILD_COST = 350;
 const MISSILE_LAUNCHER_COST = 2200;
-const MISSILE_LAUNCHER_BUILD_TIME_MS = 18000;
+const MISSILE_LAUNCHER_BUILD_TIME_MS = 27000;
 const MISSILE_LAUNCHER_DEPLOY_STAGE_MS = 1000;
 const MISSILE_LAUNCHER_DEPLOYED_RANGE = 2500;
+const BATTLESHIP_COST = 2400;
 const CARRIER_COST = 1600;
 const SUBMARINE_COST = 1800;
 const ASSAULT_SHIP_COST = 1000;
@@ -82,6 +106,8 @@ const STARTING_MAX_POPULATION = Math.min(
   PLAYER_MAX_POPULATION_CAP,
   PLAYER_BASE_POPULATION_CAP + HEADQUARTERS_POPULATION_BONUS
 );
+const STARTING_WORKER_COUNT = 4;
+const LEGACY_WORKER_RESOURCE_GATHERING_ENABLED = false;
 const UNIT_COMBAT_POWER_VALUES = Object.freeze({
   destroyer: 150,
   cruiser: 100,
@@ -110,6 +136,56 @@ const CARBASE_PREREQ_BUILDINGS = Object.freeze([
   'naval_academy',
   'missile_silo'
 ]);
+
+const perfMetrics = new Map();
+let perfWindowStartedAt = Date.now();
+let perfLastFlushAt = Date.now();
+
+function perfNowMs() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+
+function perfRecord(name, elapsedMs = 0, count = 1, detail = 0) {
+  if (!PERF_DEBUG_ENABLED || !name) return;
+  let metric = perfMetrics.get(name);
+  if (!metric) {
+    metric = { totalMs: 0, count: 0, maxMs: 0, detail: 0 };
+    perfMetrics.set(name, metric);
+  }
+  metric.totalMs += elapsedMs;
+  metric.count += count;
+  metric.detail += detail;
+  if (elapsedMs > metric.maxMs) {
+    metric.maxMs = elapsedMs;
+  }
+}
+
+function perfFlush(reason = 'runtime', force = false) {
+  if (!PERF_DEBUG_ENABLED) return;
+  const now = Date.now();
+  if (!force && (now - perfLastFlushAt) < PERF_LOG_INTERVAL_MS) {
+    return;
+  }
+
+  const windowMs = Math.max(1, now - perfWindowStartedAt);
+  const metrics = [...perfMetrics.entries()]
+    .sort((a, b) => b[1].totalMs - a[1].totalMs)
+    .slice(0, PERF_LOG_TOP_N);
+
+  console.log(`[PERF][${reason}] window=${windowMs}ms metrics=${metrics.length}`);
+  metrics.forEach(([name, metric]) => {
+    const avgMs = metric.count > 0 ? (metric.totalMs / metric.count) : 0;
+    const extras = [];
+    if (metric.detail > 0) extras.push(`detail=${metric.detail}`);
+    console.log(
+      `[PERF][${reason}] ${name} total=${metric.totalMs.toFixed(2)}ms count=${metric.count} avg=${avgMs.toFixed(3)}ms max=${metric.maxMs.toFixed(3)}ms${extras.length ? ` ${extras.join(' ')}` : ''}`
+    );
+  });
+
+  perfMetrics.clear();
+  perfWindowStartedAt = now;
+  perfLastFlushAt = now;
+}
 const BUILDING_PLACEMENT_BUFFER = 50;
 const BUILDING_PLACEMENT_SEARCH_RADIUS = 4000;
 const SLBM_MAX_HP = 500;
@@ -137,8 +213,20 @@ const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
 const FRIGATE_ENGINE_OVERDRIVE_TICK_MS = 1000;
 const NAVAL_COLLISION_WAKE_MS = 700;
 const NAVAL_COLLISION_CLEARANCE_BUFFER = 18;
-const NAVAL_REPATH_NO_PROGRESS_TICKS = 6;
-const NAVAL_REPATH_COOLDOWN_MS = 300;
+const NAVAL_REPATH_NO_PROGRESS_TICKS = 18;
+const NAVAL_REPATH_COOLDOWN_MS = 1200;
+const SQUAD_ROTATION_RATE = 0.045;
+const SQUAD_UNIT_TURN_RATE = 0.08;
+const SQUAD_CATCH_UP_SPEED_MULTIPLIER = 2.2;
+const SQUAD_COMMAND_ANGLE_DEADZONE = 48;
+const SQUAD_COMMAND_REISSUE_DISTANCE = 20;
+const SQUAD_HEADING_HYSTERESIS = 0.10;
+const SQUAD_HEADING_FORCE_DELTA = 0.32;
+const SQUAD_HEADING_UPDATE_COOLDOWN_MS = 180;
+const SQUAD_UNIT_FACING_HYSTERESIS = 0.12;
+const SQUAD_FORMATION_RETARGET_INTERVAL_MS = 220;
+const SQUAD_FORMATION_RETARGET_DISTANCE = 90;
+const SQUAD_ANCHOR_WAYPOINT_REACHED_DISTANCE = 120;
 const THREAT_SCAN_EXCLUDED_AIR_TYPES = new Set(['aircraft']);
 const ENABLE_SERVER_FOG_SNAPSHOTS = false;
 const DEFENSE_TOWER_CANNON_BASE_ANGLE = Math.PI / 2; // 6시 방향이 기본 총구 방향
@@ -482,6 +570,8 @@ function getCompletedOwnedBuildingCount(userId, type) {
 }
 
 function canBuildCarbaseForUser(userId) {
+  // AI players bypass strict carbase prerequisites
+  if (userId <= -1000) return true;
   return CARBASE_PREREQ_BUILDINGS.every(type => getCompletedOwnedBuildingCount(userId, type) >= 2);
 }
 
@@ -533,30 +623,49 @@ function createAssaultShipCargoUnit(userId, spawnPoint, cargo = {}) {
     return createMissileLauncherUnit(userId, spawnPoint, cargo);
   }
   if (unitType === 'worker') {
-    const unitConfig = getUnitDefinition('worker');
-    return {
-      id: createUniqueEntityId(450),
-      userId,
-      type: 'worker',
-      x: spawnPoint.x,
-      y: spawnPoint.y,
-      hp: cargo.hp ?? unitConfig.hp,
-      maxHp: cargo.maxHp ?? unitConfig.hp,
-      damage: unitConfig.damage,
-      speed: unitConfig.speed,
-      attackRange: unitConfig.attackRange,
-      attackCooldownMs: unitConfig.attackCooldownMs,
-      targetX: null,
-      targetY: null,
-      gatheringResourceId: null,
-      buildingType: null,
-      buildTargetX: null,
-      buildTargetY: null,
-      isDetected: false,
-      kills: cargo.kills || 0
-    };
+    return createWorkerUnit(userId, spawnPoint, cargo);
   }
   return null;
+}
+
+function createWorkerUnit(userId, spawnPoint, overrides = {}) {
+  const unitConfig = getUnitDefinition('worker');
+  return {
+    id: createUniqueEntityId(450),
+    userId,
+    type: 'worker',
+    x: spawnPoint.x,
+    y: spawnPoint.y,
+    hp: overrides.hp ?? unitConfig.hp,
+    maxHp: overrides.maxHp ?? unitConfig.hp,
+    damage: unitConfig.damage,
+    speed: unitConfig.speed,
+    attackRange: unitConfig.attackRange,
+    attackCooldownMs: unitConfig.attackCooldownMs,
+    targetX: null,
+    targetY: null,
+    gatheringResourceId: null,
+    buildingType: null,
+    buildTargetX: null,
+    buildTargetY: null,
+    isDetected: false,
+    kills: overrides.kills || 0
+  };
+}
+
+function spawnStartingWorkers(userId, centerX, centerY, count = STARTING_WORKER_COUNT) {
+  const spawnedWorkers = [];
+  for (let i = 0; i < count; i++) {
+    const angle = (Math.PI * 2 * i) / Math.max(1, count);
+    const distance = 150;
+    const worker = createWorkerUnit(userId, {
+      x: centerX + Math.cos(angle) * distance,
+      y: centerY + Math.sin(angle) * distance
+    });
+    gameState.units.set(worker.id, worker);
+    spawnedWorkers.push(worker);
+  }
+  return spawnedWorkers;
 }
 
 function getAssaultShipCargoSpawnSize(cargo) {
@@ -744,13 +853,13 @@ function recalculatePlayerMissileStock(userId) {
   return total;
 }
 
-function canPlayerUseBattleshipModeCombo(userId) {
-  return !!gameState.players.get(userId)?.battleshipModeComboUnlocked;
+function canUnitUseBattleshipModeCombo(unit) {
+  return !!(unit && unit.type === 'battleship' && unit.battleshipModeComboUnlocked);
 }
 
 function enforceBattleshipModeCompatibility(unit) {
   if (!unit || unit.type !== 'battleship') return;
-  if (unit.combatStanceActive && unit.battleshipAegisMode && !canPlayerUseBattleshipModeCombo(unit.userId)) {
+  if (unit.combatStanceActive && unit.battleshipAegisMode && !canUnitUseBattleshipModeCombo(unit)) {
     unit.combatStanceActive = false;
     unit.combatStanceStacks = 0;
   }
@@ -797,9 +906,14 @@ function refreshBattleshipModeState(unit) {
 function refreshFrigateEngineOverdrive(unit) {
   if (!unit || unit.type !== 'frigate') return;
   const baseSpeed = getUnitBaseSpeed(unit);
-  unit.speed = unit.engineOverdriveActive
+  const boostedSpeed = unit.engineOverdriveActive
     ? (baseSpeed * FRIGATE_ENGINE_OVERDRIVE_SPEED_MULTIPLIER)
     : baseSpeed;
+  const squad = getUnitSquad(unit);
+  const squadSpeedCap = squad ? getSquadSlowestSpeed(squad) : null;
+  unit.speed = Number.isFinite(squadSpeedCap)
+    ? Math.min(boostedSpeed, squadSpeedCap)
+    : boostedSpeed;
   unit.evasionChance = getFrigateEngineOverdriveEvasionChance(unit);
 }
 
@@ -857,6 +971,7 @@ function initializeUnitRuntimeState(unit) {
     unit.combatStanceActive = !!unit.combatStanceActive;
     unit.combatStanceStacks = clampBattleshipCombatStanceStacks(unit);
     unit.battleshipAegisMode = !!unit.battleshipAegisMode;
+    unit.battleshipModeComboUnlocked = !!unit.battleshipModeComboUnlocked;
     if (!Array.isArray(unit.battleshipAegisTurretCooldowns) || unit.battleshipAegisTurretCooldowns.length !== BATTLESHIP_AEGIS_TURRET_COUNT) {
       unit.battleshipAegisTurretCooldowns = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => 0);
     } else {
@@ -1350,7 +1465,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 80,
     attackCooldownMs: 1200,
     visionRadius: 1000,
-    buildTime: 3000
+    buildTime: 4500
   },
   destroyer: {
     cost: 150,
@@ -1362,7 +1477,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 1250,
     attackCooldownMs: 1000,
     visionRadius: 1000,
-    buildTime: 8000
+    buildTime: 12000
   },
   cruiser: {
     cost: 300,
@@ -1374,7 +1489,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 2000,
     attackCooldownMs: 1300,
     visionRadius: 1200,
-    buildTime: 15000
+    buildTime: 22500
   },
   battleship: {
     cost: 2400,
@@ -1386,7 +1501,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 2500,
     attackCooldownMs: 4800,
     visionRadius: 3200,
-    buildTime: 70000
+    buildTime: 105000
   },
   carrier: {
     cost: CARRIER_COST,
@@ -1398,7 +1513,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 3750,
     attackCooldownMs: 99999,
     visionRadius: 4800,
-    buildTime: 40000
+    buildTime: 60000
   },
   assaultship: {
     cost: ASSAULT_SHIP_COST,
@@ -1410,7 +1525,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 0,
     attackCooldownMs: 99999,
     visionRadius: 1400,
-    buildTime: 26000
+    buildTime: 39000
   },
   submarine: {
     cost: SUBMARINE_COST,
@@ -1422,7 +1537,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 360,
     attackCooldownMs: 7800,
     visionRadius: 800,
-    buildTime: 30000
+    buildTime: 45000
   },
   frigate: {
     cost: 120,
@@ -1434,7 +1549,7 @@ const UNIT_DEFINITIONS = {
     attackRange: 750,
     attackCooldownMs: 800,
     visionRadius: 900,
-    buildTime: 5000
+    buildTime: 7500
   },
   aircraft: {
     cost: 100,
@@ -1556,9 +1671,11 @@ function updateEntitySpatialMapPosition(spatialMap, entity, oldX, oldY, newX = e
 }
 
 function forEachNearbyEntity(spatialMap, x, y, range, callback, cellSize = COMBAT_SPATIAL_CELL_SIZE) {
+  const perfStart = PERF_DEBUG_ENABLED ? perfNowMs() : 0;
   const centerCellX = Math.floor(x / cellSize);
   const centerCellY = Math.floor(y / cellSize);
   const cellRadius = Math.ceil(range / cellSize);
+  let visitedEntities = 0;
 
   for (let dy = -cellRadius; dy <= cellRadius; dy++) {
     for (let dx = -cellRadius; dx <= cellRadius; dx++) {
@@ -1566,9 +1683,14 @@ function forEachNearbyEntity(spatialMap, x, y, range, callback, cellSize = COMBA
       const bucket = spatialMap.get(key);
       if (!bucket) continue;
       for (let i = 0; i < bucket.length; i++) {
+        visitedEntities++;
         callback(bucket[i]);
       }
     }
+  }
+
+  if (PERF_DEBUG_ENABLED) {
+    perfRecord('spatial.query', perfNowMs() - perfStart, 1, visitedEntities);
   }
 }
 
@@ -1843,62 +1965,82 @@ function buildClientUnitsPayload(filterFn = null) {
   gameState.units.forEach(unit => {
     if (filterFn && !filterFn(unit)) return;
     initializeUnitRuntimeState(unit);
-    units.push({
+    // Core properties always sent (round coords to reduce JSON size)
+    const u = {
       id: unit.id,
       userId: unit.userId,
       type: unit.type,
-      x: unit.x,
-      y: unit.y,
+      x: Math.round(unit.x),
+      y: Math.round(unit.y),
       hp: unit.hp,
       maxHp: unit.maxHp,
       speed: unit.speed,
       damage: unit.damage,
       attackRange: unit.attackRange,
-      targetX: unit.targetX,
-      targetY: unit.targetY,
-      gatheringResourceId: unit.gatheringResourceId ?? null,
-      buildingType: unit.buildingType ?? null,
-      buildTargetX: unit.buildTargetX ?? null,
-      buildTargetY: unit.buildTargetY ?? null,
-      sourceDestroyerId: unit.sourceDestroyerId ?? null,
-      isDetected: !!unit.isDetected,
-      kills: unit.kills ?? 0,
-      aimedShot: !!unit.aimedShot,
-      aimedShotCooldownUntil: unit.aimedShotCooldownUntil ?? null,
-      combatStanceActive: !!unit.combatStanceActive,
-      combatStanceStacks: unit.combatStanceStacks ?? 0,
-      battleshipAegisMode: !!unit.battleshipAegisMode,
-      engineOverdriveActive: !!unit.engineOverdriveActive,
-      evasionChance: unit.evasionChance ?? 0,
-      aegisMode: !!unit.aegisMode,
-      isIsolated: !!unit.isIsolated,
-      aircraft: unit.aircraft ?? null,
-      aircraftDeployed: unit.aircraftDeployed ?? null,
-      aircraftQueue: unit.aircraftQueue ?? [],
-      producingAircraft: unit.producingAircraft ?? null,
-      reconAircraft: unit.reconAircraft ?? null,
-      reconAircraftDeployed: unit.reconAircraftDeployed ?? null,
-      reconAircraftQueue: unit.reconAircraftQueue ?? [],
-      producingReconAircraft: unit.producingReconAircraft ?? null,
-      attackMove: !!unit.attackMove,
-      attackTargetId: unit.attackTargetId ?? null,
-      attackTargetType: unit.attackTargetType ?? null,
-      holdPosition: !!unit.holdPosition,
-      deployState: unit.deployState ?? null,
-      deployStateEndsAt: unit.deployStateEndsAt ?? null,
-      loadedSlbms: getSubmarineLoadedSlbmCount(unit),
-      stealthActive: !!unit.stealthActive,
-      stealthExpiresAt: unit.stealthExpiresAt ?? 0,
-      stealthCooldownUntil: unit.stealthCooldownUntil ?? 0,
-      loadedMissileLaunchers: unit.loadedMissileLaunchers ?? [],
-      searchCooldownUntil: unit.searchCooldownUntil ?? null,
-      searchActiveUntil: unit.searchActiveUntil ?? null,
-      airstrikeReady: !!unit.airstrikeReady,
-      airstrikeCooldownUntil: unit.airstrikeCooldownUntil ?? null,
-      isMine: unit.type === 'mine',
-      squadId: unit.squadId ?? null,
-      formationType: unit.squadId ? (gameState.squads.get(unit.squadId)?.formationType || 'trapezoid') : null
-    });
+      angle: unit.angle ?? 0
+    };
+    // Only include non-default properties to reduce payload size
+    if (unit.targetX != null) { u.targetX = Math.round(unit.targetX); u.targetY = Math.round(unit.targetY); }
+    if (unit.gatheringResourceId) u.gatheringResourceId = unit.gatheringResourceId;
+    if (unit.buildingType) u.buildingType = unit.buildingType;
+    if (unit.buildTargetX != null) { u.buildTargetX = unit.buildTargetX; u.buildTargetY = unit.buildTargetY; }
+    if (unit.sourceDestroyerId) u.sourceDestroyerId = unit.sourceDestroyerId;
+    if (unit.isDetected) u.isDetected = true;
+    if (unit.kills) u.kills = unit.kills;
+    if (unit.attackMove) u.attackMove = true;
+    if (unit.attackTargetId) { u.attackTargetId = unit.attackTargetId; u.attackTargetType = unit.attackTargetType; }
+    if (unit.holdPosition) u.holdPosition = true;
+    if (unit.isIsolated) u.isIsolated = true;
+    if (unit.squadId) { u.squadId = unit.squadId; u.formationType = gameState.squads.get(unit.squadId)?.formationType || 'trapezoid'; }
+    // Type-specific properties
+    const t = unit.type;
+    if (t === 'battleship') {
+      if (unit.aimedShot) u.aimedShot = true;
+      if (unit.aimedShotCooldownUntil) u.aimedShotCooldownUntil = unit.aimedShotCooldownUntil;
+      u.combatStanceActive = !!unit.combatStanceActive;
+      if (unit.combatStanceActive) u.combatStanceStacks = unit.combatStanceStacks ?? 0;
+      u.battleshipAegisMode = !!unit.battleshipAegisMode;
+      if (unit.battleshipModeComboUnlocked) u.battleshipModeComboUnlocked = true;
+    }
+    if (t === 'cruiser') {
+      u.aegisMode = !!unit.aegisMode;
+      if (unit.evasionChance) u.evasionChance = unit.evasionChance;
+    }
+    if (t === 'frigate') {
+      u.engineOverdriveActive = !!unit.engineOverdriveActive;
+      if (unit.evasionChance) u.evasionChance = unit.evasionChance;
+    }
+    if (t === 'carrier') {
+      u.aircraft = unit.aircraft ?? null;
+      u.aircraftDeployed = unit.aircraftDeployed ?? null;
+      if (unit.aircraftQueue && unit.aircraftQueue.length) u.aircraftQueue = unit.aircraftQueue;
+      if (unit.producingAircraft) u.producingAircraft = unit.producingAircraft;
+      u.reconAircraft = unit.reconAircraft ?? null;
+      u.reconAircraftDeployed = unit.reconAircraftDeployed ?? null;
+      if (unit.reconAircraftQueue && unit.reconAircraftQueue.length) u.reconAircraftQueue = unit.reconAircraftQueue;
+      if (unit.producingReconAircraft) u.producingReconAircraft = unit.producingReconAircraft;
+      if (unit.airstrikeReady) u.airstrikeReady = true;
+      if (unit.airstrikeCooldownUntil) u.airstrikeCooldownUntil = unit.airstrikeCooldownUntil;
+    }
+    if (t === 'submarine') {
+      u.loadedSlbms = getSubmarineLoadedSlbmCount(unit);
+      if (unit.stealthActive) u.stealthActive = true;
+      if (unit.stealthExpiresAt) u.stealthExpiresAt = unit.stealthExpiresAt;
+      if (unit.stealthCooldownUntil) u.stealthCooldownUntil = unit.stealthCooldownUntil;
+    }
+    if (t === 'destroyer') {
+      if (unit.searchCooldownUntil) u.searchCooldownUntil = unit.searchCooldownUntil;
+      if (unit.searchActiveUntil) u.searchActiveUntil = unit.searchActiveUntil;
+    }
+    if (t === 'missile_launcher') {
+      if (unit.deployState) u.deployState = unit.deployState;
+      if (unit.deployStateEndsAt) u.deployStateEndsAt = unit.deployStateEndsAt;
+    }
+    if (t === 'assault_ship') {
+      if (unit.loadedMissileLaunchers && unit.loadedMissileLaunchers.length) u.loadedMissileLaunchers = unit.loadedMissileLaunchers;
+    }
+    if (t === 'mine') u.isMine = true;
+    units.push(u);
   });
   return units;
 }
@@ -2340,7 +2482,47 @@ try {
 }
 
 app.use(express.json());
+
+// Force no-cache on JS and CSS files to prevent stale script issues
+app.use((req, res, next) => {
+  if (req.path.endsWith('.js') || req.path.endsWith('.css') || req.path.endsWith('.html')) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  }
+  next();
+});
+
+function isLocalTrainingAccessRequest(req) {
+  const host = String(req.hostname || req.get('host') || '').toLowerCase();
+  return (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host.endsWith('.localhost')
+  );
+}
+
+app.use((req, res, next) => {
+  const pathName = String(req.path || '').toLowerCase();
+  const isTrainingPath = (
+    pathName === '/training' ||
+    pathName === '/training.html' ||
+    pathName.startsWith('/api/ai-training')
+  );
+  if (!isTrainingPath || isLocalTrainingAccessRequest(req)) {
+    return next();
+  }
+  return res.status(404).send('Not found');
+});
+
 app.use(express.static('public', { etag: false, maxAge: 0, lastModified: false }));
+
+// AI Training standalone page
+app.get('/training', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'training.html'));
+});
 
 app.get(['/healthz', '/health'], (req, res) => {
   res.status(200).json({ ok: true, app: APP_NAME });
@@ -2358,7 +2540,8 @@ app.get('/api/rooms', (req, res) => {
     const room = gameRooms.get(rc.id);
     const playerCount = room ? Array.from(room.players.values()).filter(p => p.online && !p.isAI).length : 0;
     const aiCount = room ? Array.from(room.players.values()).filter(p => p.isAI).length : 0;
-    return { id: rc.id, name: rc.name, maxPlayers: rc.maxPlayers, playerCount, aiCount };
+    const aiDifficulty = room ? (room.aiDifficulty || 'normal') : 'normal';
+    return { id: rc.id, name: rc.name, maxPlayers: rc.maxPlayers, playerCount, aiCount, aiDifficulty };
   });
   res.json(roomList);
 });
@@ -2378,10 +2561,12 @@ function createRoomState() {
     fogOfWar: new Map(),
     aiRespawnTimers: new Map(),
     squads: new Map(),
+    pathCache: new Map(),
     nextSquadId: 1,
     nextRedZoneId: 1,
     nextRedZoneRollAt: Date.now() + RED_ZONE_SELECTION_INTERVAL_MS,
-    lastRedZoneCountdownSecond: null
+    lastRedZoneCountdownSecond: null,
+    aiDifficulty: 'normal'
   };
 }
 
@@ -2403,10 +2588,9 @@ function roomEmit(event, data) {
 }
 
 function collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialMap, ignoredIds = null) {
+  const perfStart = PERF_DEBUG_ENABLED ? perfNowMs() : 0;
   const blockers = [];
   if (!usesNavalContactCollision(unit) || !navalSpatialMap) return blockers;
-  // Skip collision entirely for units forming up in squad formation
-  if (unit.formingUp) return blockers;
 
   const ownEllipse = getSelectionEllipseForUnit(unit);
   const probeRange = Math.max(320, Math.max(ownEllipse.semiMajor, ownEllipse.semiMinor) + 260);
@@ -2414,13 +2598,14 @@ function collectNavalOverlapBlockers(unit, candidateX, candidateY, navalSpatialM
     if (!other || other.id === unit.id || !gameState.units.has(other.id)) return;
     if (ignoredIds && ignoredIds.has(other.id)) return;
     if (!usesNavalContactCollision(other)) return;
-    // Skip collision between squad-mates during formation
-    if (other.formingUp && unit.squadId && other.squadId === unit.squadId) return;
     const clearancePadding = getNavalBlockerClearancePadding(unit, other, candidateX, candidateY);
     if (doSelectionEllipsesOverlapWithPadding(unit, candidateX, candidateY, other, other.x, other.y, clearancePadding)) {
       blockers.push(other);
     }
   }, COLLISION_SPATIAL_CELL_SIZE);
+  if (PERF_DEBUG_ENABLED) {
+    perfRecord('naval.collectBlockers', perfNowMs() - perfStart, 1, blockers.length);
+  }
   return blockers;
 }
 
@@ -2722,8 +2907,15 @@ function findNavalSteeringMovePosition(unit, desiredX, desiredY, navalSpatialMap
 }
 
 function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
+  const perfStart = PERF_DEBUG_ENABLED ? perfNowMs() : 0;
+  const finishMove = (result) => {
+    if (PERF_DEBUG_ENABLED) {
+      perfRecord('naval.safeMove', perfNowMs() - perfStart);
+    }
+    return result;
+  };
   if (!usesNavalContactCollision(unit) || !navalSpatialMap) {
-    return { x: desiredX, y: desiredY };
+    return finishMove({ x: desiredX, y: desiredY });
   }
   let blockers = collectNavalOverlapBlockers(unit, desiredX, desiredY, navalSpatialMap);
   if (blockers.length > 0 && tryDisplaceStationaryNavalBlockers(unit, desiredX, desiredY, navalSpatialMap, blockers)) {
@@ -2732,7 +2924,7 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
   if (blockers.length === 0) {
     unit.navalBlockedTicks = 0;
     unit.navalAvoidanceSideBias = null;
-    return { x: desiredX, y: desiredY };
+    return finishMove({ x: desiredX, y: desiredY });
   }
 
   // When heavily blocked by moving units with higher priority, yield (stay put)
@@ -2745,14 +2937,14 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
     if (hasHigherPriorityMovingBlocker) {
       // Yield: stay put and let the higher-priority unit pass
       unit.navalBlockedTicks = Math.min(30, currentBlockedTicks + 2);
-      return { x: unit.x, y: unit.y };
+      return finishMove({ x: unit.x, y: unit.y });
     }
   }
 
   const steeringCandidate = findNavalSteeringMovePosition(unit, desiredX, desiredY, navalSpatialMap, blockers);
   if (steeringCandidate) {
     unit.navalBlockedTicks = Math.min(30, Math.max(0, unit.navalBlockedTicks || 0) + 1);
-    return steeringCandidate;
+    return finishMove(steeringCandidate);
   }
 
   // When very heavily blocked and steering failed, try immediate repath
@@ -2784,10 +2976,10 @@ function getSafeNavalMovePosition(unit, desiredX, desiredY, navalSpatialMap) {
   // If binary search found almost no movement, don't jitter - just stay put
   if (movedDistSq < 1.0) {
     unit.navalBlockedTicks = Math.min(30, currentBlockedTicks + 2);
-    return { x: unit.x, y: unit.y };
+    return finishMove({ x: unit.x, y: unit.y });
   }
   unit.navalBlockedTicks = Math.min(30, currentBlockedTicks + 1);
-  return { x: bestX, y: bestY };
+  return finishMove({ x: bestX, y: bestY });
 }
 
 function getUnitFinalMoveTarget(unit) {
@@ -2801,6 +2993,30 @@ function getUnitFinalMoveTarget(unit) {
   return null;
 }
 
+function shouldRefreshChasePath(unit, desiredX, desiredY, now, tolerance = 220, minIntervalMs = 600) {
+  if (!unit || !Number.isFinite(desiredX) || !Number.isFinite(desiredY)) return false;
+  if (!Number.isFinite(now)) return true;
+
+  const finalTarget = getUnitFinalMoveTarget(unit);
+  if (!finalTarget) return true;
+
+  const dx = finalTarget.x - desiredX;
+  const dy = finalTarget.y - desiredY;
+  if (((dx * dx) + (dy * dy)) > (tolerance * tolerance)) {
+    return true;
+  }
+
+  if (!Number.isFinite(unit.lastChaseRepathAt)) {
+    return false;
+  }
+
+  if ((now - unit.lastChaseRepathAt) < minIntervalMs) {
+    return false;
+  }
+
+  return (unit.navalNoProgressTicks || 0) >= NAVAL_REPATH_NO_PROGRESS_TICKS;
+}
+
 function tryRefreshNavalRoute(unit, now) {
   if (!usesNavalContactCollision(unit)) return false;
   if (!Number.isFinite(now)) return false;
@@ -2811,7 +3027,25 @@ function tryRefreshNavalRoute(unit, now) {
   if (!finalTarget) return false;
 
   const moveTarget = findNearestNavalPassableWaterPosition(unit, finalTarget.x, finalTarget.y, 360) || finalTarget;
-  const repath = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, unit.type);
+  if (isStraightPathTerrainPassable(unit, unit.x, unit.y, moveTarget.x, moveTarget.y)) {
+    unit.pathWaypoints = null;
+    unit.targetX = moveTarget.x;
+    unit.targetY = moveTarget.y;
+    unit.navalLastRepathAt = now;
+    unit.navalNoProgressTicks = 0;
+    unit.navalBlockedTicks = 0;
+    return true;
+  }
+
+  const blockedTicks = Math.max(0, unit.navalBlockedTicks || 0);
+  if (blockedTicks > 4 && blockedTicks < 18) {
+    unit.navalLastRepathAt = now;
+    unit.navalAvoidanceSideBias = unit.navalAvoidanceSideBias === 1 ? -1 : 1;
+    unit.navalNoProgressTicks = Math.max(0, NAVAL_REPATH_NO_PROGRESS_TICKS - 4);
+    return false;
+  }
+
+  const repath = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, unit.type, 'naval.refresh');
   unit.navalLastRepathAt = now;
 
   if (repath && repath.length > 1) {
@@ -2938,6 +3172,9 @@ function annihilateRoom(roomId, message = ROOM_ANNIHILATION_MESSAGE) {
   gameState.buildings.clear();
   gameState.players.clear();
   gameState.fogOfWar.clear();
+  if (gameState.pathCache) {
+    gameState.pathCache.clear();
+  }
   gameState.lastUpdate = Date.now();
   syncSlbmId();
 
@@ -3537,13 +3774,45 @@ function findNearestNavalPassableWaterPosition(unitOrType, x, y, maxSearchRadius
   return findNearestWaterPosition(clamped.x, clamped.y, maxSearchRadius);
 }
 
+function isStraightPathTerrainPassable(unitOrType, fromX, fromY, toX, toY) {
+  const type = typeof unitOrType === 'string' ? unitOrType : unitOrType?.type;
+  if (type === 'worker' || isAirUnitType(type)) {
+    return true;
+  }
+  const map = gameState.map;
+  if (!map) return true;
+
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= 1) {
+    if (isLandCombatUnitType(type)) return isOnLand(toX, toY);
+    if (isNavalUnitType(type)) return isNavalPositionTerrainPassable(unitOrType, toX, toY);
+    return true;
+  }
+
+  const sampleStep = Math.max(30, (map.cellSize || 50) * 0.6);
+  const samples = Math.max(1, Math.ceil(distance / sampleStep));
+  for (let i = 1; i <= samples; i++) {
+    const t = i / samples;
+    const sampleX = fromX + (dx * t);
+    const sampleY = fromY + (dy * t);
+    if (isLandCombatUnitType(type)) {
+      if (!isOnLand(sampleX, sampleY)) return false;
+    } else if (isNavalUnitType(type)) {
+      if (!isNavalPositionTerrainPassable(unitOrType, sampleX, sampleY)) return false;
+    }
+  }
+  return true;
+}
+
 function assignMoveTarget(unit, targetX, targetY) {
   if (!unit) return false;
   const clampedTarget = clampToMapBounds(targetX, targetY);
 
   if (unit.type === 'worker') {
     // Workers can move anywhere (land + water) and still use pathfinding.
-    const path = findPath(unit.x, unit.y, clampedTarget.x, clampedTarget.y, 'worker');
+    const path = findPath(unit.x, unit.y, clampedTarget.x, clampedTarget.y, 'worker', 'assign.worker');
     if (path && path.length > 1) {
       unit.pathWaypoints = path.slice(1); // skip current position
       const next = unit.pathWaypoints.shift();
@@ -3561,7 +3830,13 @@ function assignMoveTarget(unit, targetX, targetY) {
     const landTarget = isOnLand(clampedTarget.x, clampedTarget.y)
       ? clampedTarget
       : findNearestLandPosition(clampedTarget.x, clampedTarget.y);
-    const path = findPath(unit.x, unit.y, landTarget.x, landTarget.y, 'land');
+    if (isStraightPathTerrainPassable('land', unit.x, unit.y, landTarget.x, landTarget.y)) {
+      unit.pathWaypoints = null;
+      unit.targetX = landTarget.x;
+      unit.targetY = landTarget.y;
+      return true;
+    }
+    const path = findPath(unit.x, unit.y, landTarget.x, landTarget.y, 'land', 'assign.land');
     if (path && path.length > 1) {
       unit.pathWaypoints = path.slice(1);
       const next = unit.pathWaypoints.shift();
@@ -3594,8 +3869,15 @@ function assignMoveTarget(unit, targetX, targetY) {
     moveTarget = nearestWater;
   }
 
+  if (isStraightPathTerrainPassable(unit, unit.x, unit.y, moveTarget.x, moveTarget.y)) {
+    unit.pathWaypoints = null;
+    unit.targetX = moveTarget.x;
+    unit.targetY = moveTarget.y;
+    return true;
+  }
+
   // Use A* pathfinding for ships to navigate around islands
-  const path = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, unit.type);
+  const path = findPath(unit.x, unit.y, moveTarget.x, moveTarget.y, unit.type, 'assign.naval');
   if (path && path.length > 1) {
     unit.pathWaypoints = path.slice(1);
     const next = unit.pathWaypoints.shift();
@@ -3611,18 +3893,18 @@ function assignMoveTarget(unit, targetX, targetY) {
 
 function getUnitFormationMetrics(unit) {
   if (!unit) {
-    return { lateralSpacing: 120, forwardSpacing: 140, keepOutRadius: 60 };
+    return { lateralSpacing: 160, forwardSpacing: 500, keepOutRadius: 60 };
   }
   if (!usesNavalContactCollision(unit)) {
-    return { lateralSpacing: 100, forwardSpacing: 110, keepOutRadius: 0 };
+    return { lateralSpacing: 120, forwardSpacing: 140, keepOutRadius: 0 };
   }
-  const { semiMajor, semiMinor } = getSelectionEllipseForUnit(unit);
-  const longAxis = Math.max(semiMajor, semiMinor);
-  const shortAxis = Math.min(semiMajor, semiMinor);
+  const { longAxis, shortAxis } = getUnitFormationSize(unit);
+  // Use visual-size-aware spacing: sprites render at size*heightMult (~6.6x)
+  // so formation spacing must account for actual rendered dimensions
   return {
-    lateralSpacing: Math.round((shortAxis * 2) + 10),
-    forwardSpacing: Math.round((longAxis * 2) + 12),
-    keepOutRadius: Math.round(shortAxis + 6)
+    lateralSpacing: Math.round(shortAxis * 5 + 30),
+    forwardSpacing: Math.round(longAxis * 6 + 50),
+    keepOutRadius: Math.round(shortAxis * 2.5)
   };
 }
 
@@ -3702,6 +3984,382 @@ function resetNavalAvoidanceState(unit) {
   unit.navalNoProgressTicks = 0;
 }
 
+function normalizeAngle(angle) {
+  if (!Number.isFinite(angle)) return 0;
+  let normalized = angle;
+  while (normalized > Math.PI) normalized -= Math.PI * 2;
+  while (normalized < -Math.PI) normalized += Math.PI * 2;
+  return normalized;
+}
+
+function getAngleDelta(currentAngle, targetAngle) {
+  return normalizeAngle(targetAngle - currentAngle);
+}
+
+function turnAngleToward(currentAngle, targetAngle, maxStep) {
+  if (!Number.isFinite(targetAngle)) {
+    return Number.isFinite(currentAngle) ? normalizeAngle(currentAngle) : 0;
+  }
+  if (!Number.isFinite(currentAngle)) {
+    return normalizeAngle(targetAngle);
+  }
+  const delta = getAngleDelta(currentAngle, targetAngle);
+  if (Math.abs(delta) <= maxStep) {
+    return normalizeAngle(targetAngle);
+  }
+  return normalizeAngle(currentAngle + (Math.sign(delta) * maxStep));
+}
+
+function rotateSquadLocalOffset(forwardOffset, lateralOffset, angle) {
+  const forwardX = Math.cos(angle);
+  const forwardY = Math.sin(angle);
+  const sideX = -forwardY;
+  const sideY = forwardX;
+  return {
+    x: (forwardX * forwardOffset) + (sideX * lateralOffset),
+    y: (forwardY * forwardOffset) + (sideY * lateralOffset)
+  };
+}
+
+function updateUnitSquadFormationOffsets(unit, centerX, centerY, worldX, worldY, angle) {
+  const forwardX = Math.cos(angle);
+  const forwardY = Math.sin(angle);
+  const sideX = -forwardY;
+  const sideY = forwardX;
+  const dx = worldX - centerX;
+  const dy = worldY - centerY;
+  unit.squadForwardOffset = (dx * forwardX) + (dy * forwardY);
+  unit.squadLateralOffset = (dx * sideX) + (dy * sideY);
+  unit.squadOffsetX = dx;
+  unit.squadOffsetY = dy;
+}
+
+function getUnitSquadDesiredWorldPosition(unit, centerX, centerY, angle) {
+  const forwardOffset = Number.isFinite(unit.squadForwardOffset) ? unit.squadForwardOffset : 0;
+  const lateralOffset = Number.isFinite(unit.squadLateralOffset) ? unit.squadLateralOffset : 0;
+  const rotatedOffset = rotateSquadLocalOffset(forwardOffset, lateralOffset, angle);
+  return {
+    x: centerX + rotatedOffset.x,
+    y: centerY + rotatedOffset.y,
+    offsetX: rotatedOffset.x,
+    offsetY: rotatedOffset.y
+  };
+}
+
+function getSquadFormationUnitTier(unit) {
+  const unitType = unit?.type;
+  if (unitType === 'assaultship' || unitType === 'submarine') return 0;
+  if (unitType === 'frigate') return 1;
+  if (unitType === 'destroyer' || unitType === 'cruiser') return 2;
+  if (unitType === 'battleship' || unitType === 'carrier') return 3;
+  return Math.floor((unit?.attackRange || 0) / 500);
+}
+
+function getSquadFormationAssignmentKey(unit) {
+  return `${getSquadFormationUnitTier(unit)}:${unit?.type || 'unknown'}`;
+}
+
+function getFormationLocalCoordinates(x, y, centerX, centerY, angle) {
+  const forwardX = Math.cos(angle);
+  const forwardY = Math.sin(angle);
+  const sideX = -forwardY;
+  const sideY = forwardX;
+  const dx = x - centerX;
+  const dy = y - centerY;
+  return {
+    forward: (dx * forwardX) + (dy * forwardY),
+    lateral: (dx * sideX) + (dy * sideY)
+  };
+}
+
+function compareFormationLocalOrder(a, b) {
+  if (Math.abs(a.forward - b.forward) > 0.001) {
+    return b.forward - a.forward;
+  }
+  if (Math.abs(a.lateral - b.lateral) > 0.001) {
+    return a.lateral - b.lateral;
+  }
+  if (a.tieBreaker < b.tieBreaker) return -1;
+  if (a.tieBreaker > b.tieBreaker) return 1;
+  return 0;
+}
+
+function assignUnitsToFormationSlots(units, slots, anchorX, anchorY, targetX, targetY, angle) {
+  if (!Array.isArray(units) || !Array.isArray(slots) || units.length !== slots.length) {
+    return [];
+  }
+  if (units.length === 0) {
+    return [];
+  }
+
+  const orderedUnits = units
+    .map((unit) => ({
+      unit,
+      ...getFormationLocalCoordinates(unit.x, unit.y, anchorX, anchorY, angle),
+      tieBreaker: String(unit.id || '')
+    }))
+    .sort(compareFormationLocalOrder)
+    .map((entry) => entry.unit);
+
+  const orderedSlots = slots
+    .map((slot, index) => ({
+      slot,
+      ...getFormationLocalCoordinates(slot.x, slot.y, targetX, targetY, angle),
+      tieBreaker: `${index}:${slot.unit?.type || ''}`
+    }))
+    .sort(compareFormationLocalOrder);
+
+  if (orderedUnits.length > 12) {
+    return orderedUnits.map((unit, index) => ({
+      unit,
+      x: orderedSlots[index].slot.x,
+      y: orderedSlots[index].slot.y
+    }));
+  }
+
+  const unitLocal = orderedUnits.map((unit) => getFormationLocalCoordinates(unit.x, unit.y, anchorX, anchorY, angle));
+  const slotLocal = orderedSlots.map((entry) => getFormationLocalCoordinates(entry.slot.x, entry.slot.y, targetX, targetY, angle));
+  const costs = orderedUnits.map((unit, unitIndex) => orderedSlots.map((entry, slotIndex) => {
+    const dx = unit.x - entry.slot.x;
+    const dy = unit.y - entry.slot.y;
+    const baseCost = (dx * dx) + (dy * dy);
+    const lateralPenalty = Math.abs(unitLocal[unitIndex].lateral - slotLocal[slotIndex].lateral) * 10;
+    const forwardPenalty = Math.abs(unitLocal[unitIndex].forward - slotLocal[slotIndex].forward) * 4;
+    return baseCost + lateralPenalty + forwardPenalty;
+  }));
+
+  const memo = new Map();
+  const fullMask = (1 << orderedSlots.length) - 1;
+  function solve(unitIndex, usedMask) {
+    if (unitIndex >= orderedUnits.length) {
+      return { cost: 0, slots: [] };
+    }
+    const memoKey = `${unitIndex}:${usedMask}`;
+    if (memo.has(memoKey)) {
+      return memo.get(memoKey);
+    }
+
+    let best = null;
+    for (let slotIndex = 0; slotIndex < orderedSlots.length; slotIndex++) {
+      const slotBit = 1 << slotIndex;
+      if (usedMask & slotBit) continue;
+      const next = solve(unitIndex + 1, usedMask | slotBit);
+      const candidate = {
+        cost: costs[unitIndex][slotIndex] + next.cost,
+        slots: [slotIndex, ...next.slots]
+      };
+      if (!best || candidate.cost < best.cost) {
+        best = candidate;
+      }
+      if ((usedMask | slotBit) === fullMask && unitIndex === 0) {
+        break;
+      }
+    }
+
+    memo.set(memoKey, best);
+    return best;
+  }
+
+  const solution = solve(0, 0);
+  if (!solution || !Array.isArray(solution.slots) || solution.slots.length !== orderedUnits.length) {
+    return orderedUnits.map((unit, index) => ({
+      unit,
+      x: orderedSlots[index].slot.x,
+      y: orderedSlots[index].slot.y
+    }));
+  }
+
+  return orderedUnits.map((unit, index) => ({
+    unit,
+    x: orderedSlots[solution.slots[index]].slot.x,
+    y: orderedSlots[solution.slots[index]].slot.y
+  }));
+}
+
+function remapSquadFormationPositions(squad, units, canonicalPositions, targetX, targetY, angle) {
+  if (!Array.isArray(canonicalPositions) || canonicalPositions.length <= 1) {
+    return canonicalPositions;
+  }
+
+  const anchor = getSquadAnchorPosition(squad, units);
+  const slotsByKey = new Map();
+  canonicalPositions.forEach((position) => {
+    const key = getSquadFormationAssignmentKey(position.unit);
+    if (!slotsByKey.has(key)) {
+      slotsByKey.set(key, []);
+    }
+    slotsByKey.get(key).push(position);
+  });
+
+  const unitsByKey = new Map();
+  units.forEach((unit) => {
+    const key = getSquadFormationAssignmentKey(unit);
+    if (!unitsByKey.has(key)) {
+      unitsByKey.set(key, []);
+    }
+    unitsByKey.get(key).push(unit);
+  });
+
+  const remapped = [];
+  const assignedUnits = new Set();
+  slotsByKey.forEach((slots, key) => {
+    const matchingUnits = unitsByKey.get(key) || [];
+    const assignments = assignUnitsToFormationSlots(
+      matchingUnits,
+      slots,
+      anchor.x,
+      anchor.y,
+      targetX,
+      targetY,
+      angle
+    );
+    if (assignments.length === matchingUnits.length) {
+      assignments.forEach((assignment) => {
+        remapped.push(assignment);
+        assignedUnits.add(assignment.unit.id);
+      });
+      return;
+    }
+    slots.forEach((position) => {
+      remapped.push(position);
+      assignedUnits.add(position.unit.id);
+    });
+  });
+
+  canonicalPositions.forEach((position) => {
+    if (!assignedUnits.has(position.unit.id)) {
+      remapped.push(position);
+    }
+  });
+
+  return remapped;
+}
+
+function getSquadCommandAngle(squad, centerX, centerY, targetX, targetY) {
+  const dx = targetX - centerX;
+  const dy = targetY - centerY;
+  const currentAngle = Number.isFinite(squad?.targetAngle)
+    ? squad.targetAngle
+    : (Number.isFinite(squad?.moveAngle) ? squad.moveAngle : 0);
+  if (((dx * dx) + (dy * dy)) <= (SQUAD_COMMAND_ANGLE_DEADZONE * SQUAD_COMMAND_ANGLE_DEADZONE)) {
+    return currentAngle;
+  }
+  return Math.atan2(dy, dx);
+}
+
+function applySquadFormationLayout(squad, units, centerX, centerY, angle) {
+  const canonicalPositions = getSquadFormationPositions(units, centerX, centerY, angle, squad.formationType || 'trapezoid');
+  const positions = remapSquadFormationPositions(squad, units, canonicalPositions, centerX, centerY, angle);
+  let formationRadius = 0;
+  positions.forEach(({ unit, x, y }) => {
+    updateUnitSquadFormationOffsets(unit, centerX, centerY, x, y, angle);
+    formationRadius = Math.max(
+      formationRadius,
+      Math.hypot(unit.squadForwardOffset || 0, unit.squadLateralOffset || 0)
+    );
+  });
+  squad.formationRadius = formationRadius;
+  return positions;
+}
+
+function getSquadAnchorPosition(squad, units) {
+  if (Number.isFinite(squad?.centerX) && Number.isFinite(squad?.centerY)) {
+    return { x: squad.centerX, y: squad.centerY };
+  }
+  if (!Array.isArray(units) || units.length === 0) {
+    return { x: 0, y: 0 };
+  }
+  return {
+    x: units.reduce((sum, unit) => sum + unit.x, 0) / units.length,
+    y: units.reduce((sum, unit) => sum + unit.y, 0) / units.length
+  };
+}
+
+function getSquadActualCenter(units) {
+  if (!Array.isArray(units) || units.length === 0) {
+    return { x: 0, y: 0 };
+  }
+  return {
+    x: units.reduce((sum, unit) => sum + unit.x, 0) / units.length,
+    y: units.reduce((sum, unit) => sum + unit.y, 0) / units.length
+  };
+}
+
+function squadHasStableFormationSlots(units) {
+  return Array.isArray(units) && units.every(unit => (
+    Number.isFinite(unit.squadForwardOffset) &&
+    Number.isFinite(unit.squadLateralOffset)
+  ));
+}
+
+function ensureSquadFormationSlots(squad, units, centerX, centerY, angle) {
+  if (!squadHasStableFormationSlots(units)) {
+    applySquadFormationLayout(squad, units, centerX, centerY, angle);
+  }
+}
+
+function shouldIgnoreSquadCommand(squad, targetX, targetY, attackMove) {
+  if (!squad) return false;
+  if (squad.attackMove !== attackMove) return false;
+  if (!Number.isFinite(squad.targetX) || !Number.isFinite(squad.targetY)) return false;
+  return Math.hypot(targetX - squad.targetX, targetY - squad.targetY) < SQUAD_COMMAND_REISSUE_DISTANCE;
+}
+
+function updateSquadHeadingTarget(squad, proposedAngle, now) {
+  const currentTarget = Number.isFinite(squad?.targetAngle)
+    ? squad.targetAngle
+    : normalizeAngle(proposedAngle);
+  if (!Number.isFinite(proposedAngle)) {
+    return currentTarget;
+  }
+  if (!Number.isFinite(currentTarget)) {
+    squad.targetAngle = normalizeAngle(proposedAngle);
+    squad.lastHeadingUpdateAt = now;
+    return squad.targetAngle;
+  }
+  const delta = Math.abs(getAngleDelta(currentTarget, proposedAngle));
+  const lastUpdatedAt = Number.isFinite(squad.lastHeadingUpdateAt) ? squad.lastHeadingUpdateAt : 0;
+  if (
+    delta >= SQUAD_HEADING_FORCE_DELTA ||
+    (delta >= SQUAD_HEADING_HYSTERESIS && (now - lastUpdatedAt) >= SQUAD_HEADING_UPDATE_COOLDOWN_MS)
+  ) {
+    squad.targetAngle = normalizeAngle(proposedAngle);
+    squad.lastHeadingUpdateAt = now;
+  }
+  return Number.isFinite(squad.targetAngle) ? squad.targetAngle : currentTarget;
+}
+
+function updateUnitSquadFacingTarget(unit, formationAngle, slotAngle, dist, slotRadius, now) {
+  const chaseDistance = Math.max(slotRadius * 8, 180);
+  const releaseDistance = Math.max(slotRadius * 5, 90);
+  const fallbackAngle = Number.isFinite(unit.squadDesiredAngle)
+    ? unit.squadDesiredAngle
+    : formationAngle;
+  let desiredAngle = fallbackAngle;
+  const slotDeltaFromFormation = Math.abs(getAngleDelta(formationAngle, slotAngle));
+
+  if (dist >= chaseDistance && slotDeltaFromFormation >= 0.55) {
+    desiredAngle = slotAngle;
+  } else if (dist <= releaseDistance) {
+    desiredAngle = formationAngle;
+  }
+
+  const currentTarget = Number.isFinite(unit.squadDesiredAngle)
+    ? unit.squadDesiredAngle
+    : formationAngle;
+  const delta = Math.abs(getAngleDelta(currentTarget, desiredAngle));
+  const lastUpdatedAt = Number.isFinite(unit.squadDesiredAngleUpdatedAt) ? unit.squadDesiredAngleUpdatedAt : 0;
+  if (
+    !Number.isFinite(unit.squadDesiredAngle) ||
+    delta >= SQUAD_HEADING_FORCE_DELTA ||
+    (delta >= SQUAD_UNIT_FACING_HYSTERESIS && (now - lastUpdatedAt) >= SQUAD_HEADING_UPDATE_COOLDOWN_MS)
+  ) {
+    unit.squadDesiredAngle = normalizeAngle(desiredAngle);
+    unit.squadDesiredAngleUpdatedAt = now;
+  }
+  return Number.isFinite(unit.squadDesiredAngle) ? unit.squadDesiredAngle : formationAngle;
+}
+
 // ==================== SQUAD (부대지정) SYSTEM ====================
 
 function getUnitSquad(unit) {
@@ -3750,16 +4408,173 @@ function disbandSquadInternal(squadId) {
       u.formingUpUntil = null;
       u.squadOffsetX = null;
       u.squadOffsetY = null;
+      u.squadForwardOffset = null;
+      u.squadLateralOffset = null;
+      u.squadDesiredAngle = null;
+      u.squadDesiredAngleUpdatedAt = null;
     }
   }
   gameState.squads.delete(squadId);
 }
 
 function getUnitFormationSize(unit) {
-  const ellipse = getSelectionEllipseForUnit(unit);
-  const longAxis = Math.max(ellipse.semiMajor, ellipse.semiMinor);
-  const shortAxis = Math.min(ellipse.semiMajor, ellipse.semiMinor);
-  return { longAxis, shortAxis };
+  if (!unit) {
+    return { longAxis: 70, shortAxis: 22 };
+  }
+  switch (unit.type) {
+    case 'frigate':
+      return { longAxis: 56, shortAxis: 18 };
+    case 'destroyer':
+      return { longAxis: 66, shortAxis: 20 };
+    case 'cruiser':
+      return { longAxis: 72, shortAxis: 21 };
+    case 'submarine':
+      return { longAxis: 74, shortAxis: 18 };
+    case 'battleship':
+      return { longAxis: 84, shortAxis: 25 };
+    case 'carrier':
+      return { longAxis: 82, shortAxis: 27 };
+    case 'assaultship':
+      return { longAxis: 78, shortAxis: 24 };
+    case 'missile_launcher':
+      return { longAxis: 40, shortAxis: 18 };
+    case 'worker':
+    case 'mine':
+      return { longAxis: 22, shortAxis: 22 };
+    default:
+      return { longAxis: 68, shortAxis: 21 };
+  }
+}
+
+function getSquadTrapezoidRole(unit) {
+  const unitType = unit?.type;
+  if (unitType === 'battleship' || unitType === 'carrier') return 'core';
+  if (unitType === 'submarine' || unitType === 'assaultship') return 'rear';
+  if (unitType === 'frigate' || unitType === 'destroyer') return 'front';
+  if (unitType === 'cruiser') return 'mid';
+
+  const range = unit?.attackRange || 0;
+  if (range <= 1000) return 'front';
+  if (range >= 2600) return 'core';
+  if (range >= 1800) return 'mid';
+  return 'rear';
+}
+
+function buildCompactTrapezoidRowCounts(count) {
+  if (count <= 0) return [];
+  if (count <= 3) return [count];
+  if (count === 4) return [2, 2];
+  if (count === 5) return [2, 2, 1];
+  if (count === 6) return [2, 3, 1];
+  if (count === 7) return [2, 3, 2];
+  if (count === 8) return [3, 3, 2];
+  if (count === 9) return [3, 3, 3];
+  if (count === 10) return [3, 4, 3];
+  if (count === 11) return [4, 4, 3];
+  if (count === 12) return [4, 4, 4];
+
+  const rowCounts = [];
+  let remaining = count;
+  while (remaining > 0) {
+    const rowSize = Math.min(4, remaining);
+    rowCounts.push(rowSize);
+    remaining -= rowSize;
+  }
+  return rowCounts;
+}
+
+function createCompactTrapezoidSlotTemplates(targetX, targetY, moveAngle, units) {
+  const rowCounts = buildCompactTrapezoidRowCounts(units.length);
+  const forwardX = Math.cos(moveAngle);
+  const forwardY = Math.sin(moveAngle);
+  const sideX = -forwardY;
+  const sideY = forwardX;
+  const metrics = units.map(u => getUnitFormationMetrics(u));
+  const lateralStep = Math.max(70, ...metrics.map(m => m.lateralSpacing));
+  const rowStep = Math.max(130, ...metrics.map(m => m.forwardSpacing));
+  const totalDepth = rowStep * Math.max(0, rowCounts.length - 1);
+  const slots = [];
+
+  for (let rowIndex = 0; rowIndex < rowCounts.length; rowIndex++) {
+    const rowCount = rowCounts[rowIndex];
+    const rowOffset = (totalDepth / 2) - (rowIndex * rowStep);
+    const centerIndex = (rowCount - 1) / 2;
+
+    for (let colIndex = 0; colIndex < rowCount; colIndex++) {
+      const lateralOffset = (colIndex - centerIndex) * lateralStep;
+      const centerDistance = Math.abs(colIndex - centerIndex);
+      let role = 'mid';
+
+      if (rowCounts.length === 1) {
+        role = centerDistance <= 0.6 ? 'core' : 'front';
+      } else if (rowIndex === 0) {
+        role = 'front';
+      } else if (rowCounts.length === 2) {
+        role = centerDistance <= 0.6 ? 'core' : 'rear';
+      } else if (rowIndex === rowCounts.length - 1) {
+        role = 'rear';
+      } else if (centerDistance <= 0.6) {
+        role = 'core';
+      } else {
+        role = 'mid';
+      }
+
+      slots.push({
+        x: targetX + sideX * lateralOffset + forwardX * rowOffset,
+        y: targetY + sideY * lateralOffset + forwardY * rowOffset,
+        role,
+        rowIndex,
+        colIndex,
+        centerDistance
+      });
+    }
+  }
+
+  return slots;
+}
+
+function sortSquadUnitsForRole(units, role) {
+  const sorted = [...units];
+  if (role === 'core') {
+    sorted.sort((a, b) => {
+      const aValue = (a.type === 'battleship' ? 3 : (a.type === 'carrier' ? 2 : 1));
+      const bValue = (b.type === 'battleship' ? 3 : (b.type === 'carrier' ? 2 : 1));
+      if (aValue !== bValue) return bValue - aValue;
+      return (b.attackRange || 0) - (a.attackRange || 0);
+    });
+    return sorted;
+  }
+  if (role === 'front') {
+    sorted.sort((a, b) => (a.attackRange || 0) - (b.attackRange || 0));
+    return sorted;
+  }
+  if (role === 'rear') {
+    sorted.sort((a, b) => {
+      const aRear = a.type === 'submarine' ? 0 : (a.type === 'assaultship' ? 1 : 2);
+      const bRear = b.type === 'submarine' ? 0 : (b.type === 'assaultship' ? 1 : 2);
+      if (aRear !== bRear) return aRear - bRear;
+      return (b.attackRange || 0) - (a.attackRange || 0);
+    });
+    return sorted;
+  }
+  sorted.sort((a, b) => (b.attackRange || 0) - (a.attackRange || 0));
+  return sorted;
+}
+
+function takeNextUnitForSlot(groups, preferences) {
+  for (const groupName of preferences) {
+    const group = groups.get(groupName);
+    if (group && group.length > 0) {
+      return group.shift();
+    }
+  }
+
+  for (const group of groups.values()) {
+    if (group.length > 0) {
+      return group.shift();
+    }
+  }
+  return null;
 }
 
 function getSquadFormationPositions(units, targetX, targetY, moveAngle, formationType) {
@@ -3772,20 +4587,15 @@ function getSquadFormationPositions(units, targetX, targetY, moveAngle, formatio
   const forwardY = Math.sin(moveAngle);
   const sideX = -forwardY;
   const sideY = forwardX;
-  const FORMATION_GAP = 30;
-  const MAX_PER_ROW = 7;
+  const FORMATION_GAP = 18;
+  const MAX_PER_ROW = 4;
   const FLANK_MAX_PER_ROW = 3;
   const positions = [];
   const NON_COMBAT_TYPES = new Set(['assaultship', 'submarine']);
 
   // Tier grouping: same tier units can share rows, but same type stays adjacent
   function getUnitTier(u) {
-    const t = u.type;
-    if (t === 'assaultship' || t === 'submarine') return 0;
-    if (t === 'frigate') return 1;
-    if (t === 'destroyer' || t === 'cruiser') return 2;
-    if (t === 'battleship' || t === 'carrier') return 3;
-    return Math.floor((u.attackRange || 0) / 500);
+    return getSquadFormationUnitTier(u);
   }
 
   function getRowWidth(row) {
@@ -3887,78 +4697,38 @@ function getSquadFormationPositions(units, targetX, targetY, moveAngle, formatio
   }
 
   // ===== TRAPEZOID =====
-  const combatUnits = [], forcedRearUnits = [];
-  for (const u of sorted) { if (NON_COMBAT_TYPES.has(u.type)) forcedRearUnits.push(u); else combatUnits.push(u); }
-  // Group combat units by tier instead of raw range
-  const tierMap = new Map();
-  for (const u of combatUnits) {
-    const tier = getUnitTier(u);
-    if (!tierMap.has(tier)) tierMap.set(tier, []);
-    tierMap.get(tier).push(u);
-  }
-  const rangeGroups = [...tierMap.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
-  let frontUnits = [], flankUnits = [], rearUnits = [];
-  const N = rangeGroups.length;
-  if (N <= 1) { frontUnits = combatUnits.slice(); }
-  else if (N === 2) { frontUnits = rangeGroups[0].slice(); rearUnits = rangeGroups[1].slice(); }
-  else {
-    let fc = Math.max(1, Math.round(N * 0.43));
-    let rc = Math.max(1, Math.round(N * 0.35));
-    if (fc + rc >= N) { fc = Math.floor(N / 3); rc = Math.floor(N / 3); }
-    if (fc + rc >= N) { fc = 1; rc = 1; }
-    for (let i = 0; i < N; i++) {
-      if (i < fc) frontUnits.push(...rangeGroups[i]);
-      else if (i >= N - rc) rearUnits.push(...rangeGroups[i]);
-      else flankUnits.push(...rangeGroups[i]);
-    }
-  }
-  rearUnits.push(...forcedRearUnits);
+  const slotTemplates = createCompactTrapezoidSlotTemplates(targetX, targetY, moveAngle, sorted);
+  const groups = new Map([
+    ['front', sortSquadUnitsForRole(sorted.filter(unit => getSquadTrapezoidRole(unit) === 'front'), 'front')],
+    ['mid', sortSquadUnitsForRole(sorted.filter(unit => getSquadTrapezoidRole(unit) === 'mid'), 'mid')],
+    ['core', sortSquadUnitsForRole(sorted.filter(unit => getSquadTrapezoidRole(unit) === 'core'), 'core')],
+    ['rear', sortSquadUnitsForRole(sorted.filter(unit => getSquadTrapezoidRole(unit) === 'rear'), 'rear')]
+  ]);
 
-  const frontRows = makeRows(frontUnits, MAX_PER_ROW);
-  const rearRows = makeRows(rearUnits.filter(u => !NON_COMBAT_TYPES.has(u.type)), MAX_PER_ROW);
-  const forcedRearRows = makeRows(forcedRearUnits, MAX_PER_ROW);
-  const frontDepths = frontRows.map(r => getRowDepth(r));
-  const rearDepths = rearRows.map(r => getRowDepth(r));
-  let centerMaxWidth = 0;
-  frontRows.forEach(r => { centerMaxWidth = Math.max(centerMaxWidth, getRowWidth(r)); });
-  rearRows.forEach(r => { centerMaxWidth = Math.max(centerMaxWidth, getRowWidth(r)); });
-
-  let fOff = FORMATION_GAP / 2;
-  for (let i = frontRows.length - 1; i >= 0; i--) {
-    fOff += frontDepths[i] / 2; placeRow(frontRows[i], fOff, 0); fOff += frontDepths[i] / 2 + FORMATION_GAP;
-  }
-  let rOff = -FORMATION_GAP / 2;
-  for (let i = 0; i < rearRows.length; i++) {
-    rOff -= rearDepths[i] / 2; placeRow(rearRows[i], rOff, 0); rOff -= rearDepths[i] / 2 + FORMATION_GAP;
-  }
-  // Non-combat units (assaultship, submarine) go behind ALL other rear units
-  if (forcedRearRows.length > 0) {
-    rOff -= FORMATION_GAP;
-    const frDepths = forcedRearRows.map(r => getRowDepth(r));
-    for (let i = 0; i < forcedRearRows.length; i++) {
-      rOff -= frDepths[i] / 2; placeRow(forcedRearRows[i], rOff, 0); rOff -= frDepths[i] / 2 + FORMATION_GAP;
+  const orderedSlots = [...slotTemplates].sort((a, b) => {
+    if (a.rowIndex !== b.rowIndex) return a.rowIndex - b.rowIndex;
+    if (a.role !== b.role) {
+      const rolePriority = { core: 0, front: 1, mid: 2, rear: 3 };
+      return (rolePriority[a.role] ?? 9) - (rolePriority[b.role] ?? 9);
     }
-  }
+    if (a.centerDistance !== b.centerDistance) return a.centerDistance - b.centerDistance;
+    return a.colIndex - b.colIndex;
+  });
 
-  if (flankUnits.length > 0) {
-    const half = Math.ceil(flankUnits.length / 2);
-    const leftFlank = flankUnits.slice(0, half);
-    const rightFlank = flankUnits.slice(half);
-    function placeFlankSide(sideUnits, sign) {
-      if (sideUnits.length === 0) return;
-      const rows = [];
-      for (let i = 0; i < sideUnits.length; i += FLANK_MAX_PER_ROW) rows.push(sideUnits.slice(i, i + FLANK_MAX_PER_ROW));
-      let maxW = 0;
-      rows.forEach(r => { maxW = Math.max(maxW, getRowWidth(r)); });
-      const latCenter = sign * (centerMaxWidth / 2 + FORMATION_GAP + maxW / 2);
-      const depths = rows.map(r => getRowDepth(r));
-      const totalD = depths.reduce((s, d) => s + d, 0) + FORMATION_GAP * Math.max(0, rows.length - 1);
-      let vOff = totalD / 2;
-      for (let i = 0; i < rows.length; i++) { vOff -= depths[i] / 2; placeRow(rows[i], vOff, latCenter); vOff -= depths[i] / 2 + FORMATION_GAP; }
+  orderedSlots.forEach((slot) => {
+    const preferences = slot.role === 'core'
+      ? ['core', 'mid', 'rear', 'front']
+      : (slot.role === 'front'
+        ? ['front', 'mid', 'core', 'rear']
+        : (slot.role === 'rear'
+          ? ['rear', 'core', 'mid', 'front']
+          : ['mid', 'core', 'front', 'rear']));
+    const unit = takeNextUnitForSlot(groups, preferences);
+    if (unit) {
+      positions.push({ unit, x: slot.x, y: slot.y });
     }
-    placeFlankSide(leftFlank, -1);
-    placeFlankSide(rightFlank, 1);
-  }
+  });
+
   return positions;
 }
 
@@ -3984,46 +4754,220 @@ function getSquadPathfindType(squad) {
   return 'worker';
 }
 
+function resolveSquadCenterWaypoints(squad, centerX, centerY, targetX, targetY, reason) {
+  const pathType = getSquadPathfindType(squad);
+  const centerPath = findPath(centerX, centerY, targetX, targetY, pathType, reason);
+  if (centerPath && centerPath.length > 1) {
+    return centerPath.slice(1);
+  }
+  return null;
+}
+
+function getSquadActiveAnchorTarget(squad) {
+  if (squad?.centerWaypoints && squad.centerWaypoints.length > 0) {
+    return squad.centerWaypoints[0];
+  }
+  if (Number.isFinite(squad?.targetX) && Number.isFinite(squad?.targetY)) {
+    return { x: squad.targetX, y: squad.targetY };
+  }
+  return null;
+}
+
+function getUnitQueuedDestination(unit) {
+  if (!unit) return null;
+  if (Array.isArray(unit.pathWaypoints) && unit.pathWaypoints.length > 0) {
+    return unit.pathWaypoints[unit.pathWaypoints.length - 1];
+  }
+  if (Number.isFinite(unit.targetX) && Number.isFinite(unit.targetY)) {
+    return { x: unit.targetX, y: unit.targetY };
+  }
+  return null;
+}
+
+function shouldRefreshSquadUnitTarget(unit, desiredX, desiredY) {
+  const currentDestination = getUnitQueuedDestination(unit);
+  const size = getUnitFormationSize(unit);
+  const threshold = Math.max(
+    SQUAD_FORMATION_RETARGET_DISTANCE,
+    Math.max(size.longAxis, size.shortAxis) * 1.2
+  );
+  if (!currentDestination) return true;
+  return Math.hypot(currentDestination.x - desiredX, currentDestination.y - desiredY) > threshold;
+}
+
+function getOrderedSquadUnitsForRetarget(units) {
+  return [...units].sort((a, b) => {
+    const aForward = Number.isFinite(a.squadForwardOffset) ? a.squadForwardOffset : 0;
+    const bForward = Number.isFinite(b.squadForwardOffset) ? b.squadForwardOffset : 0;
+    if (Math.abs(aForward - bForward) > 1) return bForward - aForward;
+    const aLateral = Number.isFinite(a.squadLateralOffset) ? a.squadLateralOffset : 0;
+    const bLateral = Number.isFinite(b.squadLateralOffset) ? b.squadLateralOffset : 0;
+    if (Math.abs(aLateral - bLateral) > 1) return aLateral - bLateral;
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+}
+
+function advanceSquadAnchorWaypointIfNeeded(squad) {
+  if (!squad?.centerWaypoints || squad.centerWaypoints.length <= 0) {
+    return false;
+  }
+  const threshold = Math.max(
+    SQUAD_ANCHOR_WAYPOINT_REACHED_DISTANCE,
+    Math.min(260, (squad.formationRadius || 0) * 0.45)
+  );
+  let advanced = false;
+  while (squad.centerWaypoints.length > 0) {
+    const nextWaypoint = squad.centerWaypoints[0];
+    if (!nextWaypoint) {
+      squad.centerWaypoints.shift();
+      advanced = true;
+      continue;
+    }
+    const distance = Math.hypot((squad.centerX || 0) - nextWaypoint.x, (squad.centerY || 0) - nextWaypoint.y);
+    if (distance > threshold) {
+      break;
+    }
+    squad.centerWaypoints.shift();
+    advanced = true;
+  }
+  if (squad.centerWaypoints.length === 0) {
+    squad.centerWaypoints = null;
+  }
+  return advanced;
+}
+
+function advanceSquadAnchorTowardTarget(squad, deltaTime) {
+  if (!squad || !Number.isFinite(squad.centerX) || !Number.isFinite(squad.centerY)) {
+    return false;
+  }
+
+  let changed = advanceSquadAnchorWaypointIfNeeded(squad);
+  const activeTarget = getSquadActiveAnchorTarget(squad);
+  if (!activeTarget) {
+    return changed;
+  }
+
+  const dx = activeTarget.x - squad.centerX;
+  const dy = activeTarget.y - squad.centerY;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= 0.001) {
+    return changed;
+  }
+
+  const desiredAngle = Math.atan2(dy, dx);
+  squad.moveAngle = Number.isFinite(squad.moveAngle)
+    ? turnAngleToward(squad.moveAngle, desiredAngle, SQUAD_ROTATION_RATE)
+    : desiredAngle;
+
+  const speed = Math.max(0, getSquadSlowestSpeed(squad));
+  const moveStep = Math.min(distance, speed * deltaTime * 60);
+  if (moveStep > 0) {
+    squad.centerX += (dx / distance) * moveStep;
+    squad.centerY += (dy / distance) * moveStep;
+    changed = true;
+  }
+
+  if (Math.hypot(activeTarget.x - squad.centerX, activeTarget.y - squad.centerY) <= SQUAD_ANCHOR_WAYPOINT_REACHED_DISTANCE) {
+    if (squad.centerWaypoints && squad.centerWaypoints.length > 0) {
+      squad.centerWaypoints.shift();
+      if (squad.centerWaypoints.length === 0) {
+        squad.centerWaypoints = null;
+      }
+      changed = true;
+    } else if (Number.isFinite(squad.targetX) && Number.isFinite(squad.targetY)) {
+      squad.centerX = squad.targetX;
+      squad.centerY = squad.targetY;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+function refreshSquadFormationMovementTargets(squad, units, now, force = false) {
+  if (!squad || !Array.isArray(units) || units.length === 0) return;
+  if (!Number.isFinite(squad.centerX) || !Number.isFinite(squad.centerY)) return;
+  if (!force) {
+    const lastRetargetAt = Number.isFinite(squad.lastFormationRetargetAt) ? squad.lastFormationRetargetAt : 0;
+    if ((now - lastRetargetAt) < SQUAD_FORMATION_RETARGET_INTERVAL_MS) {
+      return;
+    }
+  }
+
+  const angle = Number.isFinite(squad.moveAngle)
+    ? squad.moveAngle
+    : (Number.isFinite(squad.targetAngle) ? squad.targetAngle : 0);
+  const reservedTargets = [];
+  const orderedUnits = getOrderedSquadUnitsForRetarget(units);
+
+  orderedUnits.forEach((unit) => {
+    if (squad.attackMove && unit.attackTargetId) {
+      return;
+    }
+    const desired = getUnitSquadDesiredWorldPosition(unit, squad.centerX, squad.centerY, angle);
+    const resolvedTarget = usesNavalContactCollision(unit)
+      ? findAvailableFormationTarget(unit, desired.x, desired.y, reservedTargets)
+      : normalizeFormationTargetForUnit(unit, desired.x, desired.y);
+    if (!resolvedTarget) {
+      return;
+    }
+    if (usesNavalContactCollision(unit)) {
+      const metrics = getUnitFormationMetrics(unit);
+      reservedTargets.push({
+        x: resolvedTarget.x,
+        y: resolvedTarget.y,
+        keepOutRadius: metrics.keepOutRadius
+      });
+    }
+    if (force || shouldRefreshSquadUnitTarget(unit, resolvedTarget.x, resolvedTarget.y)) {
+      assignMoveTarget(unit, resolvedTarget.x, resolvedTarget.y);
+    }
+  });
+
+  squad.lastFormationRetargetAt = now;
+}
+
 function issueSquadMoveOrder(squad, targetX, targetY) {
-  const formationType = squad.formationType || 'trapezoid';
   const units = getSquadAliveUnits(squad);
   if (units.length === 0) return;
+  if (shouldIgnoreSquadCommand(squad, targetX, targetY, false)) return;
 
-  const centerX = units.reduce((s, u) => s + u.x, 0) / units.length;
-  const centerY = units.reduce((s, u) => s + u.y, 0) / units.length;
-  const dx = targetX - centerX;
-  const dy = targetY - centerY;
-  const moveAngle = Math.atan2(dy, dx);
+  const anchor = getSquadAnchorPosition(squad, units);
+  const centerX = anchor.x;
+  const centerY = anchor.y;
+  const targetAngle = getSquadCommandAngle(squad, centerX, centerY, targetX, targetY);
   const slowestSpeed = getSquadSlowestSpeed(squad);
+
+  // Rebuild slots for the new heading around the CURRENT anchor.
+  squad.targetAngle = targetAngle;
+  squad.moveAngle = targetAngle;
+  const positions = applySquadFormationLayout(squad, units, centerX, centerY, targetAngle);
 
   squad.centerX = centerX;
   squad.centerY = centerY;
+  squad.actualCenterX = centerX;
+  squad.actualCenterY = centerY;
   squad.targetX = targetX;
   squad.targetY = targetY;
-  squad.moveAngle = moveAngle;
   squad.moving = true;
   squad.attackMove = false;
+  squad.centerWaypoints = resolveSquadCenterWaypoints(
+    squad,
+    centerX,
+    centerY,
+    targetX,
+    targetY,
+    'squad.move.center'
+  );
+  squad.lastFormationRetargetAt = 0;
 
-  // Pathfind for the center around terrain
-  const pathType = getSquadPathfindType(squad);
-  const centerPath = findPath(centerX, centerY, targetX, targetY, pathType);
-  if (centerPath && centerPath.length > 1) {
-    squad.centerWaypoints = centerPath.slice(1);
-  } else {
-    squad.centerWaypoints = null;
-  }
-
-  const positions = getSquadFormationPositions(units, targetX, targetY, moveAngle, formationType);
-
-  positions.forEach(({ unit, x, y }) => {
-    unit.squadOffsetX = x - targetX;
-    unit.squadOffsetY = y - targetY;
+  positions.forEach(({ unit }) => {
     unit.speed = slowestSpeed;
     unit.holdPosition = false;
     unit.attackMove = false;
     unit.attackTargetId = null;
     unit.attackTargetType = null;
-    unit.angle = moveAngle;
+    unit.angle = targetAngle;
     unit.formingUp = false;
     unit.formingUpUntil = null;
     unit.targetX = null;
@@ -4044,43 +4988,46 @@ function issueSquadAttackTarget(squad, targetId, targetType) {
 }
 
 function issueSquadAttackMove(squad, targetX, targetY) {
-  const formationType = squad.formationType || 'trapezoid';
   const units = getSquadAliveUnits(squad);
   if (units.length === 0) return;
+  if (shouldIgnoreSquadCommand(squad, targetX, targetY, true)) return;
 
-  const centerX = units.reduce((s, u) => s + u.x, 0) / units.length;
-  const centerY = units.reduce((s, u) => s + u.y, 0) / units.length;
-  const moveAngle = Math.atan2(targetY - centerY, targetX - centerX);
+  const anchor = getSquadAnchorPosition(squad, units);
+  const centerX = anchor.x;
+  const centerY = anchor.y;
+  const targetAngle = getSquadCommandAngle(squad, centerX, centerY, targetX, targetY);
   const slowestSpeed = getSquadSlowestSpeed(squad);
+
+  // Rebuild slots for the new heading around the CURRENT anchor.
+  squad.targetAngle = targetAngle;
+  squad.moveAngle = targetAngle;
+  const positions = applySquadFormationLayout(squad, units, centerX, centerY, targetAngle);
 
   squad.centerX = centerX;
   squad.centerY = centerY;
+  squad.actualCenterX = centerX;
+  squad.actualCenterY = centerY;
   squad.targetX = targetX;
   squad.targetY = targetY;
-  squad.moveAngle = moveAngle;
   squad.moving = true;
   squad.attackMove = true;
+  squad.centerWaypoints = resolveSquadCenterWaypoints(
+    squad,
+    centerX,
+    centerY,
+    targetX,
+    targetY,
+    'squad.attackMove.center'
+  );
+  squad.lastFormationRetargetAt = 0;
 
-  // Pathfind for the center around terrain
-  const pathType = getSquadPathfindType(squad);
-  const centerPath = findPath(centerX, centerY, targetX, targetY, pathType);
-  if (centerPath && centerPath.length > 1) {
-    squad.centerWaypoints = centerPath.slice(1);
-  } else {
-    squad.centerWaypoints = null;
-  }
-
-  const positions = getSquadFormationPositions(units, targetX, targetY, moveAngle, formationType);
-
-  positions.forEach(({ unit, x, y }) => {
-    unit.squadOffsetX = x - targetX;
-    unit.squadOffsetY = y - targetY;
+  positions.forEach(({ unit }) => {
     unit.speed = slowestSpeed;
     unit.holdPosition = false;
     unit.attackMove = true;
     unit.attackTargetId = null;
     unit.attackTargetType = null;
-    unit.angle = moveAngle;
+    unit.angle = targetAngle;
     unit.formingUp = false;
     unit.formingUpUntil = null;
     unit.targetX = null;
@@ -4200,9 +5147,18 @@ function issueGroupedMoveOrder(units, targetX, targetY, options = {}) {
 // Uses a coarse grid for performance on large 40000x40000 maps.
 // STEP=2 means each path cell = 2x2 terrain cells (100x100 world units).
 
-function findPath(fromX, fromY, toX, toY, unitKind) {
+function findPath(fromX, fromY, toX, toY, unitKind, reason = 'generic') {
+  const perfStart = PERF_DEBUG_ENABLED ? perfNowMs() : 0;
+  let perfIterations = 0;
+  const metricBaseName = `path.find.${reason}`;
+  const finishPath = (result, metricName = metricBaseName) => {
+    if (PERF_DEBUG_ENABLED) {
+      perfRecord(metricName, perfNowMs() - perfStart, 1, perfIterations);
+    }
+    return result;
+  };
   const map = gameState.map;
-  if (!map) return null;
+  if (!map) return finishPath(null);
 
   const gridSize = map.gridSize;
   const cellSize = map.cellSize;
@@ -4223,6 +5179,7 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
   const sgy = clamp(startGY, pathGridSize);
   const egx = clamp(endGX, pathGridSize);
   const egy = clamp(endGY, pathGridSize);
+  const pathCache = gameState?.pathCache || null;
 
   // Check if a coarse cell is passable by checking ALL terrain cells in it.
   // Ships require water, land vehicles require land, workers go anywhere.
@@ -4262,10 +5219,18 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
         }
       }
     }
-    if (!found) return null; // no reachable destination
+    if (!found) return finishPath(null); // no reachable destination
   }
 
-  if (sgx === destGX && sgy === destGY) return null;
+  if (sgx === destGX && sgy === destGY) return finishPath(null);
+
+  const cacheKey = `${unitKind}:${sgx}:${sgy}:${destGX}:${destGY}`;
+  if (pathCache) {
+    const cached = pathCache.get(cacheKey);
+    if (cached && (Date.now() - cached.createdAt) <= PATH_CACHE_TTL_MS) {
+      return finishPath(cached.path, `path.findCached.${reason}`);
+    }
+  }
 
   // A* with binary heap for performance
   const keyOf = (x, y) => y * pathGridSize + x;
@@ -4328,6 +5293,7 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
 
   while (heap.length > 0 && iterations < MAX_ITERATIONS) {
     iterations++;
+    perfIterations = iterations;
     const currentKey = heapPop();
     inOpen[currentKey] = 0;
 
@@ -4343,10 +5309,20 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
       }
       // Convert to world coordinates (center of coarse cell)
       const halfStep = Math.floor(STEP / 2);
-      return pathCells.map(n => ({
+      const resolvedPath = pathCells.map(n => ({
         x: (n.gx * STEP + halfStep) * cellSize + cellSize / 2,
         y: (n.gy * STEP + halfStep) * cellSize + cellSize / 2
       }));
+      if (pathCache) {
+        pathCache.set(cacheKey, { createdAt: Date.now(), path: resolvedPath });
+        if (pathCache.size > PATH_CACHE_MAX_ENTRIES) {
+          const oldestKey = pathCache.keys().next().value;
+          if (oldestKey !== undefined) {
+            pathCache.delete(oldestKey);
+          }
+        }
+      }
+      return finishPath(resolvedPath);
     }
 
     inClosed[currentKey] = 1;
@@ -4381,7 +5357,7 @@ function findPath(fromX, fromY, toX, toY, unitKind) {
   }
 
   // No path found
-  return null;
+  return finishPath(null);
 }
 // ==================== END A* PATHFINDING ====================
 
@@ -4534,11 +5510,120 @@ app.post('/api/login', (req, res) => {
     return res.status(400).json({ error: 'Username required' });
   }
 
+  // AIMANAGEMODE: return special response to open training panel (do NOT create player)
+  // Use 403 so even old cached game.js (which checks res.ok) won't proceed to connectToGame
+  if (username === 'AIMANAGEMODE') {
+    if (!isLocalTrainingAccessRequest(req)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    return res.status(403).json({ aiManageMode: true, error: 'AI Training Mode' });
+  }
+
   // Assign a temporary userId (no DB persistence)
   const userId = nextTempUserId++;
   const token = jwt.sign({ userId, username }, JWT_SECRET, { expiresIn: '1d' });
   
   res.json({ token, userId, username });
+});
+
+// AI Training API endpoints
+app.get('/api/ai-training/status', (req, res) => {
+  const diff = req.query.difficulty || 'hard';
+  const session = trainingSessions[diff];
+  if (!session) return res.status(400).json({ error: 'Invalid difficulty. Use hard or expert.' });
+  const status = session.getStatus();
+  // Include self-play stats if available
+  const selfPlay = session.getSelfPlayStatus ? session.getSelfPlayStatus() : null;
+  // Also include all difficulties summary
+  const allStatus = {};
+  for (const [d, s] of Object.entries(trainingSessions)) {
+    allStatus[d] = { frozen: s.frozen, isTraining: s.isTraining, stats: s.qTable.getStats() };
+  }
+  res.json({ ...status, selfPlay, allDifficulties: allStatus });
+});
+
+app.post('/api/ai-training/start', (req, res) => {
+  const diff = req.body.difficulty || 'hard';
+  const session = trainingSessions[diff];
+  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  const episodes = Math.min(Math.max(parseInt(req.body.episodes) || 500, 10), 999999);
+  const continuous = !!req.body.continuous;
+  const mode = req.body.mode || 'solo'; // 'solo' or 'selfplay'
+  const numAgents = Math.min(Math.max(parseInt(req.body.numAgents) || 4, 2), 8);
+
+  let ok;
+  if (mode === 'selfplay') {
+    ok = session.startSelfPlayTraining(episodes, numAgents, (result) => {
+      console.log(`[AI-RL][${diff}] Self-play callback:`, result);
+      if (result.done && session.continuousMode) {
+        console.log(`[AI-RL][${diff}] Continuous mode: restarting self-play...`);
+        setTimeout(() => {
+          session.startSelfPlayTraining(session.lastEpisodeCount, numAgents, () => {});
+        }, 1000);
+      }
+    });
+  } else {
+    ok = session.startTraining(episodes, (result) => {
+      console.log(`[AI-RL][${diff}] Training callback:`, result);
+      if (result.done && session.continuousMode) {
+        console.log(`[AI-RL][${diff}] Continuous mode: restarting training...`);
+        setTimeout(() => {
+          session.startTraining(session.lastEpisodeCount, () => {});
+        }, 1000);
+      }
+    });
+  }
+  session.continuousMode = continuous;
+  session.lastEpisodeCount = episodes;
+  res.json({ started: ok, episodes, continuous, difficulty: diff, frozen: session.frozen, mode, numAgents });
+});
+
+app.post('/api/ai-training/stop', (req, res) => {
+  const diff = req.body.difficulty || 'hard';
+  const session = trainingSessions[diff];
+  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  session.continuousMode = false;
+  session.stopTraining();
+  res.json({ stopped: true, difficulty: diff });
+});
+
+app.post('/api/ai-training/reset', (req, res) => {
+  const diff = req.body.difficulty || 'hard';
+  const session = trainingSessions[diff];
+  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  session.continuousMode = false;
+  session.stopTraining();
+  session.qTable.table = {};
+  session.qTable.epsilon = 0.3;
+  session.qTable.totalEpisodes = 0;
+  session.qTable.totalReward = 0;
+  session.qTable.recentRewards = [];
+  session.saveWeights();
+  console.log(`[AI-RL][${diff}] Weights reset`);
+  res.json({ reset: true, difficulty: diff });
+});
+
+app.post('/api/ai-training/freeze', (req, res) => {
+  const diff = req.body.difficulty;
+  const freeze = req.body.freeze;
+  if (!diff || !trainingSessions[diff]) return res.status(400).json({ error: 'Invalid difficulty' });
+  const session = trainingSessions[diff];
+  if (freeze && session.isTraining) {
+    session.continuousMode = false;
+    session.stopTraining();
+  }
+  session.frozen = !!freeze;
+  session.saveWeights();
+  console.log(`[AI-RL][${diff}] Frozen: ${session.frozen}`);
+  res.json({ difficulty: diff, frozen: session.frozen });
+});
+
+app.get('/api/ai-training/weights', (req, res) => {
+  const diff = req.query.difficulty || 'hard';
+  const session = trainingSessions[diff];
+  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  const stats = session.qTable.getStats();
+  res.json({ ...stats, difficulty: diff, frozen: session.frozen });
 });
 
 // Reset player game data (keeps account, resets progress) - respawn at random location
@@ -4840,33 +5925,7 @@ function spawnPlayerBase(userId) {
     buildProgress: 100
   });
   
-  // Create 4 worker units around the base
-  const workerConfig = getUnitDefinition('worker');
-  for (let i = 0; i < 4; i++) {
-    const angle = (Math.PI * 2 * i) / 4;
-    const distance = 150;
-    const workerId = Date.now() * 1000 + Math.floor(Math.random() * 1000) + i;
-    gameState.units.set(workerId, {
-      id: workerId,
-      userId: userId,
-      type: 'worker',
-      x: startPos.x + Math.cos(angle) * distance,
-      y: startPos.y + Math.sin(angle) * distance,
-      hp: workerConfig.hp,
-      maxHp: workerConfig.hp,
-      damage: workerConfig.damage,
-      speed: workerConfig.speed,
-      attackRange: workerConfig.attackRange,
-      attackCooldownMs: workerConfig.attackCooldownMs,
-      targetX: null,
-      targetY: null,
-      gatheringResourceId: null,
-      buildingType: null,
-      buildTargetX: null,
-      buildTargetY: null,
-      kills: 0
-    });
-  }
+  spawnStartingWorkers(userId, startPos.x, startPos.y, STARTING_WORKER_COUNT);
   
   // Update player data
   const player = gameState.players.get(userId);
@@ -4874,7 +5933,7 @@ function spawnPlayerBase(userId) {
     player.baseX = startPos.x;
     player.baseY = startPos.y;
     player.hasBase = true;
-    player.population = 4; // 4 workers
+    player.population = STARTING_WORKER_COUNT;
     player.maxPopulation = STARTING_MAX_POPULATION;
     player.scoreFromKills = getPlayerScoreFromKills(player);
   }
@@ -4883,7 +5942,7 @@ function spawnPlayerBase(userId) {
   const isAI = player && player.isAI;
   if (!isAI) {
     try {
-      db.prepare('UPDATE player_data SET base_x = ?, base_y = ?, has_base = 1, population = 4, max_population = ? WHERE user_id = ?').run(startPos.x, startPos.y, STARTING_MAX_POPULATION, userId);
+      db.prepare('UPDATE player_data SET base_x = ?, base_y = ?, has_base = 1, population = ?, max_population = ? WHERE user_id = ?').run(startPos.x, startPos.y, STARTING_WORKER_COUNT, STARTING_MAX_POPULATION, userId);
     } catch(e) { /* no-op: temp user has no DB row */ }
   }
   
@@ -5164,7 +6223,8 @@ io.on('connection', (socket) => {
       units: initialState.units,
       buildings: initialState.buildings,
       missiles: player ? (player.missiles || 0) : 0,
-      redZones: buildClientRedZonePayload()
+      redZones: buildClientRedZonePayload(),
+      aiDifficulty: gameState.aiDifficulty || 'normal'
     };
     
     console.log(`Sending init data: ${initData.players.length} players, ${initData.units.length} units, ${initData.buildings.length} buildings`);
@@ -5298,27 +6358,30 @@ io.on('connection', (socket) => {
       // Store squad state
       squad.centerX = cx;
       squad.centerY = cy;
+      squad.actualCenterX = cx;
+      squad.actualCenterY = cy;
       squad.targetX = cx;
       squad.targetY = cy;
       squad.moveAngle = avgAngle;
+      squad.targetAngle = avgAngle;
+      squad.lastHeadingUpdateAt = Date.now();
       squad.moving = false;
       squad.centerWaypoints = null;
 
-      const fPositions = getSquadFormationPositions(aliveUnits, cx, cy, avgAngle, squad.formationType);
-      const formingUpUntil = Date.now() + 4000;
-      fPositions.forEach(({ unit, x, y }) => {
-        unit.squadOffsetX = x - cx;
-        unit.squadOffsetY = y - cy;
+      const fPositions = applySquadFormationLayout(squad, aliveUnits, cx, cy, avgAngle);
+      fPositions.forEach(({ unit }) => {
         unit.speed = slowestSpeed;
         unit.holdPosition = false;
         unit.attackMove = false;
         unit.attackTargetId = null;
         unit.attackTargetType = null;
         unit.angle = avgAngle;
-        unit.formingUp = true;
-        unit.formingUpUntil = formingUpUntil;
+        unit.formingUp = false;
+        unit.formingUpUntil = null;
+        unit.targetX = null;
+        unit.targetY = null;
+        unit.pathWaypoints = null;
         resetNavalAvoidanceState(unit);
-        assignMoveTarget(unit, x, y);
       });
     }
     socket.emit('squadCreated', { squadId, unitIds: validUnits, formationType: squad.formationType });
@@ -5334,18 +6397,23 @@ io.on('connection', (socket) => {
     sq.formationType = fType;
     const sUnits = getSquadAliveUnits(sq);
     if (sUnits.length > 0) {
-      const cx2 = sUnits.reduce((s, u) => s + u.x, 0) / sUnits.length;
-      const cy2 = sUnits.reduce((s, u) => s + u.y, 0) / sUnits.length;
-      const pos = getSquadFormationPositions(sUnits, sq.targetX || cx2, sq.targetY || cy2, sq.moveAngle || 0, fType);
+      const cx2 = Number.isFinite(sq.centerX)
+        ? sq.centerX
+        : (sUnits.reduce((s, u) => s + u.x, 0) / sUnits.length);
+      const cy2 = Number.isFinite(sq.centerY)
+        ? sq.centerY
+        : (sUnits.reduce((s, u) => s + u.y, 0) / sUnits.length);
+      const formationAngle = Number.isFinite(sq.targetAngle) ? sq.targetAngle : (sq.moveAngle || 0);
+      const pos = applySquadFormationLayout(sq, sUnits, cx2, cy2, formationAngle);
       const spd = getSquadSlowestSpeed(sq);
-      const fUntil = Date.now() + 3000;
-      pos.forEach(({ unit, x, y }) => {
-        unit.squadOffsetX = x - (sq.centerX || cx2);
-        unit.squadOffsetY = y - (sq.centerY || cy2);
+      pos.forEach(({ unit }) => {
         unit.speed = spd;
-        unit.formingUp = true;
-        unit.formingUpUntil = fUntil;
-        assignMoveTarget(unit, x, y);
+        unit.angle = formationAngle;
+        unit.formingUp = false;
+        unit.formingUpUntil = null;
+        unit.targetX = null;
+        unit.targetY = null;
+        unit.pathWaypoints = null;
       });
     }
     socket.emit('formationTypeChanged', { squadId: sqId, formationType: fType });
@@ -5405,6 +6473,9 @@ io.on('connection', (socket) => {
   
   socket.on('workerGather', (data) => {
     switchRoom(socket.roomId);
+    if (!LEGACY_WORKER_RESOURCE_GATHERING_ENABLED) {
+      return;
+    }
     const { workerId, resourceId } = data;
     const unit = gameState.units.get(workerId);
     const resource = gameState.map.resources.find(r => r.id === resourceId);
@@ -5532,12 +6603,64 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('unlockBattleshipModeCombo', () => {
+  // Secret admin: dynamically add/remove AI players
+  // AI Difficulty setting: first human player in room sets it
+  socket.on('setAIDifficulty', (data) => {
     switchRoom(socket.roomId);
-    const player = gameState.players.get(socket.userId);
-    if (!player || player.battleshipModeComboUnlocked) return;
-    player.battleshipModeComboUnlocked = true;
-    socket.emit('battleshipModeComboUnlocked');
+    if (!gameState) return;
+    const difficulty = data && data.difficulty;
+    if (!DIFFICULTY_PRESETS[difficulty]) return;
+    gameState.aiDifficulty = difficulty;
+    io.to(socket.roomId).emit('aiDifficultyChanged', { difficulty, label: DIFFICULTY_PRESETS[difficulty].label });
+    console.log(`[AI] Room ${socket.roomId} difficulty set to ${difficulty} by ${socket.username}`);
+  });
+
+  socket.on('addAI', () => {
+    switchRoom(socket.roomId);
+    if (!gameState) return;
+    let newIndex = 0;
+    while (gameState.players.has(getAIUserId(newIndex))) newIndex++;
+    const aiPlayer = spawnAIPlayer(newIndex);
+    if (aiPlayer) {
+      io.to(socket.roomId).emit('playerJoined', aiPlayer);
+      socket.emit('systemMessage', { text: 'AI 플레이어 추가됨: ' + aiPlayer.username });
+    }
+  });
+
+  socket.on('removeAI', () => {
+    switchRoom(socket.roomId);
+    if (!gameState) return;
+    // Remove the AI with the highest index
+    let lastAiId = null;
+    gameState.players.forEach((player, userId) => {
+      if (player.isAI) {
+        if (lastAiId === null || userId > lastAiId) lastAiId = userId;
+      }
+    });
+    if (lastAiId !== null) {
+      const removedName = gameState.players.get(lastAiId)?.username || 'AI';
+      clearActiveWeaponsForUser(lastAiId);
+      removePlayerFromCurrentRoom(lastAiId, { emitPlayerLeft: true });
+      socket.emit('systemMessage', { text: 'AI 플레이어 제거됨: ' + removedName });
+    } else {
+      socket.emit('systemMessage', { text: '제거할 AI 플레이어 없음' });
+    }
+  });
+
+  socket.on('unlockBattleshipModeCombo', (data) => {
+    switchRoom(socket.roomId);
+    const unitId = Number(data?.unitId);
+    if (!Number.isFinite(unitId)) return;
+    const unit = gameState.units.get(unitId);
+    if (!unit || unit.userId !== socket.userId || unit.type !== 'battleship') return;
+    initializeUnitRuntimeState(unit);
+    if (unit.battleshipModeComboUnlocked) {
+      socket.emit('battleshipModeComboUnlocked', { unitId: unit.id, alreadyUnlocked: true });
+      return;
+    }
+    unit.battleshipModeComboUnlocked = true;
+    refreshBattleshipModeState(unit);
+    socket.emit('battleshipModeComboUnlocked', { unitId: unit.id, alreadyUnlocked: false });
   });
   
   socket.on('researchSLBM', (data) => {
@@ -5575,7 +6698,7 @@ io.on('connection', (socket) => {
         player.resources -= missileCost;
         building.missileQueue.push({
           type: 'missile',
-          buildTime: 45000,
+          buildTime: 67500,
           userId: socket.userId,
           socketId: socket.id
         });
@@ -5611,7 +6734,7 @@ io.on('connection', (socket) => {
       player.resources -= acCost;
       carrier.aircraftQueue.push({
         type: 'aircraft',
-        buildTime: 15000,
+        buildTime: 22500,
         userId: socket.userId
       });
       if (!carrier.producingAircraft) {
@@ -5759,11 +6882,11 @@ io.on('connection', (socket) => {
     const { unitIds } = data;
     if (!Array.isArray(unitIds)) return;
     const now = Date.now();
-    const canCombine = canPlayerUseBattleshipModeCombo(socket.userId);
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (!unit || unit.userId !== socket.userId || unit.type !== 'battleship') return;
       initializeUnitRuntimeState(unit);
+      const canCombine = canUnitUseBattleshipModeCombo(unit);
       if (unit.combatStanceActive) {
         unit.combatStanceActive = false;
         unit.combatStanceStacks = 0;
@@ -5783,11 +6906,11 @@ io.on('connection', (socket) => {
     switchRoom(socket.roomId);
     const { unitIds } = data;
     if (!Array.isArray(unitIds)) return;
-    const canCombine = canPlayerUseBattleshipModeCombo(socket.userId);
     unitIds.forEach(unitId => {
       const unit = gameState.units.get(unitId);
       if (!unit || unit.userId !== socket.userId || unit.type !== 'battleship') return;
       initializeUnitRuntimeState(unit);
+      const canCombine = canUnitUseBattleshipModeCombo(unit);
       if (!unit.battleshipAegisMode && unit.combatStanceActive && !canCombine) {
         return;
       }
@@ -6560,62 +7683,67 @@ function buildBuilding(userId, type, x, y) {
   }
 }
 
-// Game loop - iterates all rooms
-setInterval(() => {
-  const now = Date.now();
-  gameRooms.forEach((room, roomId) => {
-    if (!roomHasHumanPlayers(roomId)) {
-      room.lastUpdate = now;
-      return;
-    }
-    switchRoom(roomId);
-    const deltaTime = (now - gameState.lastUpdate) / 1000;
-    gameState.lastUpdate = now;
-    updateGame(deltaTime);
-    syncSlbmId();
-  });
-}, 1000 / GAME_TICK_RATE);
-
-// Separate fog of war update (less frequent) - all rooms
-setInterval(() => {
-  if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
-  gameRooms.forEach((room, roomId) => {
-    if (!roomHasHumanPlayers(roomId)) return;
-    switchRoom(roomId);
-    updateFogOfWar();
-  });
-}, 2000);
-
-// Broadcast game state updates (optimized) - per room
-let updateCounter = 0;
-setInterval(() => {
-  updateCounter++;
-  gameRooms.forEach((room, roomId) => {
-    if (!roomHasHumanPlayers(roomId)) return;
-
-    switchRoom(roomId);
-    const entityCount = gameState.units.size + gameState.buildings.size;
-    const humanCount = getRoomHumanCount(roomId);
-    let stride = 1;
-    if (entityCount > 800) stride = 3;
-    else if (entityCount > 350) stride = 2;
-    if (humanCount >= 4) stride = Math.max(stride, 3);
-    else if (humanCount >= 2) stride = Math.max(stride, 2);
-
-    if (updateCounter % stride !== 0) return;
-    const socketsInRoom = getConnectedSocketsForRoom(roomId);
-    if (socketsInRoom.length === 0) return;
-    const playersPayload = buildClientPlayersPayload();
-    socketsInRoom.forEach(socket => {
-      socket.volatile.emit('gameUpdate', buildClientStatePayloadForSocket(socket, playersPayload));
+if (!BENCHMARK_MODE) {
+  // Game loop - iterates all rooms
+  setInterval(() => {
+    const now = Date.now();
+    gameRooms.forEach((room, roomId) => {
+      if (!roomHasHumanPlayers(roomId)) {
+        room.lastUpdate = now;
+        return;
+      }
+      switchRoom(roomId);
+      const deltaTime = (now - gameState.lastUpdate) / 1000;
+      gameState.lastUpdate = now;
+      updateGame(deltaTime);
+      syncSlbmId();
     });
-  });
-}, NETWORK_UPDATE_BASE_MS);
+    perfFlush('runtime');
+  }, 1000 / GAME_TICK_RATE);
+
+  // Separate fog of war update (less frequent) - all rooms
+  setInterval(() => {
+    if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
+    gameRooms.forEach((room, roomId) => {
+      if (!roomHasHumanPlayers(roomId)) return;
+      switchRoom(roomId);
+      updateFogOfWar();
+    });
+  }, 2000);
+
+  // Broadcast game state updates (optimized) - per room
+  let updateCounter = 0;
+  setInterval(() => {
+    updateCounter++;
+    gameRooms.forEach((room, roomId) => {
+      if (!roomHasHumanPlayers(roomId)) return;
+
+      switchRoom(roomId);
+      const entityCount = gameState.units.size + gameState.buildings.size;
+      const humanCount = getRoomHumanCount(roomId);
+      let stride = 1;
+      if (entityCount > 600) stride = 4;
+      else if (entityCount > 400) stride = 3;
+      else if (entityCount > 200) stride = 2;
+      if (humanCount >= 4) stride = Math.max(stride, 3);
+      else if (humanCount >= 2) stride = Math.max(stride, 2);
+
+      if (updateCounter % stride !== 0) return;
+      const socketsInRoom = getConnectedSocketsForRoom(roomId);
+      if (socketsInRoom.length === 0) return;
+      const playersPayload = buildClientPlayersPayload();
+      socketsInRoom.forEach(socket => {
+        socket.volatile.emit('gameUpdate', buildClientStatePayloadForSocket(socket, playersPayload));
+      });
+    });
+  }, NETWORK_UPDATE_BASE_MS);
+}
 
 // Separate fog of war update function
 function updateFogOfWar() {
   if (!ENABLE_SERVER_FOG_SNAPSHOTS) return;
   const now = Date.now();
+  const cellSize = gameState.map ? (gameState.map.cellSize || 50) : 50;
   
   gameState.players.forEach((player, playerId) => {
     if (!player || player.isAI || player.online === false) return;
@@ -6623,53 +7751,62 @@ function updateFogOfWar() {
       gameState.fogOfWar.set(playerId, new Map());
     }
     const playerFog = gameState.fogOfWar.get(playerId);
+    // Reusable fog value to avoid creating a new object for every cell
+    const fogValue = { lastSeen: now, explored: true };
     
     // Reveal fog based on unit positions
       gameState.units.forEach(unit => {
-        if (unit.userId === playerId) {
+        if (unit.userId !== playerId) return;
           const unitDef = getUnitDefinition(unit.type);
           let visionRadius = unitDef.visionRadius || mapConfig.vision.unitVisionRadius;
-          // Battleship aimed shot doubles vision
           if (unit.type === 'battleship' && unit.aimedShot && !unit.battleshipAegisMode) {
             visionRadius *= 2;
           }
           if (unit.type === 'destroyer' && unit.searchActiveUntil && now < unit.searchActiveUntil) {
             visionRadius = Math.max(visionRadius, DESTROYER_SEARCH_VISION_RADIUS);
           }
-          const cellSize = gameState.map.cellSize || 50;
           const gridX = Math.floor(unit.x / cellSize);
           const gridY = Math.floor(unit.y / cellSize);
           const gridRadius = Math.ceil(visionRadius / cellSize);
+          const gridRadiusSq = gridRadius * gridRadius;
         
         for (let dx = -gridRadius; dx <= gridRadius; dx++) {
           for (let dy = -gridRadius; dy <= gridRadius; dy++) {
-            if (dx * dx + dy * dy <= gridRadius * gridRadius) {
+            if (dx * dx + dy * dy <= gridRadiusSq) {
               const key = `${gridX + dx}_${gridY + dy}`;
-              playerFog.set(key, { lastSeen: now, explored: true });
+              const existing = playerFog.get(key);
+              if (existing) {
+                existing.lastSeen = now;
+              } else {
+                playerFog.set(key, { lastSeen: now, explored: true });
+              }
             }
           }
         }
-      }
     });
     
     // Reveal fog based on building positions
     gameState.buildings.forEach(building => {
-      if (building.userId === playerId && building.buildProgress >= 100) {
+      if (building.userId !== playerId || building.buildProgress < 100) return;
         const visionRadius = mapConfig.vision.buildingVisionRadius;
-        const cellSize = gameState.map.cellSize || 50;
         const gridX = Math.floor(building.x / cellSize);
         const gridY = Math.floor(building.y / cellSize);
         const gridRadius = Math.ceil(visionRadius / cellSize);
+        const gridRadiusSq = gridRadius * gridRadius;
         
         for (let dx = -gridRadius; dx <= gridRadius; dx++) {
           for (let dy = -gridRadius; dy <= gridRadius; dy++) {
-            if (dx * dx + dy * dy <= gridRadius * gridRadius) {
+            if (dx * dx + dy * dy <= gridRadiusSq) {
               const key = `${gridX + dx}_${gridY + dy}`;
-              playerFog.set(key, { lastSeen: now, explored: true });
+              const existing = playerFog.get(key);
+              if (existing) {
+                existing.lastSeen = now;
+              } else {
+                playerFog.set(key, { lastSeen: now, explored: true });
+              }
             }
           }
         }
-      }
     });
 
     gameState.units.forEach(unit => {
@@ -6757,6 +7894,7 @@ function resolveActiveSlbmImpacts(now) {
 }
 
 function updateGame(deltaTime) {
+  const perfStart = PERF_DEBUG_ENABLED ? perfNowMs() : 0;
   const now = Date.now();
 
   // Squad maintenance: remove dead units, disband small squads
@@ -6764,7 +7902,7 @@ function updateGame(deltaTime) {
     cleanupSquad(squadId);
   });
 
-  // Per-tick squad formation enforcement: smooth interpolation + waypoint pathfinding
+  // Per-tick squad formation: direct position interpolation (center + offset)
   gameState.squads.forEach((squad, squadId) => {
     if (!squad) return;
     const units = getSquadAliveUnits(squad);
@@ -6827,23 +7965,25 @@ function updateGame(deltaTime) {
       }
     }
 
-    // Smooth-move each unit toward center + offset (no teleporting)
+    // Smooth-move each unit toward center + rotated offset (no individual pathfinding)
     const cx = squad.centerX;
     const cy = squad.centerY;
-    const catchUpSpeed = slowestSpeed * deltaTime * 60 * 2.5; // Allow faster catch-up
+    const catchUpSpeed = slowestSpeed * deltaTime * 60 * 2.5;
+    const moveAngle = Number.isFinite(squad.moveAngle) ? squad.moveAngle : 0;
 
     units.forEach(u => {
-      if (u.formingUp) return; // Still using normal movement for initial formation
-      if (!Number.isFinite(u.squadOffsetX) || !Number.isFinite(u.squadOffsetY)) return;
+      // Calculate desired position from forward/lateral offsets rotated by current moveAngle
+      const fwd = Number.isFinite(u.squadForwardOffset) ? u.squadForwardOffset : 0;
+      const lat = Number.isFinite(u.squadLateralOffset) ? u.squadLateralOffset : 0;
+      const rotated = rotateSquadLocalOffset(fwd, lat, moveAngle);
+      const desiredX = cx + rotated.x;
+      const desiredY = cy + rotated.y;
 
-      const desiredX = cx + u.squadOffsetX;
-      const desiredY = cy + u.squadOffsetY;
       const dx = desiredX - u.x;
       const dy = desiredY - u.y;
       const dist = Math.hypot(dx, dy);
 
       if (dist < 1) {
-        // Close enough, snap
         u.x = desiredX;
         u.y = desiredY;
       } else {
@@ -6851,60 +7991,79 @@ function updateGame(deltaTime) {
         const nx = u.x + (dx / dist) * step;
         const ny = u.y + (dy / dist) * step;
 
-        // Validate terrain before moving
-        let canMove = true;
-        if (isNavalUnitType(u.type)) {
-          canMove = isNavalPositionTerrainPassable(u, nx, ny);
-        } else if (isLandCombatUnitType(u.type)) {
-          canMove = isOnLand(nx, ny);
-        }
-
-        if (canMove) {
+        // Terrain handling with sliding
+        if (u.type === 'worker' || isAirUnitType(u)) {
           const clamped = clampToMapBounds(nx, ny);
           u.x = clamped.x;
           u.y = clamped.y;
+        } else if (isLandCombatUnitType(u)) {
+          const clampedNext = clampToMapBounds(nx, ny);
+          if (isOnLand(clampedNext.x, clampedNext.y)) {
+            u.x = clampedNext.x;
+            u.y = clampedNext.y;
+          } else {
+            const slideX = clampToMapBounds(nx, u.y);
+            const slideY = clampToMapBounds(u.x, ny);
+            const canSlideX = isOnLand(slideX.x, slideX.y);
+            const canSlideY = isOnLand(slideY.x, slideY.y);
+            if (canSlideX && canSlideY) {
+              if (Math.abs(dx) >= Math.abs(dy)) { u.x = slideX.x; u.y = slideX.y; }
+              else { u.x = slideY.x; u.y = slideY.y; }
+            } else if (canSlideX) { u.x = slideX.x; u.y = slideX.y; }
+            else if (canSlideY) { u.x = slideY.x; u.y = slideY.y; }
+          }
+        } else {
+          // Naval: terrain sliding
+          const clampedNext = clampToMapBounds(nx, ny);
+          if (isNavalPositionTerrainPassable(u, clampedNext.x, clampedNext.y)) {
+            u.x = clampedNext.x;
+            u.y = clampedNext.y;
+          } else {
+            const slideX = clampToMapBounds(nx, u.y);
+            const slideY = clampToMapBounds(u.x, ny);
+            const canSlideX = isNavalPositionTerrainPassable(u, slideX.x, slideX.y);
+            const canSlideY = isNavalPositionTerrainPassable(u, slideY.x, slideY.y);
+            if (canSlideX && canSlideY) {
+              if (Math.abs(dx) >= Math.abs(dy)) { u.x = slideX.x; u.y = slideX.y; }
+              else { u.x = slideY.x; u.y = slideY.y; }
+            } else if (canSlideX) { u.x = slideX.x; u.y = slideX.y; }
+            else if (canSlideY) { u.x = slideY.x; u.y = slideY.y; }
+          }
         }
-        // If terrain blocks, unit stays put (will catch up later)
       }
 
-      // Keep individual movement cleared
+      // Squad controls positioning; clear individual movement
       u.targetX = null;
       u.targetY = null;
       u.pathWaypoints = null;
-      u.angle = squad.moveAngle || u.angle;
+      u.angle = moveAngle;
+      u.collisionWakeUntil = null;
+      u.formingUp = false;
+      u.formingUpUntil = null;
 
       if (squad.attackMove) {
         u.attackMove = true;
       }
     });
 
-    // Post-formation collision separation: push overlapping squad-mates apart
-    if (!squad.moving) {
-      for (let i = 0; i < units.length; i++) {
-        if (units[i].formingUp) continue;
-        const ui = units[i];
-        const eiA = getSelectionEllipseForUnit(ui);
-        for (let j = i + 1; j < units.length; j++) {
-          if (units[j].formingUp) continue;
-          const uj = units[j];
-          if (doSelectionEllipsesOverlapWithPadding(ui, ui.x, ui.y, uj, uj.x, uj.y, NAVAL_COLLISION_CLEARANCE_BUFFER)) {
-            const sdx = uj.x - ui.x;
-            const sdy = uj.y - ui.y;
-            const sDist = Math.hypot(sdx, sdy);
-            if (sDist < 0.1) continue;
-            const pushStr = 1.5 * deltaTime * 60;
-            const pnx = sdx / sDist;
-            const pny = sdy / sDist;
-            ui.x -= pnx * pushStr;
-            ui.y -= pny * pushStr;
-            uj.x += pnx * pushStr;
-            uj.y += pny * pushStr;
-            // Update offsets to reflect pushed positions
-            ui.squadOffsetX = ui.x - cx;
-            ui.squadOffsetY = ui.y - cy;
-            uj.squadOffsetX = uj.x - cx;
-            uj.squadOffsetY = uj.y - cy;
-          }
+
+    // Collision separation: push overlapping squad-mates apart (always active)
+    for (let i = 0; i < units.length; i++) {
+      const ui = units[i];
+      for (let j = i + 1; j < units.length; j++) {
+        const uj = units[j];
+        if (doSelectionEllipsesOverlapWithPadding(ui, ui.x, ui.y, uj, uj.x, uj.y, NAVAL_COLLISION_CLEARANCE_BUFFER)) {
+          const sdx = uj.x - ui.x;
+          const sdy = uj.y - ui.y;
+          const sDist = Math.hypot(sdx, sdy);
+          if (sDist < 0.1) continue;
+          const pushStr = 2.5 * deltaTime * 60;
+          const pnx = sdx / sDist;
+          const pny = sdy / sDist;
+          ui.x -= pnx * pushStr;
+          ui.y -= pny * pushStr;
+          uj.x += pnx * pushStr;
+          uj.y += pny * pushStr;
         }
       }
     }
@@ -7005,10 +8164,10 @@ function updateGame(deltaTime) {
       }
     }
 
-    // Movement - skip units controlled by squad (unless still forming up)
-    if (unit.squadId && !unit.formingUp) {
-      // Squad units are positioned directly by the per-tick squad loop above
-      // Do nothing here — skip all individual movement/pathfinding/collision
+    // Movement - skip units controlled by squad (positioned directly by squad loop above)
+    if (unit.squadId) {
+      // Squad units are positioned by the per-tick squad formation loop
+      // Do nothing here — skip all individual movement/pathfinding
     } else if (unit.targetX !== null && unit.targetY !== null) {
       const moveStartX = unit.x;
       const moveStartY = unit.y;
@@ -7071,7 +8230,7 @@ function updateGame(deltaTime) {
               const finalTarget = (unit.pathWaypoints && unit.pathWaypoints.length > 0)
                 ? unit.pathWaypoints[unit.pathWaypoints.length - 1]
                 : { x: unit.targetX, y: unit.targetY };
-              const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, 'land');
+              const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, 'land', 'movement.landTerrainBlocked');
               if (repath && repath.length > 1) {
                 unit.pathWaypoints = repath.slice(1);
                 const next = unit.pathWaypoints.shift();
@@ -7123,7 +8282,7 @@ function updateGame(deltaTime) {
                 ? unit.pathWaypoints[unit.pathWaypoints.length - 1]
                 : { x: unit.targetX, y: unit.targetY };
                
-              const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, unit.type);
+              const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, unit.type, 'movement.navalTerrainBlocked');
               if (repath && repath.length > 1) {
                 unit.pathWaypoints = repath.slice(1);
                 const next = unit.pathWaypoints.shift();
@@ -7191,7 +8350,14 @@ function updateGame(deltaTime) {
             const finalTarget = (unit.pathWaypoints.length > 0)
               ? unit.pathWaypoints[unit.pathWaypoints.length - 1]
               : next;
-            const repath = findPath(unit.x, unit.y, finalTarget.x, finalTarget.y, isLandCombatUnitType(unit.type) ? 'land' : unit.type);
+            const repath = findPath(
+              unit.x,
+              unit.y,
+              finalTarget.x,
+              finalTarget.y,
+              isLandCombatUnitType(unit.type) ? 'land' : unit.type,
+              'movement.invalidWaypoint'
+            );
             if (repath && repath.length > 1) {
               unit.pathWaypoints = repath.slice(1);
               const wp = unit.pathWaypoints.shift();
@@ -7244,7 +8410,7 @@ function updateGame(deltaTime) {
         // Worker reached final destination (no more waypoints)
         if (unit.type === 'worker' && unit.targetX === null) {
           // Check if gathering resource
-          if (unit.gatheringResourceId) {
+          if (LEGACY_WORKER_RESOURCE_GATHERING_ENABLED && unit.gatheringResourceId) {
             const resource = gameState.map.resources.find(r => r.id === unit.gatheringResourceId);
             if (resource && resource.amount > 0) {
               const gatherAmount = Math.min(10, resource.amount);
@@ -7300,7 +8466,7 @@ function updateGame(deltaTime) {
     }
     
   });
-  
+
   // Update buildings construction
   gameState.buildings.forEach(building => {
     if (building.buildProgress >= 100 && building.hp < building.maxHp) {
@@ -8091,9 +9257,8 @@ function updateGame(deltaTime) {
           if (j <= i) continue;
           const b = unitArray[j];
           if (!usesNavalContactCollision(b)) continue;
-          // Skip collision between same-squad units during formation movement
-          if (a.squadId && a.squadId === b.squadId && (a.targetX !== null || b.targetX !== null)) continue;
-
+          // Skip collision between same-squad units (handled by squad formation system)
+          if (a.squadId && a.squadId === b.squadId) continue;
           let dx = b.x - a.x;
           let dy = b.y - a.y;
           let distSq = (dx * dx) + (dy * dy);
@@ -8442,7 +9607,13 @@ function updateGame(deltaTime) {
         // Out of range but has explicit attack command - move towards target
         const moveToX = (unit.attackTargetType === 'slbm') ? target.currentX : target.x;
         const moveToY = (unit.attackTargetType === 'slbm') ? target.currentY : target.y;
-        assignMoveTarget(unit, moveToX, moveToY);
+        const chaseTolerance = unit.attackTargetType === 'slbm' ? 120 : 220;
+        const chaseRefreshIntervalMs = unit.attackTargetType === 'slbm' ? 250 : 700;
+        if (shouldRefreshChasePath(unit, moveToX, moveToY, now, chaseTolerance, chaseRefreshIntervalMs)) {
+          if (assignMoveTarget(unit, moveToX, moveToY)) {
+            unit.lastChaseRepathAt = now;
+          }
+        }
       }
       // If auto-detected but out of range and no attack command, don't chase
     } else if (unit.attackMove) {
@@ -8453,6 +9624,9 @@ function updateGame(deltaTime) {
 
   resolveActiveSlbmImpacts(now);
   recalculateAllPlayerCombatPowerAndScores();
+  if (PERF_DEBUG_ENABLED) {
+    perfRecord('tick.updateGame', perfNowMs() - perfStart);
+  }
 }
 
 // Ranking endpoint
@@ -8510,16 +9684,15 @@ app.get('/api/rankings', (req, res) => {
 
 const AI_CONFIG = {
   count: 2, // Number of AI players
-  updateInterval: 3000, // AI decision interval (ms)
-  respawnDelayMs: 10000, // How long defeated AI stays out of the room
-  scoutInterval: 10000, // How often to send scouts
+  updateInterval: 1000, // Run frequently and throttle per-difficulty inside updateAI
+  respawnDelayMs: 10000,
+  scoutInterval: 8000,
   buildingPriority: ['power_plant', 'shipyard', 'naval_academy', 'missile_silo', 'defense_tower'],
   unitPriority: ['worker', 'destroyer', 'cruiser', 'frigate', 'submarine', 'battleship', 'carrier'],
-  attackerTrackingDuration: 5000, // How long to remember attackers (5 seconds)
-  counterattackThreshold: 3, // Minimum attackers to trigger counterattack response
-  priorityTargetDuration: 60000, // Drop stale raid targets after 1 minute
-  maxPriorityTargets: 12,
-  // Combat power scoring per unit type
+  attackerTrackingDuration: 8000,
+  counterattackThreshold: 1, // React immediately to any attacker
+  priorityTargetDuration: 90000,
+  maxPriorityTargets: 20,
   combatPower: {
     frigate: 30,
     destroyer: 150,
@@ -8530,8 +9703,7 @@ const AI_CONFIG = {
     assaultship: 100,
     missile_launcher: 100
   },
-  // Island expansion threshold
-  expansionBuildingThreshold: 10
+  expansionBuildingThreshold: 8
 };
 
 function getAIUserId(aiIndex) {
@@ -8608,6 +9780,9 @@ function spawnAIPlayer(aiIndex) {
     maxHp: 1500,
     buildProgress: 100
   });
+
+  spawnStartingWorkers(aiId, startPos.x, startPos.y, STARTING_WORKER_COUNT);
+  aiPlayer.population = STARTING_WORKER_COUNT;
 
   console.log(`AI Player ${aiName} initialized at (${startPos.x.toFixed(0)}, ${startPos.y.toFixed(0)})`);
   return aiPlayer;
@@ -8757,10 +9932,18 @@ function initializeAIPlayers() {
 
 // AI decision making
 function updateAI() {
+  const perfStart = PERF_DEBUG_ENABLED ? perfNowMs() : 0;
   const now = Date.now();
   
   gameState.players.forEach((player, playerId) => {
     if (!player.isAI || !player.hasBase) return;
+
+    const roomDifficulty = gameState.aiDifficulty || 'normal';
+    const diffPreset = DIFFICULTY_PRESETS[roomDifficulty] || DIFFICULTY_PRESETS.normal;
+    if (player.lastAIThinkAt && now - player.lastAIThinkAt < (diffPreset.updateInterval || AI_CONFIG.updateInterval)) {
+      return;
+    }
+    player.lastAIThinkAt = now;
     
     // Count AI's units and buildings
     const aiUnits = [];
@@ -8778,9 +9961,18 @@ function updateAI() {
     let powerPlantCount = 0;
     let shipyardCount = 0;
     let defenseCount = 0;
+    let missileSiloCount = 0;
+    let pendingStructureCount = 0;
     
     gameState.units.forEach(unit => {
       if (unit.userId === playerId) {
+        if (!LEGACY_WORKER_RESOURCE_GATHERING_ENABLED && unit.type === 'worker' && unit.gatheringResourceId) {
+          unit.gatheringResourceId = null;
+          if (!unit.buildingType) {
+            unit.targetX = null;
+            unit.targetY = null;
+          }
+        }
         aiUnits.push(unit);
         if (unit.type === 'worker') {
           aiWorkers.push(unit);
@@ -8791,7 +9983,8 @@ function updateAI() {
     });
     
     gameState.buildings.forEach(building => {
-      if (building.userId === playerId && building.buildProgress >= 100) {
+      if (building.userId !== playerId) return;
+      if (building.buildProgress >= 100) {
         aiBuildings.push(building);
         if (building.type === 'shipyard') {
           hasShipyard = true;
@@ -8810,8 +10003,11 @@ function updateAI() {
         if (building.type === 'missile_silo') {
           hasMissileSilo = true;
           missileSiloId = building.id;
+          missileSiloCount++;
         }
         if (building.type === 'defense_tower') defenseCount++;
+      } else {
+        pendingStructureCount++;
       }
     });
     
@@ -8820,125 +10016,480 @@ function updateAI() {
     aiCombatUnits.forEach(u => {
       currentCombatPower += (AI_CONFIG.combatPower[u.type] || 0);
     });
+    const unitTypeCounts = aiCombatUnits.reduce((acc, unit) => {
+      acc[unit.type] = (acc[unit.type] || 0) + 1;
+      return acc;
+    }, {});
+    const frigateCount = unitTypeCounts.frigate || 0;
+    const destroyerCount = unitTypeCounts.destroyer || 0;
+    const cruiserCount = unitTypeCounts.cruiser || 0;
+    const battleshipCount = unitTypeCounts.battleship || 0;
+    const carrierCount = unitTypeCounts.carrier || 0;
+    const submarineCount = unitTypeCounts.submarine || 0;
+    const assaultShipCount = unitTypeCounts.assaultship || 0;
+    const missileLauncherCount = unitTypeCounts.missile_launcher || 0;
     
     // Set target combat power if not set
     if (!player.targetCombatPower) {
       player.targetCombatPower = 300 + Math.floor(Math.random() * 401); // 300-700
     }
-    
+
+    // --- RL Integration ---
+    const activeSession = trainingSessions[roomDifficulty]; // per-difficulty session (or null for easy/normal)
+    const rlActionIdx = activeSession ? activeSession.getAction(gameState, playerId, roomDifficulty) : null;
+    const rlAction = rlActionIdx !== null ? aiTraining.ACTIONS[rlActionIdx] : null;
+
+    // Online learning: record state/reward transitions
+    const currentState = aiTraining.encodeState(gameState, playerId);
+    if (activeSession && player._prevRLState && player._prevRLAction !== undefined) {
+      const snapshot = aiTraining.takeSnapshot(gameState, playerId);
+      const prevSnapshot = player._prevRLSnapshot || snapshot;
+      const reward = aiTraining.calculateReward(prevSnapshot, snapshot);
+      activeSession.recordTransition(player._prevRLState, player._prevRLAction, reward, currentState);
+    }
+    if (rlActionIdx !== null) {
+      player._prevRLState = currentState;
+      player._prevRLAction = rlActionIdx;
+      player._prevRLSnapshot = aiTraining.takeSnapshot(gameState, playerId);
+    }
+
     // --- DEVELOPMENT: Build structures ---
+    // Count shipyard/naval_academy multiples
+    let navalAcademyCount = 0;
+    let carbaseCount = 0;
+    gameState.buildings.forEach(b => {
+      if (b.userId === playerId && b.buildProgress >= 100) {
+        if (b.type === 'naval_academy') navalAcademyCount++;
+        if (b.type === 'carbase') carbaseCount++;
+      }
+    });
+
+    const getIdleWorkers = () => aiWorkers.filter(worker => !worker.buildingType && !worker.targetX);
+    const queueWorkerForConstruction = (worker, type, cost) => {
+      if (!worker || player.resources < cost) return false;
+      let pos = null;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 150 + Math.random() * 400;
+        const bx = player.baseX + Math.cos(angle) * dist;
+        const by = player.baseY + Math.sin(angle) * dist;
+        pos = findNearestValidBuildingPosition(type, bx, by, { maxSearchRadius: 600 });
+        if (pos) break;
+      }
+      if (!pos) {
+        if (!player.buildFailCount) player.buildFailCount = 0;
+        player.buildFailCount++;
+        return false;
+      }
+      worker.buildingType = type;
+      worker.buildTargetX = pos.x;
+      worker.buildTargetY = pos.y;
+      worker.targetX = pos.x;
+      worker.targetY = pos.y;
+      worker.gatheringResourceId = null;
+      return true;
+    };
+    const tryBuildWithAnyWorker = (type, cost) => {
+      const idleWorker = getIdleWorkers()[0];
+      return queueWorkerForConstruction(idleWorker, type, cost);
+    };
+    const tryProduceUnit = (producerTypes, unitType, cost) => {
+      const allowedTypes = Array.isArray(producerTypes) ? producerTypes : [producerTypes];
+      const unitDef = getUnitDefinition(unitType);
+      if (!unitDef) return false;
+      if (player.resources < cost || player.population + (unitDef.pop || 0) > player.maxPopulation) return false;
+
+      let built = false;
+      gameState.buildings.forEach(building => {
+        if (built) return;
+        if (
+          building.userId !== playerId ||
+          !allowedTypes.includes(building.type) ||
+          building.buildProgress < 100 ||
+          (building.productionQueue?.length || 0) >= 2
+        ) {
+          return;
+        }
+        built = buildUnitForAI(playerId, building.id, unitType);
+      });
+      return built;
+    };
+    const tryQueueSlbm = () => {
+      if (!hasMissileSilo || player.resources < 1500) return false;
+      const silo = gameState.buildings.get(missileSiloId);
+      if (!silo) return false;
+      if (!silo.missileQueue) silo.missileQueue = [];
+      if (silo.missileQueue.length >= 4) return false;
+      player.resources -= 1500;
+      silo.missileQueue.push({ type: 'missile', buildTime: 67500, userId: playerId, socketId: null });
+      if (!silo.missileProducing) {
+        silo.missileProducing = { type: 'missile', startTime: now, buildTime: 67500, userId: playerId, socketId: null };
+      }
+      return true;
+    };
+
+    // --- RL ACTION EXECUTION (hard/expert only) ---
+    // RL can bias a build/production choice, but failed or non-economic actions no longer suppress the rule-based fallback.
+    let rlHandledBuild = false;
+    let rlHandledUnit = false;
+    const rlIsActive = rlAction && diffPreset.useRL;
+    if (rlIsActive) {
+      switch (rlAction) {
+        case 'build_power_plant':
+          rlHandledBuild = tryBuildWithAnyWorker('power_plant', 150);
+          break;
+        case 'build_shipyard':
+          rlHandledBuild = tryBuildWithAnyWorker('shipyard', 200);
+          break;
+        case 'build_naval_academy':
+          rlHandledBuild = hasShipyard && tryBuildWithAnyWorker('naval_academy', 300);
+          break;
+        case 'build_missile_silo':
+          rlHandledBuild = tryBuildWithAnyWorker('missile_silo', MISSILE_SILO_COST);
+          break;
+        case 'build_defense_tower':
+          rlHandledBuild = tryBuildWithAnyWorker('defense_tower', 250);
+          break;
+        case 'build_carbase':
+          rlHandledBuild = hasMissileSilo && tryBuildWithAnyWorker('carbase', CARBASE_BUILD_COST);
+          break;
+        case 'produce_worker':
+          rlHandledUnit = (aiWorkers.length === 0 && headquartersId) ? tryProduceUnit('headquarters', 'worker', 50) : false;
+          break;
+        case 'produce_frigate':
+          rlHandledUnit = tryProduceUnit('shipyard', 'frigate', 120);
+          break;
+        case 'produce_destroyer':
+          rlHandledUnit = tryProduceUnit('shipyard', 'destroyer', 150);
+          break;
+        case 'produce_cruiser':
+          rlHandledUnit = tryProduceUnit('shipyard', 'cruiser', 300);
+          break;
+        case 'produce_battleship':
+          rlHandledUnit = tryProduceUnit('naval_academy', 'battleship', BATTLESHIP_COST);
+          break;
+        case 'produce_carrier':
+          rlHandledUnit = tryProduceUnit('naval_academy', 'carrier', CARRIER_COST);
+          break;
+        case 'produce_submarine':
+          rlHandledUnit = tryProduceUnit('naval_academy', 'submarine', SUBMARINE_COST);
+          break;
+        case 'produce_assaultship':
+          rlHandledUnit = tryProduceUnit('naval_academy', 'assaultship', 500);
+          break;
+        case 'produce_missile_launcher':
+          rlHandledUnit = tryProduceUnit('carbase', 'missile_launcher', MISSILE_LAUNCHER_COST);
+          break;
+        case 'produce_slbm':
+          rlHandledUnit = tryQueueSlbm();
+          break;
+        case 'attack_nearest_enemy':
+        case 'attack_strongest_enemy':
+          if (player.knownEnemyPositions && player.knownEnemyPositions.length > 0) {
+            let target;
+            if (rlAction === 'attack_strongest_enemy') {
+              const sorted = player.knownEnemyPositions.slice().sort((a, b) => (b.lastSeenStrength || 0) - (a.lastSeenStrength || 0));
+              target = sorted[0];
+            } else {
+              let nearest = null;
+              let nearestDist = Infinity;
+              for (const pos of player.knownEnemyPositions) {
+                const dx = pos.x - player.baseX;
+                const dy = pos.y - player.baseY;
+                const d = dx * dx + dy * dy;
+                if (d < nearestDist) {
+                  nearestDist = d;
+                  nearest = pos;
+                }
+              }
+              target = nearest;
+            }
+            if (target) {
+              aiCombatUnits.forEach(unit => {
+                if (!unit.attackTargetId) assignMoveTarget(unit, target.x, target.y);
+              });
+            }
+          }
+          break;
+        case 'defend_base':
+          aiCombatUnits.forEach(unit => {
+            if (!unit.attackTargetId && unit.type !== 'missile_launcher') {
+              assignMoveTarget(unit, player.baseX + (Math.random() - 0.5) * 300, player.baseY + (Math.random() - 0.5) * 300);
+            }
+          });
+          break;
+        case 'expand':
+          rlHandledBuild = tryBuildWithAnyWorker(hasShipyard ? 'power_plant' : 'shipyard', hasShipyard ? 150 : 200);
+          break;
+        case 'scout':
+          player.lastScoutTime = 0;
+          break;
+        default:
+          break;
+      }
+    }
+
     if (aiWorkers.length > 0) {
-      const idleWorker = aiWorkers.find(w => !w.buildingType && !w.gatheringResourceId && !w.targetX);
-      
-      if (idleWorker && player.resources > 150) {
+      const idleWorkers = getIdleWorkers();
+      const earlyFleetPhase = aiCombatUnits.length < 3;
+      const desiredPowerPlants = earlyFleetPhase
+        ? Math.min(2, diffPreset.minPowerPlants || 2)
+        : Math.min(diffPreset.minPowerPlants || 3, 2 + Math.floor(aiBuildings.length / 4));
+      const desiredShipyards = hasNavalAcademy
+        ? Math.min(diffPreset.minShipyards || 2, 2)
+        : 1;
+      const desiredNavalAcademies = aiCombatUnits.length >= 4
+        ? Math.min(2, Math.max(1, Math.floor(aiCombatUnits.length / 8)))
+        : 0;
+      const desiredSilos = aiCombatUnits.length >= 10
+        ? Math.min(diffPreset.minSilos || 1, 1 + Math.floor(aiCombatUnits.length / 12))
+        : 0;
+      const desiredTowers = aiBuildings.length >= 4
+        ? Math.min(diffPreset.minTowers || 2, 1 + Math.floor(aiBuildings.length / 5))
+        : 0;
+      const desiredCarbases = missileSiloCount >= 1 && aiCombatUnits.length >= 12 ? 1 : 0;
+      const maxConcurrentBuilds = Math.max(1, Math.min(2, Math.floor(aiWorkers.length / 3) || 1));
+      const canStartAnotherStructure = pendingStructureCount < maxConcurrentBuilds;
+
+      if (!rlHandledBuild && canStartAnotherStructure && idleWorkers.length > 0) {
+        const reserveForUnits = hasNavalAcademy ? 500 : (hasShipyard ? 150 : 0);
         let buildType = null;
         let buildCost = 0;
-        
+
         if (!hasPowerPlant && player.resources >= 150) {
           buildType = 'power_plant';
           buildCost = 150;
         } else if (!hasShipyard && player.resources >= 200) {
           buildType = 'shipyard';
           buildCost = 200;
-        } else if (!hasNavalAcademy && player.resources >= 300) {
+        } else if (earlyFleetPhase) {
+          if (powerPlantCount < desiredPowerPlants && player.resources - 150 >= 120) {
+            buildType = 'power_plant';
+            buildCost = 150;
+          } else if (defenseCount < 1 && aiCombatUnits.length >= 1 && player.resources - 250 >= 120) {
+            buildType = 'defense_tower';
+            buildCost = 250;
+          }
+        } else if (!hasNavalAcademy && player.resources - 300 >= 150) {
           buildType = 'naval_academy';
           buildCost = 300;
-        } else if (powerPlantCount < 3 && player.resources >= 150) {
+        } else if (powerPlantCount < desiredPowerPlants && player.resources - 150 >= reserveForUnits) {
           buildType = 'power_plant';
           buildCost = 150;
-        } else if (!hasMissileSilo && player.resources >= MISSILE_SILO_COST) {
+        } else if (shipyardCount < desiredShipyards && player.resources - 200 >= reserveForUnits) {
+          buildType = 'shipyard';
+          buildCost = 200;
+        } else if (navalAcademyCount < desiredNavalAcademies && player.resources - 300 >= 300) {
+          buildType = 'naval_academy';
+          buildCost = 300;
+        } else if (missileSiloCount < desiredSilos && player.resources - MISSILE_SILO_COST >= 300) {
           buildType = 'missile_silo';
           buildCost = MISSILE_SILO_COST;
-        } else if (defenseCount < 3 && player.resources >= 250) {
+        } else if (defenseCount < desiredTowers && player.resources - 250 >= reserveForUnits) {
           buildType = 'defense_tower';
           buildCost = 250;
-        } else if (player.resources >= 300 && Math.random() < 0.2) {
-          // Random extra building
-          const extras = ['power_plant', 'defense_tower', 'naval_academy'];
-          buildType = extras[Math.floor(Math.random() * extras.length)];
-          buildCost = buildType === 'power_plant' ? 150 : buildType === 'defense_tower' ? 250 : 300;
+        } else if (carbaseCount < desiredCarbases && player.resources - CARBASE_BUILD_COST >= MISSILE_LAUNCHER_COST) {
+          buildType = 'carbase';
+          buildCost = CARBASE_BUILD_COST;
         }
-        
+
         if (buildType && player.resources >= buildCost) {
-          const angle = Math.random() * Math.PI * 2;
-          const distance = 300 + Math.random() * 200;
-          const buildX = player.baseX + Math.cos(angle) * distance;
-          const buildY = player.baseY + Math.sin(angle) * distance;
-          
-          if (isOnLand(buildX, buildY)) {
-            idleWorker.buildingType = buildType;
-            idleWorker.buildTargetX = buildX;
-            idleWorker.buildTargetY = buildY;
-            idleWorker.targetX = buildX;
-            idleWorker.targetY = buildY;
-            idleWorker.gatheringResourceId = null;
-          }
+          rlHandledBuild = queueWorkerForConstruction(idleWorkers[0], buildType, buildCost);
         }
       }
-      
-      // Assign idle workers to gather resources
-      aiWorkers.forEach(worker => {
-        if (!worker.gatheringResourceId && !worker.buildingType && !worker.targetX) {
-          let nearestResource = null;
-          let nearestDist = Infinity;
-          
-          gameState.map.resources.forEach(resource => {
-            if (resource.amount > 0) {
-              const dx = resource.x - worker.x;
-              const dy = resource.y - worker.y;
-              const dist = Math.sqrt(dx * dx + dy * dy);
-              if (dist < nearestDist) {
-                nearestDist = dist;
-                nearestResource = resource;
-              }
-            }
-          });
-          
-          if (nearestResource && nearestDist < 2000) {
-            worker.gatheringResourceId = nearestResource.id;
-            worker.targetX = nearestResource.x;
-            worker.targetY = nearestResource.y;
-          }
-        }
-      });
     }
     
     // --- DEVELOPMENT: Build units ---
-    // Build workers if needed (more workers for economy)
-    if (aiWorkers.length < 8 && headquartersId && player.resources >= 50 && player.population < player.maxPopulation) {
+    // Only backfill workers if all died (keep at least 1)
+    if (
+      aiWorkers.length === 0 &&
+      headquartersId &&
+      player.resources >= 50 &&
+      player.population < player.maxPopulation
+    ) {
       buildUnitForAI(playerId, headquartersId, 'worker');
     }
     
-    // --- ARMY COMPOSITION: Build towards target combat power ---
-    if (currentCombatPower < player.targetCombatPower) {
-      // Decide what to build based on what we can afford and need
-      if (hasShipyard && player.population + 1 <= player.maxPopulation) {
-        // Weighted random unit choice from shipyard
-        const roll = Math.random();
-        if (roll < 0.30 && player.resources >= 120) {
-          buildUnitForAI(playerId, shipyardId, 'frigate');
-        } else if (roll < 0.65 && player.resources >= 150) {
-          buildUnitForAI(playerId, shipyardId, 'destroyer');
-        } else if (player.resources >= 300) {
-          buildUnitForAI(playerId, shipyardId, 'cruiser');
-        }
+    // --- ARMY COMPOSITION: Build combat units (rule-based fallback when RL didn't handle) ---
+    if (!rlHandledUnit) {
+      // Build from all available shipyards
+      if (hasShipyard) {
+        gameState.buildings.forEach(b => {
+          if (
+            b.userId !== playerId ||
+            b.type !== 'shipyard' ||
+            b.buildProgress < 100 ||
+            (b.productionQueue?.length || 0) >= 2
+          ) {
+            return;
+          }
+          if (player.population + 1 > player.maxPopulation) return;
+
+          if (frigateCount < 2 && player.resources >= 120) {
+            buildUnitForAI(playerId, b.id, 'frigate');
+          } else if (destroyerCount < Math.max(2, shipyardCount) && player.resources >= 150) {
+            buildUnitForAI(playerId, b.id, 'destroyer');
+          } else if (cruiserCount < Math.max(1, Math.floor((frigateCount + destroyerCount) / 3)) && player.resources >= 300) {
+            buildUnitForAI(playerId, b.id, 'cruiser');
+          } else if (destroyerCount <= frigateCount && player.resources >= 150) {
+            buildUnitForAI(playerId, b.id, 'destroyer');
+          } else if (player.resources >= 120) {
+            buildUnitForAI(playerId, b.id, 'frigate');
+          }
+        });
       }
       
-      if (hasNavalAcademy && player.population + getUnitDefinition('submarine').pop <= player.maxPopulation) {
-        const roll = Math.random();
-        if (roll < 0.35 && player.resources >= 600) {
-          buildUnitForAI(playerId, navalAcademyId, 'battleship');
-        } else if (roll < 0.55 && player.resources >= 800) {
-          buildUnitForAI(playerId, navalAcademyId, 'carrier');
-        } else if (roll < 0.70 && player.resources >= 900) {
-          buildUnitForAI(playerId, navalAcademyId, 'submarine');
+      // Build from all available naval academies
+      if (hasNavalAcademy) {
+        gameState.buildings.forEach(b => {
+          if (
+            b.userId !== playerId ||
+            b.type !== 'naval_academy' ||
+            b.buildProgress < 100 ||
+            (b.productionQueue?.length || 0) >= 1
+          ) {
+            return;
+          }
+          if (player.population + getUnitDefinition('submarine').pop > player.maxPopulation) return;
+
+          if (submarineCount < Math.max(1, Math.min(2, shipyardCount - 1)) && player.resources >= SUBMARINE_COST) {
+            buildUnitForAI(playerId, b.id, 'submarine');
+          } else if (carrierCount < 1 && aiCombatUnits.length >= 6 && player.resources >= CARRIER_COST) {
+            buildUnitForAI(playerId, b.id, 'carrier');
+          } else if (assaultShipCount < 1 && aiCombatUnits.length >= 8 && player.resources >= 500) {
+            buildUnitForAI(playerId, b.id, 'assaultship');
+          } else if (battleshipCount < Math.max(1, Math.floor(aiCombatUnits.length / 12)) && player.resources >= BATTLESHIP_COST) {
+            buildUnitForAI(playerId, b.id, 'battleship');
+          }
+        });
+      }
+      
+      // --- AI CARBASE: Produce missile launchers ---
+      if (carbaseCount > 0 && missileLauncherCount < Math.max(1, missileSiloCount)) {
+        gameState.buildings.forEach(b => {
+          if (
+            b.userId !== playerId ||
+            b.type !== 'carbase' ||
+            b.buildProgress < 100 ||
+            (b.productionQueue?.length || 0) >= 1
+          ) {
+            return;
+          }
+          if (player.population + getUnitDefinition('missile_launcher').pop > player.maxPopulation) return;
+          if (player.resources >= MISSILE_LAUNCHER_COST) {
+            buildUnitForAI(playerId, b.id, 'missile_launcher');
+          }
+        });
+      }
+    } // end !rlHandledUnit
+
+    // --- AI MISSILE LAUNCHER: Move mobile launchers to defensive positions, then deploy ---
+    const aiMobileLaunchers = aiCombatUnits.filter(u => u.type === 'missile_launcher' && (!u.deployState || u.deployState === 'mobile'));
+    aiMobileLaunchers.forEach(launcher => {
+      if (!launcher.deployState) launcher.deployState = 'mobile';
+      if (!launcher.targetX) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 350 + Math.random() * 400;
+        const deployX = player.baseX + Math.cos(angle) * dist;
+        const deployY = player.baseY + Math.sin(angle) * dist;
+        if (isOnLand(deployX, deployY)) {
+          launcher.targetX = deployX;
+          launcher.targetY = deployY;
+        }
+      }
+    });
+    // Deploy launchers that have arrived (no targetX = at position)
+    aiCombatUnits.filter(u =>
+      u.type === 'missile_launcher' && u.deployState === 'mobile' && !u.targetX
+    ).forEach(launcher => {
+      launcher.deployState = 'deploying_stage1';
+      launcher.deployStateEndsAt = now + MISSILE_LAUNCHER_DEPLOY_STAGE_MS;
+    });
+
+    // --- AI LURE TACTIC: Send a frigate toward enemy, draw them into launcher/aegis kill zone ---
+    if (!player.lureCooldownUntil) player.lureCooldownUntil = 0;
+    const deployedLaunchers = aiCombatUnits.filter(u => u.type === 'missile_launcher' && u.deployState === 'deployed');
+    const hasAegisBs = aiCombatUnits.some(u => u.type === 'battleship' && u.battleshipAegisMode);
+    if (
+      now > player.lureCooldownUntil &&
+      deployedLaunchers.length >= 2 &&
+      hasAegisBs &&
+      player.knownEnemyPositions &&
+      player.knownEnemyPositions.length > 0
+    ) {
+      const lureUnit = aiCombatUnits.find(u => u.type === 'frigate' && !u.attackTargetId && !u.isLuring);
+      if (lureUnit) {
+        const enemyPos = player.knownEnemyPositions[Math.floor(Math.random() * player.knownEnemyPositions.length)];
+        const dx = enemyPos.x - player.baseX;
+        const dy = enemyPos.y - player.baseY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const midX = player.baseX + (dx / dist) * Math.min(dist * 0.4, 1500);
+        const midY = player.baseY + (dy / dist) * Math.min(dist * 0.4, 1500);
+        assignMoveTarget(lureUnit, midX, midY);
+        lureUnit.isLuring = true;
+        lureUnit.lureReturnAt = now + 15000;
+        player.lureCooldownUntil = now + 45000;
+      }
+    }
+    // Recall luring frigates after lure window
+    aiCombatUnits.filter(u => u.isLuring && now >= (u.lureReturnAt || 0)).forEach(u => {
+      assignMoveTarget(u, player.baseX, player.baseY);
+      u.isLuring = false;
+    });
+
+    // --- AI MINE LAYING: Lay mines on enemy approach path to AI base ---
+    if (!player.mineLayCooldownUntil) player.mineLayCooldownUntil = 0;
+    if (now > player.mineLayCooldownUntil && player.knownEnemyPositions && player.knownEnemyPositions.length > 0) {
+      const mineDestroyers = aiCombatUnits.filter(u => u.type === 'destroyer');
+      if (mineDestroyers.length > 0) {
+        const destroyer = mineDestroyers[0];
+        let activeMines = 0;
+        gameState.units.forEach(u => {
+          if (u.type === 'mine' && u.userId === playerId && u.hp > 0) activeMines++;
+        });
+        if (activeMines < DESTROYER_MAX_MINES) {
+          const enemyPos = player.knownEnemyPositions[0];
+          const dx = enemyPos.x - player.baseX;
+          const dy = enemyPos.y - player.baseY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist > 0) {
+            const approachX = player.baseX + (dx / dist) * Math.min(dist * 0.3, 1000);
+            const approachY = player.baseY + (dy / dist) * Math.min(dist * 0.3, 1000);
+            if (!isOnLand(approachX, approachY)) {
+              const mineId = Date.now() * 1000 + Math.floor(Math.random() * 1000) + 700;
+              const mineDef = getUnitDefinition('mine');
+              const mine = {
+                id: mineId,
+                userId: playerId,
+                type: 'mine',
+                x: approachX + (Math.random() - 0.5) * 200,
+                y: approachY + (Math.random() - 0.5) * 200,
+                hp: mineDef.hp,
+                maxHp: mineDef.hp,
+                damage: mineDef.damage,
+                speed: 0,
+                size: mineDef.size,
+                attackRange: mineDef.attackRange,
+                attackCooldownMs: mineDef.attackCooldownMs,
+                visionRadius: 0,
+                targetX: null,
+                targetY: null,
+                isDetected: false,
+                sourceDestroyerId: destroyer.id,
+                kills: 0
+              };
+              gameState.units.set(mine.id, mine);
+              emitUnitCreatedEvent(mine);
+              player.mineLayCooldownUntil = now + 30000;
+            }
+          }
         }
       }
     }
-    
-    // When target reached, set a new higher target
-    if (currentCombatPower >= player.targetCombatPower) {
-      player.targetCombatPower = currentCombatPower + 100 + Math.floor(Math.random() * 200);
+
+    // Always update targetCombatPower dynamically
+    if (!player.targetCombatPower || currentCombatPower >= player.targetCombatPower) {
+      player.targetCombatPower = Math.max(80, currentCombatPower + 50 + Math.floor(Math.random() * 100));
     }
     
     // --- AI SLBM ---
@@ -8950,7 +10501,7 @@ function updateAI() {
           player.resources -= 1500;
           silo.missileQueue.push({
             type: 'missile',
-            buildTime: 45000,
+            buildTime: 67500,
             userId: playerId,
             socketId: null
           });
@@ -8987,7 +10538,9 @@ function updateAI() {
       ));
       if (loadedSubs.length > 0 && Math.random() < 0.3) {
         const sub = loadedSubs[0];
-        const target = player.knownEnemyPositions[Math.floor(Math.random() * player.knownEnemyPositions.length)];
+        // Target the strongest known enemy position (most units seen nearby)
+        const sortedTargets = player.knownEnemyPositions.slice().sort((a, b) => (b.lastSeenStrength || 0) - (a.lastSeenStrength || 0));
+        const target = sortedTargets[0] || player.knownEnemyPositions[0];
         sub.loadedSlbms = Math.max(0, getSubmarineLoadedSlbmCount(sub) - 1);
         player.missiles = Math.max(0, normalizeStoredSlbmCount(player.missiles) - 1);
         sub.slbmReloadReadyAt = now + SUBMARINE_SLBM_RELOAD_MS;
@@ -9034,15 +10587,98 @@ function updateAI() {
       }
     });
     
-    // --- AI AIMED SHOT: Battleships use aimed shot when off cooldown ---
+    // --- AI SKILLS: Use all available skills (gated by difficulty) ---
+    if (!diffPreset.useSkills) { /* skip skills for easy difficulty */ }
+    else {
     const aiBattleships = aiCombatUnits.filter(u => u.type === 'battleship');
-    aiBattleships.forEach(bs => {
+    aiBattleships.forEach((bs, idx) => {
+      initializeUnitRuntimeState(bs);
+      // Aimed shot when off cooldown and has a target
       if (!bs.aimedShot && (!bs.aimedShotCooldownUntil || now >= bs.aimedShotCooldownUntil)) {
-        if (bs.attackTargetId) {
+        if (bs.attackTargetId && !bs.battleshipAegisMode) {
           bs.aimedShot = true;
         }
       }
+      // Combat stance: activate on battleships that are actively attacking
+      if (!bs.combatStanceActive && bs.attackTargetId && bs.hp > bs.maxHp * 0.4) {
+        bs.combatStanceActive = true;
+        refreshBattleshipModeState(bs);
+      }
+      // Aegis mode: put some battleships in aegis mode for area-denial defense
+      // First battleship used as defender (aegis), rest as attackers (combat stance)
+      if (idx === 0 && !bs.battleshipAegisMode && aiCombatUnits.length >= 4) {
+        bs.battleshipAegisMode = true;
+        bs.aimedShot = false;
+        bs.combatStanceActive = false;
+        bs.battleshipAegisTurretTargetLocks = Array.from({ length: BATTLESHIP_AEGIS_TURRET_COUNT }, () => null);
+        refreshBattleshipModeState(bs);
+      }
     });
+    
+    // AI Cruisers: use aegis mode for defense
+    const aiCruisers = aiCombatUnits.filter(u => u.type === 'cruiser');
+    aiCruisers.forEach((cr, idx) => {
+      if (idx === 0 && !cr.aegisMode && aiCombatUnits.length >= 5) {
+        cr.aegisMode = true;
+      }
+    });
+
+    // AI Frigates: engine overdrive when in combat and HP > 40%
+    const aiFrigates = aiCombatUnits.filter(u => u.type === 'frigate');
+    aiFrigates.forEach(fg => {
+      if (fg.attackTargetId && !fg.engineOverdriveActive && fg.hp > (fg.maxHp || 100) * 0.4) {
+        fg.engineOverdriveActive = true;
+        fg.engineOverdriveStartedAt = now;
+      }
+    });
+
+    // AI Destroyers: use search skill when enemies are nearby
+    const aiDestroyers = aiCombatUnits.filter(u => u.type === 'destroyer');
+    aiDestroyers.forEach(dd => {
+      if (!dd.searchCooldownUntil || now >= dd.searchCooldownUntil) {
+        if (player.knownEnemyPositions && player.knownEnemyPositions.length > 0) {
+          dd.searchActiveUntil = now + SEARCH_REVEAL_DURATION_MS;
+          dd.searchCooldownUntil = now + 16000;
+        }
+      }
+    });
+
+    // AI Submarines: activate stealth before approaching enemy
+    aiSubs.forEach(sub => {
+      if (!sub.stealthActive && (!sub.stealthCooldownUntil || now >= sub.stealthCooldownUntil)) {
+        if (player.knownEnemyPositions && player.knownEnemyPositions.length > 0) {
+          sub.stealthActive = true;
+          sub.isDetected = false;
+          sub.stealthExpiresAt = now + SUBMARINE_STEALTH_DURATION_MS;
+        }
+      }
+    });
+
+    // AI Carriers: launch airstrike when 10 aircraft ready and enemy known
+    aiCarriers.forEach(carrier => {
+      if (!carrier.aircraft) carrier.aircraft = [];
+      if (!carrier.aircraftDeployed) carrier.aircraftDeployed = [];
+      if (carrier.aircraft.length >= 10 && player.knownEnemyPositions && player.knownEnemyPositions.length > 0
+          && (!carrier.airstrikeCooldownUntil || now >= carrier.airstrikeCooldownUntil)) {
+        const target = player.knownEnemyPositions[0];
+        carrier.aircraft = []; // Consume all aircraft
+        carrier.airstrikeCooldownUntil = now + 20000;
+        // Create airstrike effect at target
+        const strikeId = Date.now() * 1000 + Math.floor(Math.random() * 999) + 500;
+        const strike = {
+          id: strikeId, carrierId: carrier.id, userId: playerId,
+          targetX: target.x, targetY: target.y,
+          startTime: now, passCount: AIRSTRIKE_PASS_COUNT,
+          passInterval: 667, damagePerPass: 240,
+          radius: AIRSTRIKE_DAMAGE_RADIUS, currentPass: 0,
+          nextPassAt: now + 1000
+        };
+        if (!gameState.activeAirstrikes) gameState.activeAirstrikes = new Map();
+        gameState.activeAirstrikes.set(strikeId, strike);
+        roomEmit('airstrikeLaunched', { id: strikeId, carrierId: carrier.id, userId: playerId, targetX: target.x, targetY: target.y });
+      }
+    });
+    } // end useSkills gate
     
     // --- SCOUTING: Send workers to scout all islands ---
     if (!player.scoutedIslands) player.scoutedIslands = new Set();
@@ -9098,7 +10734,14 @@ function updateAI() {
                   return Math.sqrt(edx * edx + edy * edy) < 500;
                 });
                 if (!existing) {
-                  player.knownEnemyPositions.push({ x: building.x, y: building.y, playerId: otherId, discoveredAt: now });
+                  let localStrength = 0;
+                  gameState.units.forEach(eu => {
+                    if (eu.userId === otherId) {
+                      const ddx = eu.x - building.x; const ddy = eu.y - building.y;
+                      if (ddx * ddx + ddy * ddy < 800 * 800) localStrength++;
+                    }
+                  });
+                  player.knownEnemyPositions.push({ x: building.x, y: building.y, playerId: otherId, discoveredAt: now, lastSeenStrength: localStrength });
                   console.log(`AI ${player.username} discovered enemy ${otherPlayer.username || otherId} at (${building.x.toFixed(0)}, ${building.y.toFixed(0)})`);
                 }
                 // Also update knownEnemyBases for SLBM targeting
@@ -9436,12 +11079,11 @@ function updateAI() {
     // Priority targets take precedence over regular attacks
     if (!player.lastAttackTime) player.lastAttackTime = 0;
     
-    const canAttack = currentCombatPower >= Math.min(player.targetCombatPower * 0.6, 150);
+    const canAttack = currentCombatPower >= Math.min(player.targetCombatPower * 0.4, 60);
     const hasPriorityTargets = player.priorityTargets && player.priorityTargets.length > 0;
     const hasTargets = (player.knownEnemyPositions && player.knownEnemyPositions.length > 0) || hasPriorityTargets;
-    const attackCooldown = now - player.lastAttackTime > 20000; // 20 second cooldown between attacks
-    // Shorter cooldown for counterattacks (immediate response)
-    const counterattackCooldown = now - player.lastAttackTime > 5000;
+    const attackCooldown = now - player.lastAttackTime > 8000; // 8s cooldown (was 20s)
+    const counterattackCooldown = now - player.lastAttackTime > 2000; // near-instant counterattack
     
     // Counterattack with priority targets (immediate, less strict requirements)
     if (player.isCounterattacking && player.counterattackTarget && counterattackCooldown && aiCombatUnits.length >= 1) {
@@ -9490,7 +11132,7 @@ function updateAI() {
           unit.attackTargetType = nearestTarget.type;
         }
       });
-    } else if (canAttack && hasTargets && attackCooldown && aiCombatUnits.length >= 3 && !player.isCounterattacking) {
+    } else if (canAttack && hasTargets && attackCooldown && aiCombatUnits.length >= 1 && !player.isCounterattacking) {
       // Normal attack behavior (when not counterattacking)
       player.lastAttackTime = now;
       
@@ -9543,17 +11185,34 @@ function updateAI() {
       });
     }
     
-    // --- BASE EXPANSION: when 10+ buildings on main island, expand ---
-    if (aiBuildings.length >= AI_CONFIG.expansionBuildingThreshold && !player.isExpanding) {
+    // --- BASE EXPANSION: when 8+ buildings on main island OR no space left, expand ---
+    // Track build failures to detect space shortage
+    if (!player.buildFailCount) player.buildFailCount = 0;
+    if (!player.lastBuildFailReset) player.lastBuildFailReset = now;
+    // Reset fail count every 30 seconds
+    if (now - player.lastBuildFailReset > 30000) {
+      player.buildFailCount = 0;
+      player.lastBuildFailReset = now;
+    }
+
+    const shouldExpand = (aiBuildings.length >= AI_CONFIG.expansionBuildingThreshold || player.buildFailCount >= 3) && !player.isExpanding;
+    if (shouldExpand) {
       const islandCenters = getIslandCenters();
       
       // Find closest island that we don't have buildings on
       const ownBuildingPositions = aiBuildings.map(b => ({ x: b.x, y: b.y }));
       
+      // Track islands to avoid (previously attacked during expansion)
+      if (!player.avoidIslands) player.avoidIslands = new Map(); // islandIdx -> avoidUntil timestamp
+      
       let bestIsland = null;
       let bestDist = Infinity;
+      let bestIslandIdx = -1;
       
-      islandCenters.forEach(island => {
+      islandCenters.forEach((island, idx) => {
+        // Skip islands we're avoiding (attacked there recently)
+        if (player.avoidIslands.has(idx) && now < player.avoidIslands.get(idx)) return;
+        
         // Check if we already have buildings on this island (within 1500 units)
         const hasBuilding = ownBuildingPositions.some(bp => {
           const dx = bp.x - island.x;
@@ -9568,59 +11227,381 @@ function updateAI() {
           if (dist < bestDist) {
             bestDist = dist;
             bestIsland = island;
+            bestIslandIdx = idx;
           }
         }
       });
       
       if (bestIsland) {
         player.isExpanding = true;
-        player.expansionTarget = { x: bestIsland.x, y: bestIsland.y };
+        player.expansionTarget = { x: bestIsland.x, y: bestIsland.y, islandIdx: bestIslandIdx };
         player.expansionBuilt = [];
+        player.expansionEscortSent = false;
+        player.expansionWorkerIds = [];
+        player.buildFailCount = 0;
         console.log(`AI ${player.username} expanding to island at (${bestIsland.x.toFixed(0)}, ${bestIsland.y.toFixed(0)})`);
       }
     }
     
-    // Process expansion: send workers to build on the new island
+    // Process expansion: send workers + escort to build on the new island
     if (player.isExpanding && player.expansionTarget) {
-      const expansionBuildings = ['power_plant', 'shipyard', 'missile_silo', 'defense_tower'];
+      const expansionBuildings = ['power_plant', 'shipyard', 'naval_academy', 'missile_silo', 'defense_tower'];
       if (!player.expansionBuilt) player.expansionBuilt = [];
       
-      const nextBuild = expansionBuildings.find(bt => !player.expansionBuilt.includes(bt));
+      // --- Send escort with expansion (once) ---
+      if (!player.expansionEscortSent && aiCombatUnits.length >= 2) {
+        const escortCount = Math.min(Math.ceil(aiCombatUnits.length * 0.3), 5);
+        const idleUnits = aiCombatUnits.filter(u => !u.attackTargetId);
+        const escorts = idleUnits.slice(0, escortCount);
+        escorts.forEach(u => {
+          assignMoveTarget(u, player.expansionTarget.x, player.expansionTarget.y);
+          u.attackMove = true;
+          u._isExpansionEscort = true;
+        });
+        player.expansionEscortSent = true;
+        if (escorts.length > 0) {
+          console.log(`AI ${player.username} sending ${escorts.length} escorts to expansion island`);
+        }
+      }
       
-      if (nextBuild) {
-        // Find an idle worker
-        const expandWorker = aiWorkers.find(w => !w.buildingType && !w.targetX);
-        if (expandWorker) {
-          const costs = { power_plant: 150, shipyard: 200, missile_silo: MISSILE_SILO_COST, defense_tower: 250 };
-          const cost = costs[nextBuild] || 200;
+      // --- Check if expansion workers are under attack → reroute ---
+      if (player.expansionWorkerIds && player.expansionWorkerIds.length > 0) {
+        let workerUnderAttack = false;
+        for (const wid of player.expansionWorkerIds) {
+          let found = false;
+          gameState.units.forEach(u => {
+            if (u.id === wid && u.userId === playerId) {
+              found = true;
+              // Check if any enemy unit is within 400 of this worker
+              gameState.units.forEach(eu => {
+                if (eu.userId !== playerId && eu.type !== 'worker') {
+                  const dx = eu.x - u.x;
+                  const dy = eu.y - u.y;
+                  if (dx * dx + dy * dy < 400 * 400) {
+                    workerUnderAttack = true;
+                  }
+                }
+              });
+              // Also check enemy buildings (defense towers)
+              gameState.buildings.forEach(eb => {
+                if (eb.userId !== playerId && eb.type === 'defense_tower' && eb.buildProgress >= 100) {
+                  const dx = eb.x - u.x;
+                  const dy = eb.y - u.y;
+                  if (dx * dx + dy * dy < 600 * 600) {
+                    workerUnderAttack = true;
+                  }
+                }
+              });
+            }
+          });
+          if (!found) workerUnderAttack = true; // Worker died
+        }
+        
+        if (workerUnderAttack) {
+          console.log(`AI ${player.username} expansion worker under attack! Rerouting...`);
+          // Save target before clearing
+          const threatArea = { x: player.expansionTarget.x, y: player.expansionTarget.y };
+          // Mark this island as avoid for 120 seconds
+          if (!player.avoidIslands) player.avoidIslands = new Map();
+          if (player.expansionTarget.islandIdx !== undefined) {
+            player.avoidIslands.set(player.expansionTarget.islandIdx, now + 120000);
+          }
+          // Cancel current expansion
+          player.isExpanding = false;
+          player.expansionTarget = null;
+          player.expansionBuilt = [];
+          player.expansionWorkerIds = [];
+          player.expansionEscortSent = false;
+          // Send nearby combat units to attack the threat area
+          const nearbyUnits = aiCombatUnits.filter(u => {
+            const dx = u.x - threatArea.x;
+            const dy = u.y - threatArea.y;
+            return dx * dx + dy * dy < 2000 * 2000;
+          });
+          nearbyUnits.forEach(u => {
+            assignMoveTarget(u, threatArea.x, threatArea.y);
+            u.attackMove = true;
+          });
+          // Will retry expansion next tick (picks different island due to avoidIslands)
+        }
+      }
+      
+      // --- Build next expansion building ---
+      if (player.isExpanding) {
+        const nextBuild = expansionBuildings.find(bt => !player.expansionBuilt.includes(bt));
+      
+        if (nextBuild) {
+          // Find an idle worker
+          const expandWorker = aiWorkers.find(w => !w.buildingType && !w.targetX);
+          if (expandWorker) {
+            const costs = { power_plant: 150, shipyard: 200, naval_academy: 300, missile_silo: MISSILE_SILO_COST, defense_tower: 250 };
+            const cost = costs[nextBuild] || 200;
           
-          if (player.resources >= cost) {
-            const angle = Math.random() * Math.PI * 2;
-            const distance = 100 + Math.random() * 200;
-            const buildX = player.expansionTarget.x + Math.cos(angle) * distance;
-            const buildY = player.expansionTarget.y + Math.sin(angle) * distance;
+            if (player.resources >= cost) {
+              let pos = null;
+              for (let attempt = 0; attempt < 8; attempt++) {
+                const angle = Math.random() * Math.PI * 2;
+                const distance = 100 + Math.random() * 200;
+                const bx = player.expansionTarget.x + Math.cos(angle) * distance;
+                const by = player.expansionTarget.y + Math.sin(angle) * distance;
+                pos = findNearestValidBuildingPosition(nextBuild, bx, by, { maxSearchRadius: 600 });
+                if (pos) break;
+              }
             
-            if (isOnLand(buildX, buildY)) {
-              expandWorker.buildingType = nextBuild;
-              expandWorker.buildTargetX = buildX;
-              expandWorker.buildTargetY = buildY;
-              expandWorker.targetX = buildX;
-              expandWorker.targetY = buildY;
-              expandWorker.gatheringResourceId = null;
-              player.expansionBuilt.push(nextBuild);
+              if (pos) {
+                expandWorker.buildingType = nextBuild;
+                expandWorker.buildTargetX = pos.x;
+                expandWorker.buildTargetY = pos.y;
+                expandWorker.targetX = pos.x;
+                expandWorker.targetY = pos.y;
+                expandWorker.gatheringResourceId = null;
+                player.expansionBuilt.push(nextBuild);
+                // Track this worker for attack detection
+                if (!player.expansionWorkerIds) player.expansionWorkerIds = [];
+                player.expansionWorkerIds.push(expandWorker.id);
+              }
             }
           }
+        } else {
+          // All expansion buildings queued
+          player.isExpanding = false;
+          player.expansionTarget = null;
+          player.expansionWorkerIds = [];
+          player.expansionEscortSent = false;
+          console.log(`AI ${player.username} expansion complete`);
         }
-      } else {
-        // All expansion buildings queued
-        player.isExpanding = false;
-        player.expansionTarget = null;
-        console.log(`AI ${player.username} expansion complete`);
       }
     }
     
     // Combat is processed in the global updateGame() loop for all players (including AI).
   });
+  if (PERF_DEBUG_ENABLED) {
+    perfRecord('tick.updateAI', perfNowMs() - perfStart);
+  }
+}
+
+function createBenchmarkPlayer(userId, username, baseX, baseY, isAI = false) {
+  const player = {
+    userId,
+    username,
+    resources: 50000,
+    population: 0,
+    maxPopulation: PLAYER_MAX_POPULATION_CAP,
+    combatPower: 0,
+    score: 0,
+    scoreFromKills: 0,
+    baseX,
+    baseY,
+    hasBase: true,
+    researchedSLBM: false,
+    missiles: 0,
+    battleshipModeComboUnlocked: false,
+    online: true,
+    isAI,
+    lastScoutTime: 0,
+    lastAttackTime: 0,
+    scoutTargets: [],
+    knownEnemyBases: [],
+    knownEnemyPositions: [],
+    recentAttackLocations: [],
+    priorityTargets: [],
+    isCounterattacking: false,
+    counterattackTarget: null,
+    targetCombatPower: 60
+  };
+  gameState.players.set(userId, player);
+  if (ENABLE_SERVER_FOG_SNAPSHOTS) {
+    gameState.fogOfWar.set(userId, new Map());
+  }
+  return player;
+}
+
+function createBenchmarkBuilding(userId, type, x, y, buildProgress = 100) {
+  const hpByType = {
+    headquarters: 1500,
+    shipyard: 800,
+    power_plant: 600,
+    defense_tower: 700,
+    naval_academy: 700,
+    carbase: 800,
+    missile_silo: 1000
+  };
+  const building = {
+    id: createUniqueEntityId(900),
+    userId,
+    type,
+    x,
+    y,
+    hp: hpByType[type] || 700,
+    maxHp: hpByType[type] || 700,
+    buildProgress,
+    slbmCount: 0,
+    productionQueue: []
+  };
+  gameState.buildings.set(building.id, building);
+  return building;
+}
+
+function findBenchmarkLandPosition(x, y) {
+  const clamped = clampToMapBounds(x, y);
+  return findNearestLandPosition(clamped.x, clamped.y) || clamped;
+}
+
+function findBenchmarkWaterPosition(unitType, x, y) {
+  const clamped = clampToMapBounds(x, y);
+  const radii = [220, 420, 700, 1100, 1600];
+  for (let i = 0; i < radii.length; i++) {
+    const pos = findNearestNavalPassableWaterPosition(unitType, clamped.x, clamped.y, radii[i]);
+    if (pos) return pos;
+  }
+  return clamped;
+}
+
+function createBenchmarkCombatUnit(userId, unitType, x, y) {
+  const unitDef = getUnitDefinition(unitType);
+  const unit = {
+    id: createUniqueEntityId(950),
+    userId,
+    type: unitType,
+    x,
+    y,
+    hp: unitDef.hp,
+    maxHp: unitDef.hp,
+    damage: unitDef.damage,
+    speed: unitDef.speed,
+    attackRange: unitDef.attackRange,
+    attackCooldownMs: unitDef.attackCooldownMs,
+    targetX: null,
+    targetY: null,
+    gatheringResourceId: null,
+    buildingType: null,
+    buildTargetX: null,
+    buildTargetY: null,
+    isDetected: unitType !== 'submarine' && unitType !== 'mine',
+    kills: 0
+  };
+  if (unitType === 'missile_launcher') {
+    unit.deployState = 'deployed';
+    unit.deployStateEndsAt = null;
+    unit.speed = 0;
+    unit.attackRange = MISSILE_LAUNCHER_DEPLOYED_RANGE;
+  }
+  initializeUnitRuntimeState(unit);
+  gameState.units.set(unit.id, unit);
+  const owner = gameState.players.get(userId);
+  if (owner) {
+    owner.population += getUnitPopulationCost(unit);
+  }
+  return unit;
+}
+
+function seedBenchmarkRoom(unitsPerPlayer = 50) {
+  switchRoom('server1');
+  clearCurrentRoomTransientState();
+  gameState.aiRespawnTimers.forEach(timer => clearTimeout(timer));
+  gameState.aiRespawnTimers.clear();
+  gameState.units.clear();
+  gameState.buildings.clear();
+  gameState.players.clear();
+  gameState.fogOfWar.clear();
+  gameState.squads.clear();
+  if (gameState.pathCache) {
+    gameState.pathCache.clear();
+  }
+  gameState.activeRedZones = [];
+  gameState.lastUpdate = Date.now();
+
+  const map = gameState.map;
+  const corners = [
+    { land: findBenchmarkLandPosition(420, 420), water: findBenchmarkWaterPosition('destroyer', 760, 760) },
+    { land: findBenchmarkLandPosition(map.width - 420, 420), water: findBenchmarkWaterPosition('destroyer', map.width - 760, 760) },
+    { land: findBenchmarkLandPosition(420, map.height - 420), water: findBenchmarkWaterPosition('destroyer', 760, map.height - 760) },
+    { land: findBenchmarkLandPosition(map.width - 420, map.height - 420), water: findBenchmarkWaterPosition('destroyer', map.width - 760, map.height - 760) }
+  ];
+  const players = [
+    createBenchmarkPlayer(1, 'Bench_Human', corners[0].land.x, corners[0].land.y, false),
+    createBenchmarkPlayer(-1000, 'Bench_AI_1', corners[1].land.x, corners[1].land.y, true),
+    createBenchmarkPlayer(-1001, 'Bench_AI_2', corners[2].land.x, corners[2].land.y, true),
+    createBenchmarkPlayer(-1002, 'Bench_AI_3', corners[3].land.x, corners[3].land.y, true)
+  ];
+
+  players.forEach((player, index) => {
+    const land = corners[index].land;
+    createBenchmarkBuilding(player.userId, 'headquarters', land.x, land.y, 100);
+    createBenchmarkBuilding(player.userId, 'power_plant', land.x + 120, land.y + 80, 100);
+    createBenchmarkBuilding(player.userId, 'shipyard', land.x + 180, land.y + 140, 100);
+    createBenchmarkBuilding(player.userId, 'naval_academy', land.x + 240, land.y + 200, 100);
+    createBenchmarkBuilding(player.userId, 'defense_tower', land.x - 120, land.y - 80, 100);
+    const workers = spawnStartingWorkers(player.userId, land.x, land.y, STARTING_WORKER_COUNT);
+    player.population += workers.length;
+  });
+
+  const center = { x: map.width / 2, y: map.height / 2 };
+  const unitPattern = ['destroyer', 'frigate', 'cruiser', 'destroyer', 'submarine', 'battleship'];
+  players.forEach((player, index) => {
+    const waterBase = corners[index].water;
+    const target = center;
+    for (let i = 0; i < unitsPerPlayer; i++) {
+      const unitType = unitPattern[i % unitPattern.length];
+      const col = i % 10;
+      const row = Math.floor(i / 10);
+      const offsetX = (col - 4.5) * 90;
+      const offsetY = (row - Math.floor(unitsPerPlayer / 20)) * 140;
+      const spawnPos = findBenchmarkWaterPosition(unitType, waterBase.x + offsetX, waterBase.y + offsetY);
+      const unit = createBenchmarkCombatUnit(player.userId, unitType, spawnPos.x, spawnPos.y);
+      unit.attackMove = true;
+      assignMoveTarget(unit, target.x + ((index % 2 === 0) ? 260 : -260), target.y + (index < 2 ? 160 : -160));
+    }
+  });
+
+  players.forEach(player => {
+    if (!player.isAI) return;
+    player.knownEnemyPositions = [{
+      x: players[0].baseX,
+      y: players[0].baseY,
+      playerId: players[0].userId,
+      discoveredAt: Date.now(),
+      lastSeenStrength: 500
+    }];
+  });
+
+  recalculateAllPlayerCombatPowerAndScores();
+}
+
+function runPerformanceBenchmark() {
+  const unitsPerPlayer = Math.max(10, Number(process.env.MW_BENCH_UNITS_PER_PLAYER || 50));
+  const warmupTicks = Math.max(0, Number(process.env.MW_BENCH_WARMUP_TICKS || 20));
+  const benchmarkTicks = Math.max(10, Number(process.env.MW_BENCH_TICKS || 90));
+  const aiTickStride = Math.max(1, Math.round((AI_CONFIG.updateInterval || 1000) / (1000 / GAME_TICK_RATE)));
+
+  seedBenchmarkRoom(unitsPerPlayer);
+  console.log(`[PERF] Benchmark room seeded: players=${gameState.players.size} units=${gameState.units.size} buildings=${gameState.buildings.size}`);
+
+  const deltaTime = 1 / GAME_TICK_RATE;
+  for (let tick = 0; tick < warmupTicks; tick++) {
+    updateGame(deltaTime);
+    if (tick % aiTickStride === 0) {
+      updateAI();
+    }
+  }
+
+  perfMetrics.clear();
+  perfWindowStartedAt = Date.now();
+  perfLastFlushAt = Date.now();
+
+  const startMs = perfNowMs();
+  for (let tick = 0; tick < benchmarkTicks; tick++) {
+    updateGame(deltaTime);
+    if (tick % aiTickStride === 0) {
+      updateAI();
+    }
+  }
+  const elapsedMs = perfNowMs() - startMs;
+
+  console.log(`[PERF] Benchmark complete: ticks=${benchmarkTicks} elapsed=${elapsedMs.toFixed(2)}ms avgTick=${(elapsedMs / benchmarkTicks).toFixed(2)}ms`);
+  perfRecord('benchmark.total', elapsedMs);
+  perfFlush('benchmark', true);
+  process.exit(0);
 }
 
 function emitRedZoneSync() {
@@ -9782,7 +11763,10 @@ function createRedZoneEntry(island, now) {
 
 function rollNewRedZones(now) {
   const islands = getIslandCenters();
-  gameState.nextRedZoneRollAt = now + RED_ZONE_SELECTION_INTERVAL_MS;
+  // Dynamic interval: more entities alive → faster red zone cycles (min 60s, default 600s)
+  const totalEntities = gameState.buildings.size + gameState.units.size;
+  const dynamicInterval = Math.max(60000, RED_ZONE_SELECTION_INTERVAL_MS - Math.floor(totalEntities / 10) * 30000);
+  gameState.nextRedZoneRollAt = now + dynamicInterval;
   gameState.lastRedZoneCountdownSecond = null;
 
   if (!Array.isArray(islands) || islands.length === 0) {
@@ -9799,7 +11783,32 @@ function rollNewRedZones(now) {
     shuffled[swapIndex] = temp;
   }
 
-  const selected = shuffled.slice(0, Math.min(RED_ZONE_ISLAND_COUNT, shuffled.length));
+  // Find islands occupied by human (non-AI) players
+  const humanIslandIds = new Set();
+  gameState.buildings.forEach(b => {
+    const p = gameState.players.get(b.userId);
+    if (!p || p.isAI) return;
+    let bestDist = Infinity;
+    let bestIsland = null;
+    islands.forEach(isl => {
+      const dx = b.x - isl.x; const dy = b.y - isl.y;
+      const d = dx * dx + dy * dy;
+      if (d < bestDist) { bestDist = d; bestIsland = isl; }
+    });
+    if (bestIsland && bestDist < 2500 * 2500) humanIslandIds.add(bestIsland.id);
+  });
+
+  let selected;
+  const humanIslands = shuffled.filter(i => humanIslandIds.has(i.id));
+  const otherIslands = shuffled.filter(i => !humanIslandIds.has(i.id));
+  if (humanIslands.length > 0) {
+    // Force at least 1 random human island, fill remaining slots from the rest
+    const forced = humanIslands[Math.floor(Math.random() * humanIslands.length)];
+    const rest = [...humanIslands.filter(x => x !== forced), ...otherIslands];
+    selected = [forced, ...rest].slice(0, Math.min(RED_ZONE_ISLAND_COUNT, islands.length));
+  } else {
+    selected = shuffled.slice(0, Math.min(RED_ZONE_ISLAND_COUNT, shuffled.length));
+  }
   gameState.activeRedZones = selected.map(island => createRedZoneEntry(island, now));
   emitRedZoneSync();
   emitRedZoneActivationAlert();
@@ -10021,15 +12030,17 @@ function buildUnitForAI(userId, buildingId, unitType) {
   return false;
 }
 
-// Run AI update loop - only for rooms with connected humans
-setInterval(() => {
-  gameRooms.forEach((room, roomId) => {
-    if (!roomHasHumanPlayers(roomId)) return;
-    switchRoom(roomId);
-    updateAI();
-    syncSlbmId();
-  });
-}, AI_CONFIG.updateInterval);
+if (!BENCHMARK_MODE) {
+  // Run AI update loop - only for rooms with connected humans
+  setInterval(() => {
+    gameRooms.forEach((room, roomId) => {
+      if (!roomHasHumanPlayers(roomId)) return;
+      switchRoom(roomId);
+      updateAI();
+      syncSlbmId();
+    });
+  }, AI_CONFIG.updateInterval);
+}
 
 // ==================== END AI PLAYER SYSTEM ====================
 
@@ -10038,6 +12049,10 @@ if (!process.env.JWT_SECRET) {
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`${APP_NAME} server running on port ${PORT}`);
-});
+if (BENCHMARK_MODE) {
+  runPerformanceBenchmark();
+} else {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`${APP_NAME} server running on port ${PORT}`);
+  });
+}

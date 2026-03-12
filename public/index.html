@@ -7,9 +7,74 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <title>MW Craft</title>
-    <link rel="stylesheet" href="style.css?v=20260310b">
+    <link rel="stylesheet" href="style.css?v=nocache_x9r7k2m">
 </head>
 <body>
+    <!-- AI Training Panel (admin - outside any screen so it's always accessible) -->
+    <div id="trainingPanel" style="display:none;">
+        <div class="training-header">
+            <h3>🧠 AI 강화학습</h3>
+            <button id="trainingCloseBtn" class="training-close">&times;</button>
+        </div>
+        <div class="training-body">
+            <div class="training-info" style="background:#0d1117;border:1px solid #333;border-radius:6px;padding:8px;margin-bottom:10px;font-size:11px;color:#8b949e;">
+                💡 난이도별로 독립된 가중치(Q-table)를 사용합니다.<br>
+                <b style="color:#4a9eff;">어려움</b>과 <b style="color:#ff6b6b;">전문가</b>를 각각 따로 학습시키세요.<br>
+                🔒 고정하면 학습/온라인 업데이트가 차단됩니다.
+            </div>
+
+            <!-- Difficulty selector tabs -->
+            <div style="display:flex;gap:4px;margin-bottom:10px;">
+                <button class="train-diff-tab active" data-diff="hard" style="flex:1;padding:6px;border:2px solid #4a9eff;border-radius:6px;background:#1a2332;color:#4a9eff;font-weight:bold;cursor:pointer;">🔵 어려움</button>
+                <button class="train-diff-tab" data-diff="expert" style="flex:1;padding:6px;border:2px solid #555;border-radius:6px;background:#1a1f25;color:#888;font-weight:bold;cursor:pointer;">🔴 전문가</button>
+            </div>
+
+            <!-- Per-difficulty summary cards -->
+            <div id="trainDiffSummary" style="display:flex;gap:6px;margin-bottom:10px;">
+                <div id="summaryHard" style="flex:1;background:#0d1117;border:1px solid #333;border-radius:6px;padding:6px;font-size:11px;">
+                    <div style="color:#4a9eff;font-weight:bold;">어려움</div>
+                    <div>상태: <span id="sumHardStates">0</span> | 학습: <span id="sumHardEpisodes">0</span></div>
+                    <div id="sumHardFrozen" style="color:#888;">🔓 활성</div>
+                </div>
+                <div id="summaryExpert" style="flex:1;background:#0d1117;border:1px solid #333;border-radius:6px;padding:6px;font-size:11px;">
+                    <div style="color:#ff6b6b;font-weight:bold;">전문가</div>
+                    <div>상태: <span id="sumExpertStates">0</span> | 학습: <span id="sumExpertEpisodes">0</span></div>
+                    <div id="sumExpertFrozen" style="color:#888;">🔓 활성</div>
+                </div>
+            </div>
+
+            <div class="training-status">
+                <div>상태: <span id="trainStatus">대기중</span> <span id="trainFrozenBadge" style="display:none;color:#ff4444;font-weight:bold;">🔒 고정됨</span></div>
+                <div>에피소드: <span id="trainEpisode">0</span> / <span id="trainMaxEpisode">0</span></div>
+                <div>총 학습: <span id="trainTotalEpisodes">0</span> 에피소드</div>
+                <div>탐색 상태: <span id="trainStates">0</span></div>
+                <div>평균 보상: <span id="trainAvgReward">0</span></div>
+                <div>탐험률(ε): <span id="trainEpsilon">0.3</span></div>
+            </div>
+            <div style="margin-bottom:10px;">
+                <div style="color:#aaa;font-size:12px;margin-bottom:6px;">빠른 시작:</div>
+                <button class="train-preset-btn" data-episodes="500">⚡ 500회</button>
+                <button class="train-preset-btn" data-episodes="5000">🔥 5,000회</button>
+                <button class="train-preset-btn" data-episodes="50000">💪 50,000회</button>
+                <button class="train-preset-btn" data-episodes="200000">🏆 200,000회</button>
+            </div>
+            <div class="training-controls">
+                <label style="color:#aaa;font-size:12px;">에피소드:</label>
+                <input type="number" id="trainEpisodeInput" value="5000" min="10" max="999999" style="width:90px;padding:4px;background:#1a1f25;color:#fff;border:1px solid #555;border-radius:4px;">
+                <button id="trainStartBtn" class="train-btn train-start">학습 시작</button>
+                <button id="trainStopBtn" class="train-btn train-stop" disabled>중단</button>
+            </div>
+            <div class="training-controls" style="margin-top:6px;">
+                <label style="color:#aaa;font-size:12px;display:flex;align-items:center;gap:4px;">
+                    <input type="checkbox" id="trainContinuous"> 연속 학습
+                </label>
+                <button id="trainFreezeBtn" class="train-btn" style="background:#2d1b4e;color:#d4a5ff;">🔒 고정</button>
+                <button id="trainResetBtn" class="train-btn" style="background:#8b4513;color:#fff;margin-left:auto;">초기화</button>
+            </div>
+            <div id="trainingLog" class="training-log"></div>
+        </div>
+    </div>
+
     <!-- Login Screen -->
     <div id="loginScreen" class="screen active">
         <div class="login-container">
@@ -23,6 +88,16 @@
                         <option value="server2">서버 2</option>
                     </select>
                     <div id="serverInfo" style="color: #888; font-size: 11px; margin-top: 4px;"></div>
+                </div>
+                <div style="margin: 8px 0;">
+                    <label style="color: #aaa; font-size: 13px; display: block; margin-bottom: 4px;">AI 난이도</label>
+                    <select id="aiDifficultySelect" style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #8f99a3; background: #20252b; color: #fff; font-size: 14px; cursor: pointer;">
+                        <option value="easy">쉬움 - 초보자용</option>
+                        <option value="normal" selected>보통 - 기본 AI</option>
+                        <option value="hard">어려움 - 강화학습 AI</option>
+                        <option value="expert">전문가 - 최강 AI</option>
+                    </select>
+                    <div id="difficultyDesc" style="color: #888; font-size: 11px; margin-top: 4px;">규칙 기반 AI, 기본 난이도</div>
                 </div>
                 <button id="loginBtn">접속</button>
                 <div id="authError" class="error"></div>
@@ -54,14 +129,16 @@
                 <span class="hud-label">점수:</span>
                 <span id="score">0</span>
             </div>
+            <div id="aiAddZone" title="" style="width:28px;height:100%;cursor:default;flex-shrink:0;"></div>
             <button id="resetBtn" class="reset-btn" title="내 기지와 모든 데이터 초기화">내 기지 초기화</button>
+            <div id="aiRemoveZone" title="" style="width:20px;height:100%;cursor:default;flex-shrink:0;"></div>
             <button id="logoutBtn" class="logout-btn">로그아웃</button>
             <span id="modeIndicator" style="display:none;color:#ff4444;font-weight:bold;margin-left:15px;font-size:14px;">⚔️ 공격 모드 (클릭으로 대상 지정)</span>
         </div>
 
         <!-- Rankings Panel -->
         <div id="rankingsPanel">
-            <h3>🏆 상위 5위 랭킹</h3>
+            <h3 id="rankingsToggle" onclick="document.getElementById('rankingsPanel').classList.toggle('rankings-open')" style="cursor:pointer;">🏆 상위 5위 랭킹 <span id="rankingsArrow">▶</span></h3>
             <div id="rankingsList"></div>
         </div>
 
@@ -190,6 +267,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.3.2/dist/pixi.min.js"></script>
     <script src="/socket.io/socket.io.js"></script>
-    <script src="game.js?v=1773115500005"></script>
+    <script src="game.js?v=nocache_diff_v2"></script>
 </body>
 </html>

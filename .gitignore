@@ -3,3 +3,6 @@ game.db
 .env
 *.log
 .DS_Store
+ai-weights-hard.json
+ai-weights-expert.json
+*.gz.test
