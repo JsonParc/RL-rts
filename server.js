@@ -17,8 +17,8 @@ const io = socketIo(server);
 const aiTraining = require('./ai-training');
 const RL_SESSION_DIFFICULTIES = Object.freeze(['hard', 'expert']);
 const DEFAULT_AI_DIFFICULTY = 'normal';
-const ALLOW_AI_DIFFICULTY_SELECTION = false;
-const ALLOW_RL_WEIGHT_LOADING = false;
+const ALLOW_AI_DIFFICULTY_SELECTION = true;
+const ALLOW_RL_WEIGHT_LOADING = true;
 const EMPTY_TRAINING_STATS = Object.freeze({
   episodes: 0,
   states: 0,
