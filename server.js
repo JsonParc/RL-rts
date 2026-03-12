@@ -43,6 +43,12 @@ async function ensureTrainingSessionLoaded(difficulty) {
         if (!RL_WEIGHT_UPDATES_ENABLED) {
           session.frozen = true;
         }
+        const stateCount = Number.isFinite(session.loadedStateCount)
+          ? session.loadedStateCount
+          : Object.keys(session.qTable.table || {}).length;
+        if (!RL_WEIGHT_UPDATES_ENABLED && stateCount <= 0) {
+          throw new Error(`No usable RL states loaded for ${difficulty}`);
+        }
         trainingSessions[difficulty] = session;
       }
       return session;

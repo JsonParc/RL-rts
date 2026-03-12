@@ -38,7 +38,75 @@ function hasCachedWeights(difficulty) {
   return fs.existsSync(paths.jsonPath) || fs.existsSync(paths.gzipPath);
 }
 
-function downloadFileWithRedirects(url, destinationPath, redirectCount = 0) {
+function mergeCookieHeader(existingHeader, setCookieHeaders) {
+  const cookieMap = new Map();
+  if (existingHeader) {
+    for (const part of String(existingHeader).split(/;\s*/)) {
+      const eqIndex = part.indexOf('=');
+      if (eqIndex <= 0) continue;
+      cookieMap.set(part.slice(0, eqIndex), part);
+    }
+  }
+  const headers = Array.isArray(setCookieHeaders)
+    ? setCookieHeaders
+    : (setCookieHeaders ? [setCookieHeaders] : []);
+  for (const rawHeader of headers) {
+    const pair = String(rawHeader).split(';')[0].trim();
+    const eqIndex = pair.indexOf('=');
+    if (eqIndex <= 0) continue;
+    cookieMap.set(pair.slice(0, eqIndex), pair);
+  }
+  return Array.from(cookieMap.values()).join('; ');
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;/g, '\'')
+    .replace(/&quot;/g, '"');
+}
+
+function decodeGoogleDriveEscapedUrl(value) {
+  return decodeHtmlEntities(String(value || ''))
+    .replace(/\\u003d/g, '=')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\u002f/g, '/')
+    .replace(/\\\//g, '/');
+}
+
+function isGoogleDriveUrl(url) {
+  return /drive\.google\.com|drive\.usercontent\.google\.com/.test(String(url || ''));
+}
+
+function extractGoogleDriveDownloadUrl(html, currentUrl) {
+  const downloadUrlMatch = html.match(/"downloadUrl":"([^"]+)"/i);
+  if (downloadUrlMatch) {
+    return decodeGoogleDriveEscapedUrl(downloadUrlMatch[1]);
+  }
+
+  const hrefMatch = html.match(/href="(\/uc\?export=download[^"]+)"/i);
+  if (hrefMatch) {
+    return new URL(decodeHtmlEntities(hrefMatch[1]), currentUrl).toString();
+  }
+
+  const formMatch = html.match(/<form[^>]+action="([^"]*uc\?export=download[^"]*)"/i);
+  if (formMatch) {
+    const actionUrl = new URL(decodeHtmlEntities(formMatch[1]), currentUrl);
+    const inputRegex = /<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi;
+    let inputMatch;
+    while ((inputMatch = inputRegex.exec(html)) !== null) {
+      actionUrl.searchParams.set(
+        decodeHtmlEntities(inputMatch[1]),
+        decodeHtmlEntities(inputMatch[2])
+      );
+    }
+    return actionUrl.toString();
+  }
+
+  return null;
+}
+
+function downloadFileWithRedirects(url, destinationPath, redirectCount = 0, cookieHeader = '') {
   return new Promise((resolve, reject) => {
     if (!url) {
       reject(new Error('Missing download URL'));
@@ -49,13 +117,22 @@ function downloadFileWithRedirects(url, destinationPath, redirectCount = 0) {
       return;
     }
     const client = url.startsWith('https://') ? https : http;
-    const request = client.get(url, (response) => {
+    const requestOptions = new URL(url);
+    requestOptions.headers = {
+      'User-Agent': 'Mozilla/5.0 MW-Craft-RL/1.0',
+      Accept: '*/*'
+    };
+    if (cookieHeader) {
+      requestOptions.headers.Cookie = cookieHeader;
+    }
+    const request = client.get(requestOptions, (response) => {
       const statusCode = response.statusCode || 0;
       const location = response.headers.location;
+      const nextCookieHeader = mergeCookieHeader(cookieHeader, response.headers['set-cookie']);
       if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
         response.resume();
         const nextUrl = new URL(location, url).toString();
-        resolve(downloadFileWithRedirects(nextUrl, destinationPath, redirectCount + 1));
+        resolve(downloadFileWithRedirects(nextUrl, destinationPath, redirectCount + 1, nextCookieHeader));
         return;
       }
       if (statusCode !== 200) {
@@ -69,9 +146,16 @@ function downloadFileWithRedirects(url, destinationPath, redirectCount = 0) {
         let body = '';
         response.setEncoding('utf8');
         response.on('data', (chunk) => {
-          if (body.length < 1024) body += chunk;
+          if (body.length < 262144) body += chunk;
         });
         response.on('end', () => {
+          if (isGoogleDriveUrl(url)) {
+            const nextUrl = extractGoogleDriveDownloadUrl(body, url);
+            if (nextUrl) {
+              resolve(downloadFileWithRedirects(nextUrl, destinationPath, redirectCount + 1, nextCookieHeader));
+              return;
+            }
+          }
           reject(new Error(`Weight download returned HTML instead of binary: ${body.slice(0, 120)}`));
         });
         return;
@@ -108,6 +192,7 @@ function downloadFileWithRedirects(url, destinationPath, redirectCount = 0) {
 
 async function ensureExternalWeightsCached(difficulty) {
   if (hasCachedWeights(difficulty)) {
+    console.log(`[AI-RL][${difficulty}] Using cached local weights file.`);
     return true;
   }
   const downloadUrl = getExternalWeightsUrl(difficulty);
@@ -116,8 +201,12 @@ async function ensureExternalWeightsCached(difficulty) {
   }
   if (!weightsDownloadPromises.has(difficulty)) {
     const { gzipPath } = getWeightsPaths(difficulty);
+    console.log(`[AI-RL][${difficulty}] Downloading weights from external source...`);
     const promise = downloadFileWithRedirects(downloadUrl, gzipPath)
-      .then(() => true)
+      .then(() => {
+        console.log(`[AI-RL][${difficulty}] External weights cached at ${path.basename(gzipPath)}.`);
+        return true;
+      })
       .finally(() => {
         weightsDownloadPromises.delete(difficulty);
       });
@@ -997,6 +1086,7 @@ class TrainingSession {
   constructor(difficulty) {
     this.difficulty = difficulty || 'default';
     this.qTable = new QTable();
+    this.loadedStateCount = 0;
     this.isTraining = false;
     this.frozen = false;         // When frozen, no weight updates (online learning or training)
     this.trainingSpeed = 1;
@@ -1015,7 +1105,12 @@ class TrainingSession {
     // Migrate old single weights file if this is 'hard' and no per-difficulty file exists
     if (this.difficulty === 'hard') {
       const oldPath = path.join(__dirname, 'ai-weights.json');
-      if (!fs.existsSync(this.weightsPath) && !fs.existsSync(this.compressedWeightsPath) && fs.existsSync(oldPath)) {
+      if (
+        !getExternalWeightsUrl(this.difficulty) &&
+        !fs.existsSync(this.weightsPath) &&
+        !fs.existsSync(this.compressedWeightsPath) &&
+        fs.existsSync(oldPath)
+      ) {
         try { fs.copyFileSync(oldPath, this.weightsPath); console.log('[AI-RL] Migrated old weights to hard'); } catch(e) {}
       }
     }
@@ -1033,7 +1128,8 @@ class TrainingSession {
         this.qTable.totalReward = data.totalReward || 0;
         this.qTable.recentRewards = data.recentRewards || [];
         this.frozen = !!data.frozen;
-        console.log(`[AI-RL][${this.difficulty}] Loaded weights: ${Object.keys(this.qTable.table).length} states, ${this.qTable.totalEpisodes} episodes, frozen: ${this.frozen}`);
+        this.loadedStateCount = Object.keys(this.qTable.table).length;
+        console.log(`[AI-RL][${this.difficulty}] Loaded weights: ${this.loadedStateCount} states, ${this.qTable.totalEpisodes} episodes, frozen: ${this.frozen}`);
         return true;
       }
       if (fs.existsSync(this.compressedWeightsPath)) {
@@ -1045,12 +1141,14 @@ class TrainingSession {
         this.qTable.totalReward = data.totalReward || 0;
         this.qTable.recentRewards = data.recentRewards || [];
         this.frozen = !!data.frozen;
-        console.log(`[AI-RL][${this.difficulty}] Loaded compressed weights: ${Object.keys(this.qTable.table).length} states, ${this.qTable.totalEpisodes} episodes, frozen: ${this.frozen}`);
+        this.loadedStateCount = Object.keys(this.qTable.table).length;
+        console.log(`[AI-RL][${this.difficulty}] Loaded compressed weights: ${this.loadedStateCount} states, ${this.qTable.totalEpisodes} episodes, frozen: ${this.frozen}`);
         return true;
       }
     } catch (e) {
       console.error(`[AI-RL][${this.difficulty}] Failed to load weights:`, e.message);
     }
+    this.loadedStateCount = 0;
     return false;
   }
 
