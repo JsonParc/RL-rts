@@ -6411,8 +6411,9 @@ if (loginPanel) {
 
 // Auth
 // AI Difficulty description
+const ENABLE_AI_TRAINING_UI = false;
 const DEFAULT_AI_DIFFICULTY = 'normal';
-const AI_DIFFICULTY_SELECTION_ENABLED = true;
+const AI_DIFFICULTY_SELECTION_ENABLED = false;
 const diffDescs = {
     easy: '약화된 규칙 기반 AI. 느린 판단, 적은 건물/유닛',
     normal: '규칙 기반 AI, 기본 난이도',
@@ -6494,6 +6495,10 @@ function addSystemLog(msg) {
 // --- AI Training Panel ---
 (function() {
     const panel = document.getElementById('trainingPanel');
+    if (!ENABLE_AI_TRAINING_UI) {
+        if (panel) panel.style.display = 'none';
+        return;
+    }
     const closeBtn = document.getElementById('trainingCloseBtn');
     const startBtn = document.getElementById('trainStartBtn');
     const stopBtn = document.getElementById('trainStopBtn');
@@ -6728,7 +6733,7 @@ async function login() {
         const data = await res.json();
 
         // AIMANAGEMODE: server returns special flag, open training panel
-        if (data.aiManageMode) {
+        if (ENABLE_AI_TRAINING_UI && data.aiManageMode) {
             isLoggingIn = false;
             document.getElementById('authError').textContent = '';
             const panel = document.getElementById('trainingPanel');

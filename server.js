@@ -7,6 +7,7 @@ const Database = require('better-sqlite3');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
+const ENABLE_AI_TRAINING = false;
 const BENCHMARK_MODE = process.env.MW_BENCHMARK === '1';
 const RL_WEIGHT_UPDATES_ENABLED = process.env.MW_ALLOW_RL_WEIGHT_UPDATES === '1';
 const RL_PRELOAD_ON_START = process.env.MW_PRELOAD_RL_ON_START !== '0';
@@ -14,11 +15,11 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
-const aiTraining = require('./ai-training');
+const aiTraining = ENABLE_AI_TRAINING ? require('./ai-training') : null;
 const RL_SESSION_DIFFICULTIES = Object.freeze(['hard', 'expert']);
 const DEFAULT_AI_DIFFICULTY = 'normal';
-const ALLOW_AI_DIFFICULTY_SELECTION = true;
-const ALLOW_RL_WEIGHT_LOADING = true;
+const ALLOW_AI_DIFFICULTY_SELECTION = false;
+const ALLOW_RL_WEIGHT_LOADING = false;
 const EMPTY_TRAINING_STATS = Object.freeze({
   episodes: 0,
   states: 0,
@@ -31,7 +32,7 @@ const trainingSessions = { hard: null, expert: null };
 const trainingSessionLoads = { hard: null, expert: null };
 let rlPreloadPromise = null;
 async function ensureTrainingSessionLoaded(difficulty) {
-  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE || !ALLOW_RL_WEIGHT_LOADING) {
+  if (!ENABLE_AI_TRAINING || !RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE || !ALLOW_RL_WEIGHT_LOADING) {
     return null;
   }
   if (trainingSessions[difficulty]) {
@@ -67,7 +68,7 @@ async function ensureTrainingSessionLoaded(difficulty) {
   return trainingSessionLoads[difficulty];
 }
 function preloadTrainingSessions() {
-  if (BENCHMARK_MODE || !RL_PRELOAD_ON_START || !ALLOW_RL_WEIGHT_LOADING) {
+  if (!ENABLE_AI_TRAINING || BENCHMARK_MODE || !RL_PRELOAD_ON_START || !ALLOW_RL_WEIGHT_LOADING) {
     return Promise.resolve([]);
   }
   if (!rlPreloadPromise) {
@@ -89,7 +90,7 @@ function preloadTrainingSessions() {
   return rlPreloadPromise;
 }
 function getTrainingSession(difficulty, { create = false } = {}) {
-  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE || !ALLOW_RL_WEIGHT_LOADING) {
+  if (!ENABLE_AI_TRAINING || !RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE || !ALLOW_RL_WEIGHT_LOADING) {
     return null;
   }
   let session = trainingSessions[difficulty];
@@ -119,7 +120,73 @@ function getTrainingSessionStatusSummary(difficulty) {
     loading: !!trainingSessionLoads[difficulty]
   };
 }
-const DIFFICULTY_PRESETS = aiTraining.DIFFICULTY_PRESETS;
+const FALLBACK_DIFFICULTY_PRESETS = Object.freeze({
+  easy: Object.freeze({
+    label: '쉬움',
+    epsilon: 0.6,
+    updateInterval: 4000,
+    buildingMultiplier: 0.5,
+    unitMultiplier: 0.5,
+    attackCooldown: 40000,
+    counterattackThreshold: 5,
+    useSkills: false,
+    useRL: false,
+    minPowerPlants: 2,
+    minShipyards: 1,
+    minSilos: 0,
+    minTowers: 1,
+    maxWorkers: 1
+  }),
+  normal: Object.freeze({
+    label: '보통',
+    epsilon: 0.3,
+    updateInterval: 2000,
+    buildingMultiplier: 1.0,
+    unitMultiplier: 1.0,
+    attackCooldown: 20000,
+    counterattackThreshold: 2,
+    useSkills: true,
+    useRL: false,
+    minPowerPlants: 3,
+    minShipyards: 1,
+    minSilos: 1,
+    minTowers: 2,
+    maxWorkers: 1
+  }),
+  hard: Object.freeze({
+    label: '어려움',
+    epsilon: 0.15,
+    updateInterval: 1500,
+    buildingMultiplier: 1.5,
+    unitMultiplier: 1.5,
+    attackCooldown: 10000,
+    counterattackThreshold: 1,
+    useSkills: true,
+    useRL: ENABLE_AI_TRAINING,
+    minPowerPlants: 4,
+    minShipyards: 2,
+    minSilos: 1,
+    minTowers: 3,
+    maxWorkers: 1
+  }),
+  expert: Object.freeze({
+    label: '전문가',
+    epsilon: 0.05,
+    updateInterval: 1000,
+    buildingMultiplier: 2.0,
+    unitMultiplier: 2.0,
+    attackCooldown: 5000,
+    counterattackThreshold: 1,
+    useSkills: true,
+    useRL: ENABLE_AI_TRAINING,
+    minPowerPlants: 5,
+    minShipyards: 2,
+    minSilos: 2,
+    minTowers: 4,
+    maxWorkers: 1
+  })
+});
+const DIFFICULTY_PRESETS = (aiTraining && aiTraining.DIFFICULTY_PRESETS) || FALLBACK_DIFFICULTY_PRESETS;
 
 function getEffectiveAIDifficulty(difficulty) {
   if (!ALLOW_AI_DIFFICULTY_SELECTION) return DEFAULT_AI_DIFFICULTY;
@@ -2667,6 +2734,9 @@ app.use((req, res, next) => {
     pathName === '/training.html' ||
     pathName.startsWith('/api/ai-training')
   );
+  if (isTrainingPath && !ENABLE_AI_TRAINING) {
+    return res.status(404).send('Not found');
+  }
   if (!isTrainingPath || isLocalTrainingAccessRequest(req)) {
     return next();
   }
@@ -2677,6 +2747,9 @@ app.use(express.static('public', { etag: false, maxAge: 0, lastModified: false }
 
 // AI Training standalone page
 app.get('/training', (req, res) => {
+  if (!ENABLE_AI_TRAINING) {
+    return res.status(404).send('Not found');
+  }
   res.sendFile(path.join(__dirname, 'public', 'training.html'));
 });
 
@@ -5669,6 +5742,9 @@ app.post('/api/login', (req, res) => {
   // AIMANAGEMODE: return special response to open training panel (do NOT create player)
   // Use 403 so even old cached game.js (which checks res.ok) won't proceed to connectToGame
   if (username === 'AIMANAGEMODE') {
+    if (!ENABLE_AI_TRAINING) {
+      return res.status(404).json({ error: 'Not found' });
+    }
     if (!isLocalTrainingAccessRequest(req)) {
       return res.status(404).json({ error: 'Not found' });
     }
@@ -10226,21 +10302,27 @@ function updateAI() {
     }
 
     // --- RL Integration ---
-    const rlActionIdx = activeSession ? activeSession.getAction(gameState, playerId, effectiveDifficulty) : null;
-    const rlAction = rlActionIdx !== null ? aiTraining.ACTIONS[rlActionIdx] : null;
+    const rlActionIdx = (ENABLE_AI_TRAINING && activeSession)
+      ? activeSession.getAction(gameState, playerId, effectiveDifficulty)
+      : null;
+    const rlAction = (ENABLE_AI_TRAINING && rlActionIdx !== null && aiTraining)
+      ? aiTraining.ACTIONS[rlActionIdx]
+      : null;
 
     // Online learning: record state/reward transitions
-    const currentState = aiTraining.encodeState(gameState, playerId);
-    if (activeSession && player._prevRLState && player._prevRLAction !== undefined) {
-      const snapshot = aiTraining.takeSnapshot(gameState, playerId);
-      const prevSnapshot = player._prevRLSnapshot || snapshot;
-      const reward = aiTraining.calculateReward(prevSnapshot, snapshot);
-      activeSession.recordTransition(player._prevRLState, player._prevRLAction, reward, currentState);
-    }
-    if (rlActionIdx !== null) {
-      player._prevRLState = currentState;
-      player._prevRLAction = rlActionIdx;
-      player._prevRLSnapshot = aiTraining.takeSnapshot(gameState, playerId);
+    if (ENABLE_AI_TRAINING && aiTraining) {
+      const currentState = aiTraining.encodeState(gameState, playerId);
+      if (activeSession && player._prevRLState && player._prevRLAction !== undefined) {
+        const snapshot = aiTraining.takeSnapshot(gameState, playerId);
+        const prevSnapshot = player._prevRLSnapshot || snapshot;
+        const reward = aiTraining.calculateReward(prevSnapshot, snapshot);
+        activeSession.recordTransition(player._prevRLState, player._prevRLAction, reward, currentState);
+      }
+      if (rlActionIdx !== null) {
+        player._prevRLState = currentState;
+        player._prevRLAction = rlActionIdx;
+        player._prevRLSnapshot = aiTraining.takeSnapshot(gameState, playerId);
+      }
     }
 
     // --- DEVELOPMENT: Build structures ---
