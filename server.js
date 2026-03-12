@@ -16,6 +16,8 @@ const io = socketIo(server);
 
 const aiTraining = require('./ai-training');
 const RL_SESSION_DIFFICULTIES = Object.freeze(['hard', 'expert']);
+const DEFAULT_AI_DIFFICULTY = 'normal';
+const ALLOW_AI_DIFFICULTY_SELECTION = false;
 const EMPTY_TRAINING_STATS = Object.freeze({
   episodes: 0,
   states: 0,
@@ -117,6 +119,12 @@ function getTrainingSessionStatusSummary(difficulty) {
   };
 }
 const DIFFICULTY_PRESETS = aiTraining.DIFFICULTY_PRESETS;
+
+function getEffectiveAIDifficulty(difficulty) {
+  if (!ALLOW_AI_DIFFICULTY_SELECTION) return DEFAULT_AI_DIFFICULTY;
+  return DIFFICULTY_PRESETS[difficulty] ? difficulty : DEFAULT_AI_DIFFICULTY;
+}
+
 const APP_NAME = 'MW Craft';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
 const GAME_TICK_RATE = 30; // 30 ticks per second
@@ -295,6 +303,8 @@ const ROOM_ANNIHILATION_MESSAGE = '거대한 악의 세력이 설치한 핵폭�
 const BATTLESHIP_COMBAT_STANCE_HP_COST_RATIO = 0.10;
 const BATTLESHIP_COMBAT_STANCE_ATTACK_SPEED_MULTIPLIER = 1.10;
 const BATTLESHIP_COMBAT_STANCE_MIN_ATTACK_COOLDOWN_MS = 150;
+const BATTLESHIP_COMBAT_STANCE_DECAY_DELAY_MS = 10000;
+const BATTLESHIP_COMBAT_STANCE_DECAY_INTERVAL_MS = 1000;
 const FRIGATE_ENGINE_OVERDRIVE_HP_COST_RATIO = 0.10;
 const FRIGATE_ENGINE_OVERDRIVE_SPEED_MULTIPLIER = 1.10;
 const FRIGATE_ENGINE_OVERDRIVE_MAX_EVASION = 0.80;
@@ -976,6 +986,56 @@ function refreshBattleshipCombatStance(unit) {
     : baseCooldown;
 }
 
+function noteBattleshipCombatActivity(unit, now = Date.now()) {
+  if (!unit || unit.type !== 'battleship') return;
+  unit.lastBattleshipCombatAt = now;
+  unit.lastCombatStanceDecayAt = now;
+}
+
+function updateBattleshipCombatStanceDecay(unit, now = Date.now(), inCombat = false) {
+  if (!unit || unit.type !== 'battleship') return;
+  if (!unit.combatStanceActive) {
+    unit.lastCombatStanceDecayAt = 0;
+    return;
+  }
+  if (inCombat) {
+    noteBattleshipCombatActivity(unit, now);
+    return;
+  }
+
+  const lastCombatAt = Number.isFinite(unit.lastBattleshipCombatAt) && unit.lastBattleshipCombatAt > 0
+    ? unit.lastBattleshipCombatAt
+    : (Number.isFinite(unit.lastAttackTime) ? unit.lastAttackTime : now);
+  const decayWindowStartAt = lastCombatAt + BATTLESHIP_COMBAT_STANCE_DECAY_DELAY_MS;
+  if (now < decayWindowStartAt) {
+    return;
+  }
+
+  const currentStacks = clampBattleshipCombatStanceStacks(unit);
+  if (currentStacks <= 0) {
+    unit.combatStanceActive = false;
+    unit.lastCombatStanceDecayAt = decayWindowStartAt;
+    refreshBattleshipModeState(unit);
+    return;
+  }
+
+  const lastDecayAt = Number.isFinite(unit.lastCombatStanceDecayAt) && unit.lastCombatStanceDecayAt >= decayWindowStartAt
+    ? unit.lastCombatStanceDecayAt
+    : decayWindowStartAt;
+  const decaySteps = Math.floor((now - lastDecayAt) / BATTLESHIP_COMBAT_STANCE_DECAY_INTERVAL_MS);
+  if (decaySteps <= 0) {
+    return;
+  }
+
+  const nextStacks = Math.max(0, currentStacks - decaySteps);
+  unit.combatStanceStacks = nextStacks;
+  unit.lastCombatStanceDecayAt = lastDecayAt + (decaySteps * BATTLESHIP_COMBAT_STANCE_DECAY_INTERVAL_MS);
+  if (nextStacks <= 0) {
+    unit.combatStanceActive = false;
+  }
+  refreshBattleshipModeState(unit);
+}
+
 function refreshBattleshipAegisState(unit) {
   if (!unit || unit.type !== 'battleship') return;
   const baseRange = getUnitBaseAttackRange(unit);
@@ -1033,6 +1093,7 @@ function applyBattleshipCombatStanceAttackCost(unit, now = Date.now()) {
     getBattleshipCombatStanceMaxStacks(unit),
     clampBattleshipCombatStanceStacks(unit) + 1
   );
+  noteBattleshipCombatActivity(unit, now);
   refreshBattleshipModeState(unit);
   return applyUnitSelfDamage(unit, stanceDamage, now);
 }
@@ -1058,6 +1119,12 @@ function initializeUnitRuntimeState(unit) {
   if (unit.type === 'battleship') {
     unit.combatStanceActive = !!unit.combatStanceActive;
     unit.combatStanceStacks = clampBattleshipCombatStanceStacks(unit);
+    unit.lastBattleshipCombatAt = Number.isFinite(unit.lastBattleshipCombatAt)
+      ? unit.lastBattleshipCombatAt
+      : (Number.isFinite(unit.lastAttackTime) ? unit.lastAttackTime : 0);
+    unit.lastCombatStanceDecayAt = Number.isFinite(unit.lastCombatStanceDecayAt)
+      ? unit.lastCombatStanceDecayAt
+      : 0;
     unit.battleshipAegisMode = !!unit.battleshipAegisMode;
     unit.battleshipModeComboUnlocked = !!unit.battleshipModeComboUnlocked;
     if (!Array.isArray(unit.battleshipAegisTurretCooldowns) || unit.battleshipAegisTurretCooldowns.length !== BATTLESHIP_AEGIS_TURRET_COUNT) {
@@ -2628,7 +2695,7 @@ app.get('/api/rooms', (req, res) => {
     const room = gameRooms.get(rc.id);
     const playerCount = room ? Array.from(room.players.values()).filter(p => p.online && !p.isAI).length : 0;
     const aiCount = room ? Array.from(room.players.values()).filter(p => p.isAI).length : 0;
-    const aiDifficulty = room ? (room.aiDifficulty || 'normal') : 'normal';
+    const aiDifficulty = room ? getEffectiveAIDifficulty(room.aiDifficulty) : DEFAULT_AI_DIFFICULTY;
     return { id: rc.id, name: rc.name, maxPlayers: rc.maxPlayers, playerCount, aiCount, aiDifficulty };
   });
   res.json(roomList);
@@ -2654,7 +2721,7 @@ function createRoomState() {
     nextRedZoneId: 1,
     nextRedZoneRollAt: Date.now() + RED_ZONE_SELECTION_INTERVAL_MS,
     lastRedZoneCountdownSecond: null,
-    aiDifficulty: 'normal'
+    aiDifficulty: DEFAULT_AI_DIFFICULTY
   };
 }
 
@@ -6325,7 +6392,7 @@ io.on('connection', (socket) => {
       buildings: initialState.buildings,
       missiles: player ? (player.missiles || 0) : 0,
       redZones: buildClientRedZonePayload(),
-      aiDifficulty: gameState.aiDifficulty || 'normal'
+      aiDifficulty: getEffectiveAIDifficulty(gameState.aiDifficulty)
     };
     
     console.log(`Sending init data: ${initData.players.length} players, ${initData.units.length} units, ${initData.buildings.length} buildings`);
@@ -6709,8 +6776,7 @@ io.on('connection', (socket) => {
   socket.on('setAIDifficulty', (data) => {
     switchRoom(socket.roomId);
     if (!gameState) return;
-    const difficulty = data && data.difficulty;
-    if (!DIFFICULTY_PRESETS[difficulty]) return;
+    const difficulty = getEffectiveAIDifficulty(data && data.difficulty);
     gameState.aiDifficulty = difficulty;
     io.to(socket.roomId).emit('aiDifficultyChanged', { difficulty, label: DIFFICULTY_PRESETS[difficulty].label });
     console.log(`[AI] Room ${socket.roomId} difficulty set to ${difficulty} by ${socket.username}`);
@@ -6991,6 +7057,8 @@ io.on('connection', (socket) => {
       if (unit.combatStanceActive) {
         unit.combatStanceActive = false;
         unit.combatStanceStacks = 0;
+        unit.lastBattleshipCombatAt = 0;
+        unit.lastCombatStanceDecayAt = 0;
         refreshBattleshipModeState(unit);
         applyUnitSelfDamage(unit, computeCurrentHpSelfDamage(unit, BATTLESHIP_COMBAT_STANCE_HP_COST_RATIO), now);
         return;
@@ -6999,6 +7067,7 @@ io.on('connection', (socket) => {
         return;
       }
       unit.combatStanceActive = true;
+      noteBattleshipCombatActivity(unit, now);
       refreshBattleshipModeState(unit);
     });
   });
@@ -9578,6 +9647,7 @@ function updateGame(deltaTime) {
     }
 
     if (unit.type === 'battleship' && unit.battleshipAegisMode) {
+      updateBattleshipCombatStanceDecay(unit, now, !!target);
       if (unit.attackTargetType === 'slbm') {
         unit.attackTargetId = null;
         unit.attackTargetType = null;
@@ -9593,6 +9663,10 @@ function updateGame(deltaTime) {
         now
       );
       return;
+    }
+
+    if (unit.type === 'battleship') {
+      updateBattleshipCombatStanceDecay(unit, now, !!target);
     }
 
     // 3) Process attack on target
@@ -10039,17 +10113,21 @@ function updateAI() {
   gameState.players.forEach((player, playerId) => {
     if (!player.isAI || !player.hasBase) return;
 
-    const roomDifficulty = gameState.aiDifficulty || 'normal';
-    const diffPreset = DIFFICULTY_PRESETS[roomDifficulty] || DIFFICULTY_PRESETS.normal;
+    const roomDifficulty = gameState.aiDifficulty || DEFAULT_AI_DIFFICULTY;
+    const effectiveDifficulty = getEffectiveAIDifficulty(roomDifficulty);
+    if (gameState.aiDifficulty !== effectiveDifficulty) {
+      gameState.aiDifficulty = effectiveDifficulty;
+    }
+    const diffPreset = DIFFICULTY_PRESETS[effectiveDifficulty] || DIFFICULTY_PRESETS[DEFAULT_AI_DIFFICULTY];
     if (player.lastAIThinkAt && now - player.lastAIThinkAt < (diffPreset.updateInterval || AI_CONFIG.updateInterval)) {
       return;
     }
     let activeSession = null;
-    if (diffPreset.useRL && RL_SESSION_DIFFICULTIES.includes(roomDifficulty) && !BENCHMARK_MODE) {
-      activeSession = getTrainingSession(roomDifficulty, { create: true });
+    if (diffPreset.useRL && RL_SESSION_DIFFICULTIES.includes(effectiveDifficulty) && !BENCHMARK_MODE) {
+      activeSession = getTrainingSession(effectiveDifficulty, { create: true });
       if (!activeSession) {
         if (!player._rlSessionWaitLoggedAt || now - player._rlSessionWaitLoggedAt > 15000) {
-          console.warn(`[AI-RL][${roomDifficulty}] Waiting for session load before AI think (player ${playerId}).`);
+          console.warn(`[AI-RL][${effectiveDifficulty}] Waiting for session load before AI think (player ${playerId}).`);
           player._rlSessionWaitLoggedAt = now;
         }
         return;
@@ -10147,7 +10225,7 @@ function updateAI() {
     }
 
     // --- RL Integration ---
-    const rlActionIdx = activeSession ? activeSession.getAction(gameState, playerId, roomDifficulty) : null;
+    const rlActionIdx = activeSession ? activeSession.getAction(gameState, playerId, effectiveDifficulty) : null;
     const rlAction = rlActionIdx !== null ? aiTraining.ACTIONS[rlActionIdx] : null;
 
     // Online learning: record state/reward transitions

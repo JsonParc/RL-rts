@@ -160,8 +160,12 @@ let battleshipBaseImage = null;
 let battleshipBaseLoaded = false;
 let battleshipAegisBaseImage = null;
 let battleshipAegisBaseLoaded = false;
+let ymtBattleshipBaseImage = null;
+let ymtBattleshipBaseLoaded = false;
 let mainCannonImage = null;
 let mainCannonLoaded = false;
+let ymtMainCannonImage = null;
+let ymtMainCannonLoaded = false;
 
 // Submarine image
 let submarineImage = null;
@@ -343,6 +347,18 @@ function loadBattleshipImages() {
         battleshipBaseImage.src = '/assets/images/units/battleshipbase.png';
     }
 
+    if (!ymtBattleshipBaseImage) {
+        ymtBattleshipBaseImage = new Image();
+        ymtBattleshipBaseImage.onload = () => {
+            ymtBattleshipBaseLoaded = true;
+            console.log('JsonParc battleship base image loaded');
+        };
+        ymtBattleshipBaseImage.onerror = () => {
+            console.warn('Failed to load ymtbattleshipbase.png');
+        };
+        ymtBattleshipBaseImage.src = '/assets/images/units/ymtbattleshipbase.png';
+    }
+
     if (!battleshipAegisBaseImage) {
         battleshipAegisBaseImage = new Image();
         battleshipAegisBaseImage.onload = () => {
@@ -365,6 +381,18 @@ function loadBattleshipImages() {
             console.warn('Failed to load maincannon.png');
         };
         mainCannonImage.src = '/assets/images/units/maincannon.png';
+    }
+
+    if (!ymtMainCannonImage) {
+        ymtMainCannonImage = new Image();
+        ymtMainCannonImage.onload = () => {
+            ymtMainCannonLoaded = true;
+            console.log('JsonParc main cannon image loaded');
+        };
+        ymtMainCannonImage.onerror = () => {
+            console.warn('Failed to load ymtmaincannon.png');
+        };
+        ymtMainCannonImage.src = '/assets/images/units/ymtmaincannon.png';
     }
 }
 
@@ -737,16 +765,37 @@ function getBattleshipTargetHoldMs(unit) {
     return Math.min(7000, Math.max(1200, cooldown + 600));
 }
 
+function isJsonParcBattleshipOwner(userId) {
+    if (userId == null) return false;
+    if (userId === gameState.userId) {
+        return gameState.username === 'JsonParc';
+    }
+    const player = gameState.players.get(userId);
+    return !!(player && player.username === 'JsonParc');
+}
+
 function getBattleshipBodyImage(unitOrType = null) {
     const unit = typeof unitOrType === 'object' ? unitOrType : null;
+    if (unit && isJsonParcBattleshipOwner(unit.userId) && ymtBattleshipBaseLoaded && ymtBattleshipBaseImage) {
+        return ymtBattleshipBaseImage;
+    }
     if (unit?.battleshipAegisMode && battleshipAegisBaseLoaded && battleshipAegisBaseImage) {
         return battleshipAegisBaseImage;
     }
     return (battleshipBaseLoaded && battleshipBaseImage) ? battleshipBaseImage : null;
 }
 
+function getBattleshipCannonImage(unitOrType = null) {
+    const unit = typeof unitOrType === 'object' ? unitOrType : null;
+    if (unit && isJsonParcBattleshipOwner(unit.userId) && ymtMainCannonLoaded && ymtMainCannonImage) {
+        return ymtMainCannonImage;
+    }
+    return (mainCannonLoaded && mainCannonImage) ? mainCannonImage : null;
+}
+
 function getBattleshipVisualMetrics(size = 60, unitOrType = null) {
     const bodyImage = getBattleshipBodyImage(unitOrType);
+    const cannonImage = getBattleshipCannonImage(unitOrType);
     const originalWidth = bodyImage
         ? bodyImage.width
         : DEFAULT_BATTLESHIP_BASE_WIDTH;
@@ -766,11 +815,11 @@ function getBattleshipVisualMetrics(size = 60, unitOrType = null) {
         y: (pos.y - centerY) * imageScaleY
     }));
 
-    const cannonOriginalWidth = (mainCannonLoaded && mainCannonImage)
-        ? mainCannonImage.width
+    const cannonOriginalWidth = cannonImage
+        ? cannonImage.width
         : DEFAULT_MAIN_CANNON_WIDTH;
-    const cannonOriginalHeight = (mainCannonLoaded && mainCannonImage)
-        ? mainCannonImage.height
+    const cannonOriginalHeight = cannonImage
+        ? cannonImage.height
         : DEFAULT_MAIN_CANNON_HEIGHT;
     const turretWidth = cannonOriginalWidth * imageScaleX;
     const turretHeight = cannonOriginalHeight * imageScaleY;
@@ -4556,7 +4605,10 @@ function syncUnitLayer() {
             } else {
                 const desiredBodyImg = getBattleshipBodyImage(unit);
                 const desiredBodySrc = desiredBodyImg ? desiredBodyImg.src : null;
+                const desiredCannonImg = getBattleshipCannonImage(unit);
+                const desiredCannonSrc = desiredCannonImg ? desiredCannonImg.src : null;
                 if (desiredBodySrc && entry.battleshipBodySrc !== desiredBodySrc) needsRecreate = true;
+                else if (desiredCannonSrc && entry.battleshipCannonSrc !== desiredCannonSrc) needsRecreate = true;
                 else if (entry.battleshipAegisMode !== !!unit.battleshipAegisMode) needsRecreate = true;
             }
         } else if (unit.type === 'cruiser' && entry.aegisMode !== !!unit.aegisMode) {
@@ -4644,6 +4696,7 @@ function createUnitSpriteEntry(unit, size) {
     let lastColor = 0;
     let lastImageSrc = null;
     let battleshipBodySrc = null;
+    let battleshipCannonSrc = null;
 
     if (unit.type === 'worker') {
         // Worker - circle via Graphics
@@ -4683,8 +4736,10 @@ function createUnitSpriteEntry(unit, size) {
                 bodyGroup.addChild(body);
 
                 // Turrets
-                if (mainCannonLoaded && mainCannonImage) {
-                    const cannonTex = getOrCreateTexture(mainCannonImage);
+                const cannonImg = getBattleshipCannonImage(unit);
+                if (cannonImg) {
+                    battleshipCannonSrc = cannonImg.src;
+                    const cannonTex = getOrCreateTexture(cannonImg);
                     if (cannonTex) {
                         metrics.turretInner.forEach(pos => {
                             const turretC = new PIXI.Container();
@@ -4757,6 +4812,7 @@ function createUnitSpriteEntry(unit, size) {
         lastColor,
         lastImageSrc,
         battleshipBodySrc,
+        battleshipCannonSrc,
         battleshipAegisMode: unit.type === 'battleship' ? !!unit.battleshipAegisMode : undefined
     };
 }
@@ -6355,18 +6411,32 @@ if (loginPanel) {
 
 // Auth
 // AI Difficulty description
+const DEFAULT_AI_DIFFICULTY = 'normal';
+const AI_DIFFICULTY_SELECTION_ENABLED = false;
 const diffDescs = {
     easy: '약화된 규칙 기반 AI. 느린 판단, 적은 건물/유닛',
     normal: '규칙 기반 AI, 기본 난이도',
     hard: '강화학습으로 훈련된 AI. 전략적 판단 + 스킬 활용',
     expert: '최강 강화학습 AI. 자원 보너스 + 빠른 판단 + 완벽한 전략'
 };
+const diffField = document.getElementById('aiDifficultyField');
 const diffSelect = document.getElementById('aiDifficultySelect');
 const diffDesc = document.getElementById('difficultyDesc');
+function getSelectedAIDifficulty() {
+    if (!AI_DIFFICULTY_SELECTION_ENABLED) return DEFAULT_AI_DIFFICULTY;
+    return (diffSelect && diffSelect.value) ? diffSelect.value : DEFAULT_AI_DIFFICULTY;
+}
+if (diffField && !AI_DIFFICULTY_SELECTION_ENABLED) {
+    diffField.style.display = 'none';
+}
 if (diffSelect && diffDesc) {
-    diffSelect.addEventListener('change', () => {
-        diffDesc.textContent = diffDescs[diffSelect.value] || '';
-    });
+    diffSelect.value = getSelectedAIDifficulty();
+    diffDesc.textContent = diffDescs[getSelectedAIDifficulty()] || '';
+    if (AI_DIFFICULTY_SELECTION_ENABLED) {
+        diffSelect.addEventListener('change', () => {
+            diffDesc.textContent = diffDescs[diffSelect.value] || '';
+        });
+    }
 }
 
 document.getElementById('loginBtn').addEventListener('click', login);
@@ -6842,10 +6912,11 @@ function connectToGame() {
         console.log('Received init data:', data);
         
         // Set AI difficulty (first human player sets it)
-        const selectedDiff = document.getElementById('aiDifficultySelect');
-        if (selectedDiff && selectedDiff.value) {
-            socket.emit('setAIDifficulty', { difficulty: selectedDiff.value });
+        if (diffSelect && data && data.aiDifficulty && diffDescs[data.aiDifficulty]) {
+            diffSelect.value = AI_DIFFICULTY_SELECTION_ENABLED ? data.aiDifficulty : DEFAULT_AI_DIFFICULTY;
+            if (diffDesc) diffDesc.textContent = diffDescs[diffSelect.value] || '';
         }
+        socket.emit('setAIDifficulty', { difficulty: getSelectedAIDifficulty() });
         
         try {
             gameState.userId = data.userId;
