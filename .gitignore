@@ -5,4 +5,6 @@ game.db
 .DS_Store
 ai-weights-hard.json
 ai-weights-expert.json
+ai-weights-hard.json.gz
+ai-weights-expert.json.gz
 *.gz.test

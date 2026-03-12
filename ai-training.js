@@ -10,8 +10,121 @@
  */
 
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const zlib = require('zlib');
+
+const EXTERNAL_WEIGHTS_URLS = Object.freeze({
+  hard: process.env.MW_RL_WEIGHTS_HARD_URL || 'https://drive.google.com/uc?export=download&id=19iFoCr5N69GBYFJR5RuRLJLr2lPQfTNt',
+  expert: process.env.MW_RL_WEIGHTS_EXPERT_URL || 'https://drive.google.com/uc?export=download&id=1f38P1dYPT-F9MpGTPuqL2EgssWuasJkU'
+});
+const weightsDownloadPromises = new Map();
+
+function getWeightsPaths(difficulty) {
+  const jsonPath = path.join(__dirname, `ai-weights-${difficulty}.json`);
+  return {
+    jsonPath,
+    gzipPath: `${jsonPath}.gz`
+  };
+}
+
+function getExternalWeightsUrl(difficulty) {
+  return EXTERNAL_WEIGHTS_URLS[difficulty] || null;
+}
+
+function hasCachedWeights(difficulty) {
+  const paths = getWeightsPaths(difficulty);
+  return fs.existsSync(paths.jsonPath) || fs.existsSync(paths.gzipPath);
+}
+
+function downloadFileWithRedirects(url, destinationPath, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    if (!url) {
+      reject(new Error('Missing download URL'));
+      return;
+    }
+    if (redirectCount > 5) {
+      reject(new Error('Too many redirects while downloading weights'));
+      return;
+    }
+    const client = url.startsWith('https://') ? https : http;
+    const request = client.get(url, (response) => {
+      const statusCode = response.statusCode || 0;
+      const location = response.headers.location;
+      if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
+        response.resume();
+        const nextUrl = new URL(location, url).toString();
+        resolve(downloadFileWithRedirects(nextUrl, destinationPath, redirectCount + 1));
+        return;
+      }
+      if (statusCode !== 200) {
+        response.resume();
+        reject(new Error(`Weight download failed with HTTP ${statusCode}`));
+        return;
+      }
+
+      const contentType = String(response.headers['content-type'] || '').toLowerCase();
+      if (contentType.includes('text/html')) {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => {
+          if (body.length < 1024) body += chunk;
+        });
+        response.on('end', () => {
+          reject(new Error(`Weight download returned HTML instead of binary: ${body.slice(0, 120)}`));
+        });
+        return;
+      }
+
+      const tempPath = `${destinationPath}.tmp`;
+      const output = fs.createWriteStream(tempPath);
+      output.on('error', (error) => {
+        response.destroy(error);
+      });
+      response.on('error', (error) => {
+        output.destroy(error);
+      });
+      output.on('finish', () => {
+        output.close((closeError) => {
+          if (closeError) {
+            reject(closeError);
+            return;
+          }
+          fs.rename(tempPath, destinationPath, (renameError) => {
+            if (renameError) {
+              reject(renameError);
+              return;
+            }
+            resolve(destinationPath);
+          });
+        });
+      });
+      response.pipe(output);
+    });
+    request.on('error', reject);
+  });
+}
+
+async function ensureExternalWeightsCached(difficulty) {
+  if (hasCachedWeights(difficulty)) {
+    return true;
+  }
+  const downloadUrl = getExternalWeightsUrl(difficulty);
+  if (!downloadUrl) {
+    return false;
+  }
+  if (!weightsDownloadPromises.has(difficulty)) {
+    const { gzipPath } = getWeightsPaths(difficulty);
+    const promise = downloadFileWithRedirects(downloadUrl, gzipPath)
+      .then(() => true)
+      .finally(() => {
+        weightsDownloadPromises.delete(difficulty);
+      });
+    weightsDownloadPromises.set(difficulty, promise);
+  }
+  return weightsDownloadPromises.get(difficulty);
+}
 
 // ========== STATE ENCODING ==========
 
@@ -895,8 +1008,9 @@ class TrainingSession {
     this.trainingLog = [];
     this.lastSaveTime = 0;
     this.autoSaveInterval = 60000;
-    this.weightsPath = path.join(__dirname, `ai-weights-${this.difficulty}.json`);
-    this.compressedWeightsPath = `${this.weightsPath}.gz`;
+    const weightPaths = getWeightsPaths(this.difficulty);
+    this.weightsPath = weightPaths.jsonPath;
+    this.compressedWeightsPath = weightPaths.gzipPath;
 
     // Migrate old single weights file if this is 'hard' and no per-difficulty file exists
     if (this.difficulty === 'hard') {
@@ -2311,6 +2425,7 @@ module.exports = {
   QTable,
   ACTIONS,
   DIFFICULTY_PRESETS,
+  ensureExternalWeightsCached,
   encodeState,
   calculateReward,
   takeSnapshot,
