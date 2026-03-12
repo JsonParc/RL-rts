@@ -14,19 +14,49 @@ const server = http.createServer(app);
 const io = socketIo(server);
 
 const aiTraining = require('./ai-training');
-// Separate training sessions for each RL-enabled difficulty
-const trainingSessions = BENCHMARK_MODE
-  ? { hard: null, expert: null }
-  : {
-    hard: new aiTraining.TrainingSession('hard'),
-    expert: new aiTraining.TrainingSession('expert')
-  };
-if (!RL_WEIGHT_UPDATES_ENABLED) {
-  Object.values(trainingSessions).forEach((session) => {
-    if (session) {
+const RL_SESSION_DIFFICULTIES = Object.freeze(['hard', 'expert']);
+const EMPTY_TRAINING_STATS = Object.freeze({
+  episodes: 0,
+  states: 0,
+  epsilon: 0,
+  avgReward: 0,
+  totalReward: 0
+});
+// Separate training sessions for each RL-enabled difficulty; loaded lazily on first use.
+const trainingSessions = { hard: null, expert: null };
+function getTrainingSession(difficulty, { create = false } = {}) {
+  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE) {
+    return null;
+  }
+  let session = trainingSessions[difficulty];
+  if (!session && create) {
+    session = new aiTraining.TrainingSession(difficulty);
+    if (!RL_WEIGHT_UPDATES_ENABLED) {
       session.frozen = true;
     }
-  });
+    trainingSessions[difficulty] = session;
+  }
+  return session;
+}
+function getTrainingSessionStatusSummary(difficulty) {
+  const session = getTrainingSession(difficulty);
+  if (session) {
+    return {
+      ...session.getStatus(),
+      unloaded: false
+    };
+  }
+  return {
+    difficulty,
+    isTraining: false,
+    frozen: !RL_WEIGHT_UPDATES_ENABLED,
+    currentEpisode: 0,
+    maxEpisodes: 0,
+    episodeSteps: 0,
+    stats: { ...EMPTY_TRAINING_STATS },
+    log: [],
+    unloaded: true
+  };
 }
 const DIFFICULTY_PRESETS = aiTraining.DIFFICULTY_PRESETS;
 const APP_NAME = 'MW Craft';
@@ -5529,23 +5559,32 @@ app.post('/api/login', (req, res) => {
 // AI Training API endpoints
 app.get('/api/ai-training/status', (req, res) => {
   const diff = req.query.difficulty || 'hard';
-  const session = trainingSessions[diff];
-  if (!session) return res.status(400).json({ error: 'Invalid difficulty. Use hard or expert.' });
-  const status = session.getStatus();
+  if (!RL_SESSION_DIFFICULTIES.includes(diff)) {
+    return res.status(400).json({ error: 'Invalid difficulty. Use hard or expert.' });
+  }
+  const session = getTrainingSession(diff);
+  const status = getTrainingSessionStatusSummary(diff);
   // Include self-play stats if available
-  const selfPlay = session.getSelfPlayStatus ? session.getSelfPlayStatus() : null;
+  const selfPlay = session?.getSelfPlayStatus ? session.getSelfPlayStatus() : null;
   // Also include all difficulties summary
   const allStatus = {};
-  for (const [d, s] of Object.entries(trainingSessions)) {
-    allStatus[d] = { frozen: s.frozen, isTraining: s.isTraining, stats: s.qTable.getStats() };
+  for (const difficulty of RL_SESSION_DIFFICULTIES) {
+    const summary = getTrainingSessionStatusSummary(difficulty);
+    allStatus[difficulty] = {
+      frozen: summary.frozen,
+      isTraining: summary.isTraining,
+      stats: summary.stats,
+      unloaded: summary.unloaded
+    };
   }
   res.json({ ...status, selfPlay, allDifficulties: allStatus });
 });
 
 app.post('/api/ai-training/start', (req, res) => {
   const diff = req.body.difficulty || 'hard';
-  const session = trainingSessions[diff];
-  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  if (!RL_SESSION_DIFFICULTIES.includes(diff)) return res.status(400).json({ error: 'Invalid difficulty' });
+  const session = getTrainingSession(diff, { create: true });
+  if (!session) return res.status(503).json({ error: 'Training unavailable in benchmark mode' });
   const episodes = Math.min(Math.max(parseInt(req.body.episodes) || 500, 10), 999999);
   const continuous = !!req.body.continuous;
   const mode = req.body.mode || 'solo'; // 'solo' or 'selfplay'
@@ -5580,8 +5619,9 @@ app.post('/api/ai-training/start', (req, res) => {
 
 app.post('/api/ai-training/stop', (req, res) => {
   const diff = req.body.difficulty || 'hard';
-  const session = trainingSessions[diff];
-  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  if (!RL_SESSION_DIFFICULTIES.includes(diff)) return res.status(400).json({ error: 'Invalid difficulty' });
+  const session = getTrainingSession(diff, { create: true });
+  if (!session) return res.status(503).json({ error: 'Training unavailable in benchmark mode' });
   session.continuousMode = false;
   session.stopTraining();
   res.json({ stopped: true, difficulty: diff });
@@ -5589,8 +5629,9 @@ app.post('/api/ai-training/stop', (req, res) => {
 
 app.post('/api/ai-training/reset', (req, res) => {
   const diff = req.body.difficulty || 'hard';
-  const session = trainingSessions[diff];
-  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  if (!RL_SESSION_DIFFICULTIES.includes(diff)) return res.status(400).json({ error: 'Invalid difficulty' });
+  const session = getTrainingSession(diff, { create: true });
+  if (!session) return res.status(503).json({ error: 'Training unavailable in benchmark mode' });
   session.continuousMode = false;
   session.stopTraining();
   session.qTable.table = {};
@@ -5606,8 +5647,9 @@ app.post('/api/ai-training/reset', (req, res) => {
 app.post('/api/ai-training/freeze', (req, res) => {
   const diff = req.body.difficulty;
   const freeze = req.body.freeze;
-  if (!diff || !trainingSessions[diff]) return res.status(400).json({ error: 'Invalid difficulty' });
-  const session = trainingSessions[diff];
+  if (!RL_SESSION_DIFFICULTIES.includes(diff)) return res.status(400).json({ error: 'Invalid difficulty' });
+  const session = getTrainingSession(diff, { create: true });
+  if (!session) return res.status(503).json({ error: 'Training unavailable in benchmark mode' });
   if (freeze && session.isTraining) {
     session.continuousMode = false;
     session.stopTraining();
@@ -5620,8 +5662,9 @@ app.post('/api/ai-training/freeze', (req, res) => {
 
 app.get('/api/ai-training/weights', (req, res) => {
   const diff = req.query.difficulty || 'hard';
-  const session = trainingSessions[diff];
-  if (!session) return res.status(400).json({ error: 'Invalid difficulty' });
+  if (!RL_SESSION_DIFFICULTIES.includes(diff)) return res.status(400).json({ error: 'Invalid difficulty' });
+  const session = getTrainingSession(diff, { create: true });
+  if (!session) return res.status(503).json({ error: 'Training unavailable in benchmark mode' });
   const stats = session.qTable.getStats();
   res.json({ ...stats, difficulty: diff, frozen: session.frozen });
 });
@@ -10035,7 +10078,7 @@ function updateAI() {
     }
 
     // --- RL Integration ---
-    const activeSession = trainingSessions[roomDifficulty]; // per-difficulty session (or null for easy/normal)
+    const activeSession = getTrainingSession(roomDifficulty, { create: true }); // per-difficulty session (or null for easy/normal)
     const rlActionIdx = activeSession ? activeSession.getAction(gameState, playerId, roomDifficulty) : null;
     const rlAction = rlActionIdx !== null ? aiTraining.ACTIONS[rlActionIdx] : null;
 
