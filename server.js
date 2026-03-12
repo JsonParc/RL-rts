@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 
 const BENCHMARK_MODE = process.env.MW_BENCHMARK === '1';
 const RL_WEIGHT_UPDATES_ENABLED = process.env.MW_ALLOW_RL_WEIGHT_UPDATES === '1';
+const RL_PRELOAD_ON_START = process.env.MW_PRELOAD_RL_ON_START !== '0';
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
@@ -25,6 +26,7 @@ const EMPTY_TRAINING_STATS = Object.freeze({
 // Separate training sessions for each RL-enabled difficulty; loaded lazily on first use.
 const trainingSessions = { hard: null, expert: null };
 const trainingSessionLoads = { hard: null, expert: null };
+let rlPreloadPromise = null;
 async function ensureTrainingSessionLoaded(difficulty) {
   if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE) {
     return null;
@@ -54,6 +56,28 @@ async function ensureTrainingSessionLoaded(difficulty) {
       });
   }
   return trainingSessionLoads[difficulty];
+}
+function preloadTrainingSessions() {
+  if (BENCHMARK_MODE || !RL_PRELOAD_ON_START) {
+    return Promise.resolve([]);
+  }
+  if (!rlPreloadPromise) {
+    rlPreloadPromise = Promise.all(
+      RL_SESSION_DIFFICULTIES.map(async (difficulty) => {
+        const session = await ensureTrainingSessionLoaded(difficulty);
+        if (!session) {
+          console.warn(`[AI-RL][${difficulty}] Session preload failed or returned null.`);
+          return null;
+        }
+        const stateCount = Object.keys(session.qTable.table || {}).length;
+        console.log(`[AI-RL][${difficulty}] Session ready for live play (${stateCount} states).`);
+        return session;
+      })
+    ).finally(() => {
+      rlPreloadPromise = null;
+    });
+  }
+  return rlPreloadPromise;
 }
 function getTrainingSession(difficulty, { create = false } = {}) {
   if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE) {
@@ -10014,6 +10038,17 @@ function updateAI() {
     if (player.lastAIThinkAt && now - player.lastAIThinkAt < (diffPreset.updateInterval || AI_CONFIG.updateInterval)) {
       return;
     }
+    let activeSession = null;
+    if (diffPreset.useRL && RL_SESSION_DIFFICULTIES.includes(roomDifficulty) && !BENCHMARK_MODE) {
+      activeSession = getTrainingSession(roomDifficulty, { create: true });
+      if (!activeSession) {
+        if (!player._rlSessionWaitLoggedAt || now - player._rlSessionWaitLoggedAt > 15000) {
+          console.warn(`[AI-RL][${roomDifficulty}] Waiting for session load before AI think (player ${playerId}).`);
+          player._rlSessionWaitLoggedAt = now;
+        }
+        return;
+      }
+    }
     player.lastAIThinkAt = now;
     
     // Count AI's units and buildings
@@ -10106,7 +10141,6 @@ function updateAI() {
     }
 
     // --- RL Integration ---
-    const activeSession = getTrainingSession(roomDifficulty, { create: true }); // per-difficulty session (or null for easy/normal)
     const rlActionIdx = activeSession ? activeSession.getAction(gameState, playerId, roomDifficulty) : null;
     const rlAction = rlActionIdx !== null ? aiTraining.ACTIONS[rlActionIdx] : null;
 
@@ -12125,5 +12159,6 @@ if (BENCHMARK_MODE) {
 } else {
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`${APP_NAME} server running on port ${PORT}`);
+    void preloadTrainingSessions();
   });
 }
