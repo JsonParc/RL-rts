@@ -4994,11 +4994,12 @@ function issueSquadMoveOrder(squad, targetX, targetY) {
   const centerX = anchor.x;
   const centerY = anchor.y;
   const targetAngle = getSquadCommandAngle(squad, centerX, centerY, targetX, targetY);
+  const initialMoveAngle = Number.isFinite(squad.moveAngle) ? squad.moveAngle : targetAngle;
   const slowestSpeed = getSquadSlowestSpeed(squad);
 
   // Rebuild slots for the new heading around the CURRENT anchor.
   squad.targetAngle = targetAngle;
-  squad.moveAngle = targetAngle;
+  squad.moveAngle = initialMoveAngle;
   const positions = applySquadFormationLayout(squad, units, centerX, centerY, targetAngle);
 
   squad.centerX = centerX;
@@ -5025,7 +5026,7 @@ function issueSquadMoveOrder(squad, targetX, targetY) {
     unit.attackMove = false;
     unit.attackTargetId = null;
     unit.attackTargetType = null;
-    unit.angle = targetAngle;
+    unit.angle = initialMoveAngle;
     unit.formingUp = false;
     unit.formingUpUntil = null;
     unit.targetX = null;
@@ -5054,11 +5055,12 @@ function issueSquadAttackMove(squad, targetX, targetY) {
   const centerX = anchor.x;
   const centerY = anchor.y;
   const targetAngle = getSquadCommandAngle(squad, centerX, centerY, targetX, targetY);
+  const initialMoveAngle = Number.isFinite(squad.moveAngle) ? squad.moveAngle : targetAngle;
   const slowestSpeed = getSquadSlowestSpeed(squad);
 
   // Rebuild slots for the new heading around the CURRENT anchor.
   squad.targetAngle = targetAngle;
-  squad.moveAngle = targetAngle;
+  squad.moveAngle = initialMoveAngle;
   const positions = applySquadFormationLayout(squad, units, centerX, centerY, targetAngle);
 
   squad.centerX = centerX;
@@ -5085,7 +5087,7 @@ function issueSquadAttackMove(squad, targetX, targetY) {
     unit.attackMove = true;
     unit.attackTargetId = null;
     unit.attackTargetType = null;
-    unit.angle = targetAngle;
+    unit.angle = initialMoveAngle;
     unit.formingUp = false;
     unit.formingUpUntil = null;
     unit.targetX = null;
@@ -7991,6 +7993,7 @@ function updateGame(deltaTime) {
     // Move virtual center along waypoints or straight to target
     if (squad.moving && Number.isFinite(squad.targetX) && Number.isFinite(squad.targetY)) {
       const centerStep = slowestSpeed * deltaTime * 60;
+      let desiredHeading = null;
 
       // Follow waypoints if available
       if (squad.centerWaypoints && squad.centerWaypoints.length > 0) {
@@ -7998,8 +8001,9 @@ function updateGame(deltaTime) {
         const wdx = wp.x - squad.centerX;
         const wdy = wp.y - squad.centerY;
         const wDist = Math.hypot(wdx, wdy);
-        // Update moveAngle to face current waypoint direction
-        if (wDist > 1) squad.moveAngle = Math.atan2(wdy, wdx);
+        if (wDist > 1) {
+          desiredHeading = Math.atan2(wdy, wdx);
+        }
         if (wDist < centerStep + 5) {
           squad.centerX = wp.x;
           squad.centerY = wp.y;
@@ -8014,6 +8018,9 @@ function updateGame(deltaTime) {
         const tdx = squad.targetX - squad.centerX;
         const tdy = squad.targetY - squad.centerY;
         const tDist = Math.hypot(tdx, tdy);
+        if (tDist > 1) {
+          desiredHeading = Math.atan2(tdy, tdx);
+        }
         if (tDist < 10) {
           squad.centerX = squad.targetX;
           squad.centerY = squad.targetY;
@@ -8033,6 +8040,15 @@ function updateGame(deltaTime) {
         squad.centerY = squad.targetY;
         squad.moving = false;
         squad.centerWaypoints = null;
+      }
+
+      if (Number.isFinite(desiredHeading)) {
+        const headingTarget = updateSquadHeadingTarget(squad, desiredHeading, now);
+        squad.moveAngle = Number.isFinite(squad.moveAngle)
+          ? turnAngleToward(squad.moveAngle, headingTarget, SQUAD_ROTATION_RATE)
+          : headingTarget;
+      } else if (!Number.isFinite(squad.moveAngle) && Number.isFinite(squad.targetAngle)) {
+        squad.moveAngle = squad.targetAngle;
       }
     }
 
