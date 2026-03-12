@@ -17,7 +17,8 @@ const io = socketIo(server);
 const aiTraining = require('./ai-training');
 const RL_SESSION_DIFFICULTIES = Object.freeze(['hard', 'expert']);
 const DEFAULT_AI_DIFFICULTY = 'normal';
-const ALLOW_AI_DIFFICULTY_SELECTION = true;
+const ALLOW_AI_DIFFICULTY_SELECTION = false;
+const ALLOW_RL_WEIGHT_LOADING = false;
 const EMPTY_TRAINING_STATS = Object.freeze({
   episodes: 0,
   states: 0,
@@ -30,7 +31,7 @@ const trainingSessions = { hard: null, expert: null };
 const trainingSessionLoads = { hard: null, expert: null };
 let rlPreloadPromise = null;
 async function ensureTrainingSessionLoaded(difficulty) {
-  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE) {
+  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE || !ALLOW_RL_WEIGHT_LOADING) {
     return null;
   }
   if (trainingSessions[difficulty]) {
@@ -66,7 +67,7 @@ async function ensureTrainingSessionLoaded(difficulty) {
   return trainingSessionLoads[difficulty];
 }
 function preloadTrainingSessions() {
-  if (BENCHMARK_MODE || !RL_PRELOAD_ON_START) {
+  if (BENCHMARK_MODE || !RL_PRELOAD_ON_START || !ALLOW_RL_WEIGHT_LOADING) {
     return Promise.resolve([]);
   }
   if (!rlPreloadPromise) {
@@ -88,7 +89,7 @@ function preloadTrainingSessions() {
   return rlPreloadPromise;
 }
 function getTrainingSession(difficulty, { create = false } = {}) {
-  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE) {
+  if (!RL_SESSION_DIFFICULTIES.includes(difficulty) || BENCHMARK_MODE || !ALLOW_RL_WEIGHT_LOADING) {
     return null;
   }
   let session = trainingSessions[difficulty];
